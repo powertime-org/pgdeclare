@@ -4,22 +4,86 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgdeclare"
-version = "0.0.1"
+version = "0.1.0"
 description = "Declarative Postgres schemas: diff the live database against your SQL files, with before/after migration blocks and a hash ledger."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-authors = [{ name = "Powertime", email = "info@powertime.org" }]
+authors = [{ name = "Peter Brodsky" }]
+maintainers = [{ name = "Powertime", email = "info@powertime.org" }]
 requires-python = ">=3.12"
-classifiers = [
-    "Development Status :: 1 - Planning",
-    "Topic :: Database",
-    "Programming Language :: Python :: 3",
+keywords = [
+    "postgres",
+    "postgresql",
+    "schema",
+    "migrations",
+    "declarative",
+    "diff",
+    "ddl",
+    "database",
 ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: SQL",
+    "Topic :: Database",
+    "Topic :: Software Development :: Build Tools",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pglast>=8.5",
+    "psycopg2-binary>=2.9.13",
+]
+
+[project.scripts]
+pgdeclare = "pgdeclare.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/powertime-org/pgdeclare"
 Source = "https://github.com/powertime-org/pgdeclare"
+Issues = "https://github.com/powertime-org/pgdeclare/issues"
+Changelog = "https://github.com/powertime-org/pgdeclare/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.40.2",
+    "pytest>=9.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.14",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pgdeclare"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/pgdeclare", "tests", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: needs a PostgreSQL server (TEST_DATABASE_URL); skipped without one",
+]
+timeout = 300
+timeout_method = "thread"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.basedpyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
