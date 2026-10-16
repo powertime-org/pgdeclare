@@ -30,8 +30,9 @@ schema files ──build──▶ plan database ──introspect──┐
 live database ─────────────────────introspect───────┘
 ```
 
-Status: **0.1.0, alpha.** The engine has run a production application's
-schema for a long time, but the public API may change before 1.0.
+Status: **0.1.0, alpha.** The engine has run the production schema of
+[Powertime](https://powertime.org) since it went into service on
+10 December 2025. The public API may change before 1.0.
 
 ## Why
 
@@ -145,7 +146,7 @@ Options shared by both commands:
 | `--schema NAME` | `public` | A schema to manage; repeat for several |
 | `--role NAME` | none | A role whose definition, memberships and grants are managed; repeatable |
 | `--ledger-table SCHEMA.TABLE` | `pgdeclare.applied_migrations` | Where executed blocks are recorded |
-| `--plan-database NAME` | `<db>_pgdeclare_plan` | Scratch database; created and dropped per run unless it already exists |
+| `--plan-database NAME` | `<db>_pgdeclare_plan_<random>` | Scratch database the declared schema is built in. Never the target database; an existing one must be owned by you and is left in place, otherwise it is created and dropped per run |
 | `-v`, `--verbose` | off | Log the engine's progress |
 
 `apply` also takes `--dry-run`, `--offline` (allow changes that lock or

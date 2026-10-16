@@ -125,10 +125,16 @@ def target(integration_db_url):
         yield url
     finally:
         _admin(integration_db_url, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
-        _admin(
-            integration_db_url,
-            f'DROP DATABASE IF EXISTS "{name}_pgdeclare_plan" WITH (FORCE)',
-        )
+        for (plan,) in _plan_databases(integration_db_url, name):
+            _admin(integration_db_url, f'DROP DATABASE IF EXISTS "{plan}" WITH (FORCE)')
+
+
+def _plan_databases(url: str, target_name: str) -> list[tuple]:
+    return _rows(
+        url,
+        "SELECT datname FROM pg_database "
+        f"WHERE datname LIKE '{target_name}\\_pgdeclare\\_plan%'",
+    )
 
 
 def _write(sql_dir: Path, content: str, name: str = "main.sql") -> Path:
@@ -182,8 +188,7 @@ def test_diff_apply_diff_cycle(tmp_path, target, capsys):
         ("2026-01-01_seed",)
     ]
     # The plan database the CLI created is gone again.
-    plan = target.rsplit("/", 1)[1] + "_pgdeclare_plan"
-    assert _rows(target, f"SELECT 1 FROM pg_database WHERE datname = '{plan}'") == []
+    assert _plan_databases(target, target.rsplit("/", 1)[1]) == []
 
     assert main(["diff", "--exit-code", "--json", *base]) == EXIT_OK
     payload = json.loads(capsys.readouterr().out)
@@ -306,3 +311,67 @@ def test_dropping_a_table_with_data_takes_an_unqualified_directive(tmp_path, tar
     )
     assert main(base) == EXIT_OK
     assert _rows(target, "SELECT to_regclass('public.old')::text") == [(None,)]
+
+
+@pytest.mark.integration
+def test_the_target_is_never_the_plan_database(tmp_path, target, capsys):
+    sql = str(_write(tmp_path / "sql", V1))
+    _admin(target, "CREATE TABLE keep (v int)")
+    _admin(target, "INSERT INTO keep VALUES (1)")
+    name = target.rsplit("/", 1)[1]
+    code = main(
+        ["apply", "--database-url", target, "--sql-dir", sql, "--plan-database", name]
+    )
+    assert code == EXIT_ERROR
+    assert "cannot be the target database" in capsys.readouterr().err
+    assert _rows(target, "SELECT v FROM keep") == [(1,)]
+
+
+@pytest.mark.integration
+def test_a_plan_database_owned_by_someone_else_is_refused(tmp_path, target, capsys):
+    sql = str(_write(tmp_path / "sql", V1))
+    suffix = uuid.uuid4().hex[:8]
+    role, plan = f"pgdeclare_other_{suffix}", f"pgdeclare_foreign_{suffix}"
+    _admin(target, f'CREATE ROLE "{role}" NOLOGIN')
+    try:
+        _admin(target, f'CREATE DATABASE "{plan}" OWNER "{role}"')
+        code = main(
+            [
+                "diff",
+                "--database-url",
+                target,
+                "--sql-dir",
+                sql,
+                "--plan-database",
+                plan,
+            ]
+        )
+        assert code == EXIT_ERROR
+        assert "not owned by the current user" in capsys.readouterr().err
+        assert _rows(target, f"SELECT 1 FROM pg_database WHERE datname = '{plan}'")
+    finally:
+        _admin(target, f'DROP DATABASE IF EXISTS "{plan}" WITH (FORCE)')
+        _admin(target, f'DROP ROLE IF EXISTS "{role}"')
+
+
+@pytest.mark.integration
+def test_an_owned_plan_database_is_reused_and_kept(tmp_path, target):
+    sql = str(_write(tmp_path / "sql", V1))
+    plan = f"pgdeclare_mine_{uuid.uuid4().hex[:8]}"
+    _admin(target, f'CREATE DATABASE "{plan}"')
+    try:
+        code = main(
+            [
+                "diff",
+                "--database-url",
+                target,
+                "--sql-dir",
+                sql,
+                "--plan-database",
+                plan,
+            ]
+        )
+        assert code == EXIT_OK
+        assert _rows(target, f"SELECT 1 FROM pg_database WHERE datname = '{plan}'")
+    finally:
+        _admin(target, f'DROP DATABASE IF EXISTS "{plan}" WITH (FORCE)')

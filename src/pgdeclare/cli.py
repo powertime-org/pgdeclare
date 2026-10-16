@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import tempfile
 from collections.abc import Callable, Iterator, Sequence
@@ -83,17 +84,38 @@ def _autocommit(
 
 @contextmanager
 def plan_database(url: str, requested: str | None) -> Iterator[str]:
-    """Yield the plan database's name, creating it if it does not exist.
+    """Yield the plan database's name.
 
-    A database this call created is dropped on the way out; one that already
-    existed is left alone (its managed schemas are rebuilt on every run).
+    Building the plan drops and recreates the managed schemas in it, so it must
+    never be the target database, and a database someone else owns is never
+    reused: its leftover objects would run inside this session. By default a
+    fresh, randomly named database is created and dropped per run. A requested
+    database is created (and dropped) if it does not exist; if it exists, the
+    current user must own it, and it is left in place afterwards.
     """
-    name = requested or f"{_database_name(url)}_pgdeclare_plan"
-    exists = _autocommit(
-        url, pgsql.SQL("SELECT 1 FROM pg_database WHERE datname = %s"), (name,)
+    target = _database_name(url)
+    if requested is not None and requested == target:
+        raise CliError(
+            f"the plan database cannot be the target database ({target!r}); "
+            "building the plan drops and recreates the managed schemas"
+        )
+    name = requested or f"{target}_pgdeclare_plan_{secrets.token_hex(4)}"
+    owner = _autocommit(
+        url,
+        pgsql.SQL(
+            "SELECT pg_get_userbyid(datdba) = current_user"
+            " FROM pg_database WHERE datname = %s"
+        ),
+        (name,),
     )
     created = False
-    if not exists:
+    if owner:
+        if not owner[0][0]:
+            raise CliError(
+                f"plan database {name!r} exists and is not owned by the current "
+                "user; refusing to build in it"
+            )
+    else:
         _autocommit(url, pgsql.SQL("CREATE DATABASE {}").format(pgsql.Identifier(name)))
         created = True
     try:
@@ -303,8 +325,9 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--plan-database",
         metavar="NAME",
-        help="scratch database the declared schema is built in "
-        "(default: <database>_pgdeclare_plan, created and dropped per run)",
+        help="scratch database the declared schema is built in; never the target, "
+        "and if it exists you must own it (default: a fresh "
+        "<database>_pgdeclare_plan_<random>, created and dropped per run)",
     )
     common.add_argument(
         "-v", "--verbose", action="store_true", help="log the engine's progress"
