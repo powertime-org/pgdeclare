@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pgdeclare"
+version = "0.0.1"
+description = "Declarative Postgres schemas: diff the live database against your SQL files, with before/after migration blocks and a hash ledger."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Powertime", email = "info@powertime.org" }]
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Topic :: Database",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Homepage = "https://github.com/powertime-org/pgdeclare"
+Source = "https://github.com/powertime-org/pgdeclare"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pgdeclare"]
