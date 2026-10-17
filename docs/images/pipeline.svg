@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 290" width="960" height="290" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <title>How pgdeclare applies a schema. The schema files are built into a scratch plan database and introspected. Pending @migrate-before blocks run on the live database, which is then introspected. The two are diffed, the difference is applied, @migrate-after and DO blocks run, and a second diff must come back empty.</title>
+  <style>
+    /* Transparent background, mid-tone palette: reads on light and dark pages alike. */
+    .box { fill: #848d97; fill-opacity: 0.12; stroke: #848d97; stroke-width: 1.5; }
+    .label { fill: #768390; font-size: 14px; font-weight: 700; }
+    .note { fill: #848d97; font-size: 12px; }
+    .wire { stroke: #848d97; stroke-width: 2; fill: none; }
+    .decl { stroke: #2ea043; }
+    .declf { fill: #2ea043; }
+    .decl-box { fill: #2ea043; fill-opacity: 0.12; stroke: #2ea043; stroke-width: 2; }
+    .imp-box { fill: #ec7a2c; fill-opacity: 0.12; stroke: #ec7a2c; stroke-width: 2; stroke-dasharray: 5 4; }
+    .impf { fill: #ec7a2c; }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#848d97"/>
+    </marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2ea043"/>
+    </marker>
+  </defs>
+
+  <!-- legend -->
+  <rect x="20" y="14" width="14" height="14" class="decl-box"/>
+  <text x="42" y="26" class="note">declarative: what the schema should be</text>
+  <rect x="340" y="14" width="14" height="14" class="imp-box"/>
+  <text x="362" y="26" class="note">imperative: one-off steps, run once, hash recorded</text>
+
+  <!-- declared lane -->
+  <g transform="translate(20,62)">
+    <path d="M0,0 H100 L124,24 V76 H0 z" class="decl-box"/>
+    <path d="M100,0 V24 H124" fill="none" class="decl" stroke-width="2"/>
+    <line x1="14" y1="34" x2="96" y2="34" class="decl" stroke-width="2" stroke-opacity="0.6"/>
+    <line x1="14" y1="46" x2="86" y2="46" class="decl" stroke-width="2" stroke-opacity="0.6"/>
+    <line x1="14" y1="58" x2="100" y2="58" class="decl" stroke-width="2" stroke-opacity="0.6"/>
+    <text x="62" y="98" text-anchor="middle" class="label">schema files</text>
+  </g>
+  <line x1="152" y1="100" x2="222" y2="100" class="wire" marker-end="url(#a)"/>
+  <text x="187" y="90" text-anchor="middle" class="note">build</text>
+  <g transform="translate(232,64)">
+    <path d="M0,10 V62 A62,10 0 0 0 124,62 V10" class="box"/>
+    <ellipse cx="62" cy="10" rx="62" ry="10" class="box"/>
+    <text x="62" y="46" text-anchor="middle" class="label">plan</text>
+    <text x="62" y="96" text-anchor="middle" class="note">scratch database</text>
+  </g>
+
+  <!-- live lane -->
+  <g transform="translate(20,186)">
+    <path d="M0,10 V62 A62,10 0 0 0 124,62 V10" class="box"/>
+    <ellipse cx="62" cy="10" rx="62" ry="10" class="box"/>
+    <text x="62" y="46" text-anchor="middle" class="label">live</text>
+    <text x="62" y="96" text-anchor="middle" class="note">your database</text>
+  </g>
+  <line x1="152" y1="222" x2="222" y2="222" class="wire" marker-end="url(#a)"/>
+  <rect x="232" y="198" width="124" height="48" class="imp-box"/>
+  <text x="294" y="219" text-anchor="middle" font-size="13" font-weight="700" class="impf">@migrate-</text>
+  <text x="294" y="236" text-anchor="middle" font-size="13" font-weight="700" class="impf">before</text>
+  <text x="294" y="268" text-anchor="middle" class="note">renames</text>
+
+  <!-- merge into diff -->
+  <path d="M364,100 H400 V146 H420" class="wire" marker-end="url(#a)"/>
+  <path d="M364,222 H400 V146" class="wire"/>
+  <text x="390" y="161" text-anchor="middle" class="note" transform="rotate(-90 390 161)">introspect</text>
+
+  <rect x="430" y="122" width="96" height="48" class="decl-box"/>
+  <text x="478" y="151" text-anchor="middle" class="label">diff</text>
+  <line x1="526" y1="146" x2="556" y2="146" class="decl" stroke-width="2" marker-end="url(#ag)"/>
+  <rect x="566" y="122" width="96" height="48" class="decl-box"/>
+  <text x="614" y="151" text-anchor="middle" class="label">apply</text>
+  <line x1="662" y1="146" x2="692" y2="146" class="wire" marker-end="url(#a)"/>
+  <rect x="702" y="122" width="112" height="48" class="imp-box"/>
+  <text x="758" y="143" text-anchor="middle" font-size="13" font-weight="700" class="impf">@migrate-</text>
+  <text x="758" y="160" text-anchor="middle" font-size="13" font-weight="700" class="impf">after, DO</text>
+  <text x="758" y="192" text-anchor="middle" class="note">backfills</text>
+  <line x1="814" y1="146" x2="844" y2="146" class="wire" marker-end="url(#a)"/>
+  <rect x="854" y="122" width="96" height="48" class="decl-box"/>
+  <text x="902" y="151" text-anchor="middle" class="label">re-diff</text>
+  <path d="M888,188 L898,198 L918,178" fill="none" class="decl" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="902" y="222" text-anchor="middle" class="note">must be empty</text>
+</svg>
