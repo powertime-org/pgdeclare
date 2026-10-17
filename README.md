@@ -2,48 +2,7 @@
 
 pgdeclare is a Postgres schema differ.
 
-## Philosophy
-
-### Finding what you're looking for
-
-*All* answerable questions are the narrow application of a single universal root question: how to find what you're looking for.  Databases solve this problem for applications by getting developers to specify the shape of their data and how they plan on using it.  For example, phone books, if you are old enough to have seen them and still young enough to remember them, organize the data in them first by last name, then by first name. In exchange you get a phone number.  However, you cannot (in any reasonable amount of time) find a name given a phone number (even though caller ID could be useful) because the phone book has been organized around looking up phone numbers by name and not names by phone number.
-
-SQL is a language that lets developers specify how their data should be organized and what kinds of records you can retrieve quickly.  It's used in pretty much everything that handles any non-trivial amount of data.  It's also special in that it describes *what* you want and it's up to the database to decide *how* to fulfill the request.  This feature makes using databases vastly easier than it otherwise would be and yet, changing a SQL database can be rather unpleasant.
-
-### Migrations: when the code is state
-
-The problem is that changing a database's shape requires "migrations" -- a way of directing the database to its desired state given its current state.  Consider the difference between these two programs controlling a robot:
-
-**Brittle:**
-
-```text
-1. drive 100 meters forward
-2. turn 90 degrees right
-3. drive another 50 meters
-```
-
-**Resilient:**
-
-```text
-1. turn right at the stop light
-2. stop at the first house
-```
-
-![Brittle, in orange: 1. drive 100 meters forward, 2. turn 90 degrees right, 3. drive another 50 meters. Started 50 meters back, the robot turns early and drives off a cliff. Resilient, in green: 1. turn right at the stop light, 2. stop at the first house. From the same start, it arrives at the house.](docs/images/brittle-vs-resilient.svg)
-
-The brittle version is obviously longer (which is generally worse) but it has several other problems, the most significant of which is that each instruction requires you to understand all previous instructions to make sense of.  Consider the line `turn 90 degrees right`.  Depending on where you are, turning 90 degrees either takes you through the stop light or it drives you off a cliff.  The consequences of the command itself cannot be understood without understanding all prior commands and where they've landed you.  The same is not true of `turn right at the stop light`.  You can certainly turn at the wrong stop light if you run that command at an unexpected time, but you aren't going to turn into a car, a house, a wall, or off a cliff, because you were not where you thought you were when the command was called.  Things can still go wrong but it's harder to unleash catastrophe.  This is why handling state is something most good engineers try to squeeze into the smallest volume of code possible because it is so difficult to reason about.  Functional languages are so pleasant to use exactly because they're so good at isolating state.  But with SQL, the code itself is state.  There's a reasonable reason for this: the database, unless it's empty, *is* state, so changes to how it works need to consider what's in it.
-
-### ORMs
-
-No matter the reason, SQL is so hard to write at scale that it was one of the early things people tried optimizing in software engineering.  The 90s saw TOPLink and then later Enterprise JavaBeans, both examples of something called Object Relational Mapping (ORM).  They helped engineers write traditional code, organized into modules, files, and functions.  It was a bit like ordering at a restaurant in a foreign country where the waiter speaks both the local language and your language but is not native in either.  You usually get what you ask for, but not always.  Some ORMs were better than others but no real system used them without heavy use of the escape hatch they all come with: the ability to write raw SQL.  The downside was that SQL was then sprinkled randomly throughout the source code of another language in a way that once again made it hard to reason about.  Backend engineering was often an exercise in skinning databases.  Business logic -- the thing that made your app special -- often ended up being a tiny part of the actual engineering effort.  ORMs also brought migration tools, like Rails migrations and Alembic, which made the tower of changes easier to write but no easier to read.
-
-### NoSQL
-
-Eventually, there was a global revolt against SQL that cropped up somewhere between 2006 with Google's Bigtable paper and 2009 which saw Cassandra, MongoDB, CouchDB, Redis, and others proudly aligning themselves with the NoSQL movement.  Mongo was very easy to get going with and iterate on but SQL still won out for a host of reasons.  Chief among them was that the data model didn't just disappear -- it became an emergent property of the code, which essentially spread the same poison migrations carried, the history of every shape the data ever had, into the entire code base.  The code became state.  And so, after a long hype cycle, in 2023, Postgres became the most-used database in the Stack Overflow developer survey and SQL reasserted its dominance.
-
-### Declare the end state
-
-The point of pgdeclare is to let people write in SQL but describe the final state without building up an ever less stable tower of changes.  Reverse jenga still ends up with a pile of blocks on the floor -- it's just a bigger mess.  To set expectations: some change management is inevitable and we provide our own escape hatch for those.  And to be fair, pgdeclare is not the first schema differ -- even for Postgres -- but we couldn't find a free, open-source one that handled the SQL our code uses.  Hopefully it works for you too, and if not, pull requests are very welcome.
+Why we built it: [Your Database Schema Should Be Code You Can Read](https://blog.powertime.org/pgdeclare).
 
 ## Overview
 
