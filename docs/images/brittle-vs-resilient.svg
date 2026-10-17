@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 440" width="880" height="440" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <title>A robot started 50 meters behind where its program assumed. The brittle program (drive 100 meters forward, turn 90 degrees right, drive another 50 meters) turns too early and drives off a cliff. The resilient program (turn right at the stop light, stop at the first house) still arrives at the house.</title>
+  <style>
+    /* Transparent background, mid-tone palette: reads on light and dark pages alike,
+       whatever theme the viewer's browser reports. */
+    .ink { fill: #768390; }
+    .bg { fill: #ffffff; }
+    .muted { fill: #848d97; }
+    .road { fill: #848d97; fill-opacity: 0.3; }
+    .lane { stroke: #848d97; stroke-width: 1.5; stroke-dasharray: 6 6; fill: none; }
+    .ghost { stroke: #848d97; stroke-width: 2; stroke-dasharray: 4 5; fill: none; }
+    .frame { fill: none; stroke: #848d97; stroke-opacity: 0.5; }
+    .orange { fill: #ec7a2c; }
+    .green { fill: #2ea043; }
+    .orange-s { stroke: #ec7a2c; }
+    .green-s { stroke: #2ea043; }
+    .cliffline { stroke: #848d97; stroke-width: 3; }
+  </style>
+  <defs>
+    <pattern id="hatch" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="10" stroke="#848d97" stroke-width="2" stroke-opacity="0.6"/>
+    </pattern>
+    <marker id="arrow-o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" class="orange"/>
+    </marker>
+    <marker id="arrow-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" class="green"/>
+    </marker>
+    <!-- the shared map: roads, stop light, house, cliff -->
+    <g id="map">
+      <path d="M150,140 H190 V180 H410 V220 H190 V415 H150 z" class="road"/>
+      <line x1="170" y1="225" x2="170" y2="412" class="lane"/>
+      <line x1="195" y1="200" x2="405" y2="200" class="lane"/>
+      <rect x="203" y="240" width="207" height="175" fill="url(#hatch)"/>
+      <line x1="203" y1="240" x2="203" y2="415" class="cliffline"/>
+      <line x1="203" y1="240" x2="410" y2="240" class="cliffline"/>
+      <text x="306" y="392" text-anchor="middle" font-size="13" font-weight="700" class="muted">cliff</text>
+      <!-- stop light -->
+      <rect x="196" y="146" width="14" height="30" class="ink"/>
+      <circle cx="203" cy="153" r="3.5" fill="#cf222e"/>
+      <circle cx="203" cy="161" r="3.5" fill="#bf8700"/>
+      <circle cx="203" cy="169" r="3.5" fill="#1a7f37"/>
+      <!-- house -->
+      <path d="M318,178 L318,156 L332,144 L346,156 L346,178 z" class="ink"/>
+      <text x="332" y="136" text-anchor="middle" font-size="12" class="muted">house</text>
+      <!-- planned start and planned brittle route -->
+      <circle cx="170" cy="330" r="7" class="ghost"/>
+      <text x="140" y="334" text-anchor="end" font-size="12" class="muted">assumed start</text>
+      <text x="140" y="399" text-anchor="end" font-size="12" class="muted">actual start</text>
+    </g>
+    <g id="robot">
+      <rect x="-9" y="-9" width="18" height="18" class="ink"/>
+      <path d="M-5,3 L0,-5 L5,3 z" class="bg"/>
+    </g>
+  </defs>
+
+  <!-- brittle -->
+  <rect x="6" y="6" width="428" height="428" class="frame"/>
+  <text x="24" y="36" font-size="16" font-weight="700" class="orange">Brittle</text>
+  <text x="24" y="64" font-size="14" font-weight="600" class="orange">1. drive 100 meters forward</text>
+  <text x="24" y="84" font-size="14" font-weight="600" class="orange">2. turn 90 degrees right</text>
+  <text x="24" y="104" font-size="14" font-weight="600" class="orange">3. drive another 50 meters</text>
+  <use href="#map"/>
+  <path d="M170,395 L170,265 L268,265" fill="none" stroke-width="4" class="orange-s" marker-end="url(#arrow-o)"/>
+  <use href="#robot" x="170" y="395"/>
+  <g class="orange-s" stroke-width="4" stroke-linecap="round">
+    <line x1="276" y1="255" x2="296" y2="275"/>
+    <line x1="296" y1="255" x2="276" y2="275"/>
+  </g>
+  <text x="286" y="300" text-anchor="middle" font-size="13" font-weight="700" class="orange">off the cliff</text>
+
+  <!-- resilient -->
+  <g transform="translate(440,0)">
+    <rect x="6" y="6" width="428" height="428" class="frame"/>
+    <text x="24" y="36" font-size="16" font-weight="700" class="green">Resilient</text>
+    <text x="24" y="64" font-size="14" font-weight="600" class="green">1. turn right at the stop light</text>
+    <text x="24" y="84" font-size="14" font-weight="600" class="green">2. stop at the first house</text>
+    <use href="#map"/>
+    <path d="M170,395 L170,200 L304,200" fill="none" stroke-width="4" class="green-s" marker-end="url(#arrow-g)"/>
+    <use href="#robot" x="170" y="395"/>
+    <path d="M318,206 L326,214 L342,196" fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" class="green-s"/>
+    <text x="332" y="236" text-anchor="middle" font-size="13" font-weight="700" class="green">home</text>
+  </g>
+</svg>

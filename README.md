@@ -1,70 +1,66 @@
 # pgdeclare
 
-**Your database schema should be code you can read.**
+pgdeclare is a Postgres schema differ.
 
-With migration files it is not. The shape of a table is the sum of every
-`ALTER` ever written against it, so answering "what columns does `account`
-have, and which are nullable?" means replaying the history in your head or
-asking a live database. Reviewers read deltas, not the schema. An LLM reading
-the repository sees the same deltas and has to reconstruct the state too, and
-gets it wrong in the same places people do. Managing state in code is hard
-enough; when the code *is* the state, written as a pile of changes, it is
-rough.
+## Philosophy
 
-pgdeclare keeps the schema as declarations: one `CREATE TABLE` per table, in
-plain SQL files, always describing the database as it is now. You change a
-table by editing its definition. pgdeclare builds the declared schema in a
-scratch database, diffs it against the live one through `pg_catalog`, and
-applies the difference.
+### Finding what you're looking for
 
-A diff cannot infer everything, such as a rename or a backfill. For those you
-write small imperative `@migrate-before` / `@migrate-after` blocks next to the
-DDL they belong to. Each runs once per database and is recorded in a hash
-ledger, so an edit after it ran is refused rather than silently ignored.
-Destructive changes on tables that hold data need an explicit `@drop`
-directive.
+*All* answerable questions are the narrow application of a single universal root question: how to find what you're looking for.  Databases solve this problem for applications by getting developers to specify the shape of their data and how they plan on using it.  For example, phone books, if you are old enough to have seen them and still young enough to remember them, organize the data in them first by last name, then by first name. In exchange you get a phone number.  However, you cannot (in any reasonable amount of time) find a name given a phone number (even though caller ID could be useful) because the phone book has been organized around looking up phone numbers by name and not names by phone number.
+
+SQL is a language that lets developers specify how their data should be organized and what kinds of records you can retrieve quickly.  It's used in pretty much everything that handles any non-trivial amount of data.  It's also special in that it describes *what* you want and it's up to the database to decide *how* to fulfill the request.  This feature makes using databases vastly easier than it otherwise would be and yet, changing a SQL database can be rather unpleasant.
+
+### Migrations: when the code is state
+
+The problem is that changing a database's shape requires "migrations" -- a way of directing the database to its desired state given its current state.  Consider the difference between these two programs controlling a robot:
+
+**Brittle:**
 
 ```text
-schema files ──build──▶ plan database ──introspect──┐
-                                                    ├─▶ diff ─▶ apply ─▶ re-diff (must be empty)
-live database ─────────────────────introspect───────┘
+1. drive 100 meters forward
+2. turn 90 degrees right
+3. drive another 50 meters
 ```
 
-Status: **0.1.0, alpha.** The engine has run the production schema of
-[Powertime](https://powertime.org) since it went into service on
-10 December 2025. The public API may change before 1.0.
+**Resilient:**
 
-## Why
+```text
+1. turn right at the stop light
+2. stop at the first house
+```
 
-There are two common ways to evolve a Postgres schema, and both work:
+![Brittle, in orange: 1. drive 100 meters forward, 2. turn 90 degrees right, 3. drive another 50 meters. Started 50 meters back, the robot turns early and drives off a cliff. Resilient, in green: 1. turn right at the stop light, 2. stop at the first house. From the same start, it arrives at the house.](docs/images/brittle-vs-resilient.svg)
 
-- **Migration files** (a numbered sequence of up/down scripts) give you full
-  control and an exact history. The cost is readability: the current schema
-  exists only by replaying the files, so it cannot be read, reviewed or
-  reasoned about from the code alone, and every change is written twice, once
-  as "the table should look like this" in your head and once as the `ALTER`
-  that gets it there.
-- **Pure diff tools** compare a desired schema with a live one and generate the
-  `ALTER`s. The schema is readable in one place. The cost is that a diff sees
-  only structure: it cannot know that a dropped column and a new one are a
-  rename, or that a new `NOT NULL` column needs a backfill first.
+The brittle version is obviously longer (which is generally worse) but it has several other problems, the most significant of which is that each instruction requires you to understand all previous instructions to make sense of.  Consider the line `turn 90 degrees right`.  Depending on where you are, turning 90 degrees either takes you through the stop light or it drives you off a cliff.  The consequences of the command itself cannot be understood without understanding all prior commands and where they've landed you.  The same is not true of `turn right at the stop light`.  You can certainly turn at the wrong stop light if you run that command at an unexpected time, but you aren't going to turn into a car, a house, a wall, or off a cliff, because you were not where you thought you were when the command was called.  Things can still go wrong but it's harder to unleash catastrophe.  This is why handling state is something most good engineers try to squeeze into the smallest volume of code possible because it is so difficult to reason about.  Functional languages are so pleasant to use exactly because they're so good at isolating state.  But with SQL, the code itself is state.  There's a reasonable reason for this: the database, unless it's empty, *is* state, so changes to how it works need to consider what's in it.
 
-pgdeclare takes the diff approach, so the schema files are the readable
-source of truth, and adds the missing piece: the imperative steps live as
-inline blocks beside the declarations, run at a defined point (before or after
-the diff), exactly once, with their hash recorded. History still exists, in
-git, where history belongs.
+### ORMs
 
-Two design choices worth knowing:
+No matter the reason, SQL is so hard to write at scale that it was one of the early things people tried optimizing in software engineering.  The 90s saw TOPLink and then later Enterprise JavaBeans, both examples of something called Object Relational Mapping (ORM).  They helped engineers write traditional code, organized into modules, files, and functions.  It was a bit like ordering at a restaurant in a foreign country where the waiter speaks both the local language and your language but is not native in either.  You usually get what you ask for, but not always.  Some ORMs were better than others but no real system used them without heavy use of the escape hatch they all come with: the ability to write raw SQL.  The downside was that SQL was then sprinkled randomly throughout the source code of another language in a way that once again made it hard to reason about.  Backend engineering was often an exercise in skinning databases.  Business logic -- the thing that made your app special -- often ended up being a tiny part of the actual engineering effort.  ORMs also brought migration tools, like Rails migrations and Alembic, which made the tower of changes easier to write but no easier to read.
 
-- **Postgres parses your SQL.** The desired schema is not reconstructed from a
-  parser's model of your files. pgdeclare executes them in a scratch "plan"
-  database and introspects the result, so defaults, implicit constraints and
-  type normalisation come out exactly as Postgres would produce them.
-- **Postgres orders the work.** Statements, and the changes themselves, run
-  retry-until-stable: anything that fails on a missing dependency is retried
-  after the rest, until everything succeeds or no progress is made. You do not
-  maintain a dependency order.
+### NoSQL
+
+Eventually, there was a global revolt against SQL that cropped up somewhere between 2006 with Google's Bigtable paper and 2009 which saw Cassandra, MongoDB, CouchDB, Redis, and others proudly aligning themselves with the NoSQL movement.  Mongo was very easy to get going with and iterate on but SQL still won out for a host of reasons.  Chief among them was that the data model didn't just disappear -- it became an emergent property of the code, which essentially spread the same poison migrations carried, the history of every shape the data ever had, into the entire code base.  The code became state.  And so, after a long hype cycle, in 2023, Postgres became the most-used database in the Stack Overflow developer survey and SQL reasserted its dominance.
+
+### Declare the end state
+
+The point of pgdeclare is to let people write in SQL but describe the final state without building up an ever less stable tower of changes.  Reverse jenga still ends up with a pile of blocks on the floor -- it's just a bigger mess.  To set expectations: some change management is inevitable and we provide our own escape hatch for those.  And to be fair, pgdeclare is not the first schema differ -- even for Postgres -- but we couldn't find a free, open-source one that handled the SQL our code uses.  Hopefully it works for you too, and if not, pull requests are very welcome.
+
+## Overview
+
+**Your database schema should be code you can read.**
+
+With migration files, reviewers read deltas, not the schema, and an LLM reading the repository has to reconstruct the state too, getting it wrong in the same places people do. pgdeclare keeps the schema as declarations: one `CREATE TABLE` per table, in plain SQL files, always describing the database as it is now. You change a table by editing its definition. pgdeclare builds the declared schema in a scratch database, diffs it against the live one through `pg_catalog`, and applies the difference.
+
+A diff cannot infer everything, such as a rename or a backfill. For those you write small imperative `@migrate-before` / `@migrate-after` blocks next to the DDL they belong to. Each runs once per database and is recorded in a hash ledger, so an edit after it ran is refused rather than silently ignored. Destructive changes on tables that hold data need an explicit `@drop` directive.  Migrations that have run can be pruned so they don't pile up.  History still exists, in git, where history belongs.
+
+![The schema files are built into a scratch plan database and introspected. Pending @migrate-before blocks run on the live database, which is then introspected. The two are diffed, the difference is applied, @migrate-after and DO blocks run, and a second diff must come back empty.](docs/images/pipeline.svg)
+
+Status: **0.1.0.** The engine has run the production schema of [Powertime](https://powertime.org) since it went into service on 10 December 2025. Backwards compatibility may not be preserved until 1.0.
+
+## Design choices
+
+- **Postgres parses your SQL.** The desired schema is not reconstructed from a parser's model of your files. pgdeclare executes them in a scratch "plan" database and introspects the result, so defaults, implicit constraints and type normalisation come out exactly as Postgres would produce them.
+- **Postgres orders the work.** Statements, and the changes themselves, run retry-until-stable: anything that fails on a missing dependency is retried after the rest, until everything succeeds or no progress is made. You do not maintain a dependency order.
 
 ## Install
 
@@ -149,16 +145,11 @@ Options shared by both commands:
 | `--plan-database NAME` | `<db>_pgdeclare_plan_<random>` | Scratch database the declared schema is built in. Never the target database; an existing one must be owned by you and is left in place, otherwise it is created and dropped per run |
 | `-v`, `--verbose` | off | Log the engine's progress |
 
-`apply` also takes `--dry-run`, `--offline` (allow changes that lock or
-rewrite tables) and `--force` (bypass `@drop` checks, re-run edited blocks,
-continue despite non-convergence).
+`apply` also takes `--dry-run`, `--offline` (allow changes that lock or rewrite tables) and `--force` (bypass `@drop` checks, re-run edited blocks, continue despite non-convergence).
 
-Exit codes: `0` success or nothing to do, `1` error, `2` changes pending
-(`diff --exit-code` only).
+Exit codes: `0` success or nothing to do, `1` error, `2` changes pending (`diff --exit-code` only).
 
-The CLI also creates the managed schemas in the target database and installs
-any `CREATE EXTENSION` your schema files declare, in both the plan and the
-target database. The library leaves both to the caller.
+The CLI also creates the managed schemas in the target database and installs any `CREATE EXTENSION` your schema files declare, in both the plan and the target database. The library leaves both to the caller.
 
 ### Python
 
@@ -187,10 +178,7 @@ print(format_changes_summary(changes))
 apply_declared_schema(url, Path("sql"), "app_plan", config=config)
 ```
 
-`apply_declared_schema` raises `SchemaConvergenceError` if a second diff after
-applying still finds work, and a plain `Exception` with the reason for any
-other failure. Progress goes to the standard `logging` logger `pgdeclare`, and
-user-facing lines to `config.report`.
+`apply_declared_schema` raises `SchemaConvergenceError` if a second diff after applying still finds work, and a plain `Exception` with the reason for any other failure. Progress goes to the standard `logging` logger `pgdeclare`, and user-facing lines to `config.report`.
 
 ## Directives
 
@@ -204,26 +192,17 @@ ALTER TABLE note RENAME COLUMN body TO content;
 -- @end-migrate
 ```
 
-- `@migrate-before` blocks run before the diff. Use them for renames, and for
-  anything the diff must not see as drop-plus-add.
-- `@migrate-after` blocks run after the diff. Use them for backfills on
-  columns the diff just created.
-- The id after the colon is the ledger key. It must be unique; a date prefix
-  keeps them sorted and readable.
-- A block runs once per database. Its SQL is hashed (SHA-256, first 16 hex
-  digits). Editing a block after it ran is an error until you re-run with
-  `--force`.
-- Blocks are stripped before the schema is built, so the plan database never
-  sees them.
-- On a fresh database (no tables in the managed schemas) blocks are recorded
-  as satisfied without running: the schema is built straight to its final
-  state, and the upgrade path does not apply.
+- `@migrate-before` blocks run before the diff. Use them for renames, and for anything the diff must not see as drop-plus-add.
+- `@migrate-after` blocks run after the diff. Use them for backfills on columns the diff just created.
+- The id after the colon is the ledger key. It must be unique; a date prefix keeps them sorted and readable.
+- A block runs once per database. Its SQL is hashed (SHA-256, first 16 hex digits). Editing a block after it ran is an error until you re-run with `--force`.
+- Blocks are stripped before the schema is built, so the plan database never sees them.
+- On a fresh database (no tables in the managed schemas) blocks are recorded as satisfied without running: the schema is built straight to its final state, and the upgrade path does not apply.
 - Comment lines inside a block are not part of its SQL.
 
 ### `@drop`
 
-Dropping a table or a column that contains data needs explicit consent,
-written inside a block:
+Dropping a table or a column that contains data needs explicit consent, written inside a block:
 
 ```sql
 -- @migrate-before:2026-03-01_drop_legacy
@@ -233,14 +212,11 @@ SELECT 1;
 -- @end-migrate
 ```
 
-Columns are named `table.column` or `schema.table.column`; tables `table` or
-`schema.table`. Empty tables and columns can be dropped without one.
-`--force` overrides the check.
+Columns are named `table.column` or `schema.table.column`; tables `table` or `schema.table`. Empty tables and columns can be dropped without one. `--force` overrides the check.
 
 ### `DO` blocks
 
-Top-level `DO $$ ... $$;` blocks in the schema files run on every apply, after
-the diff. They must be idempotent.
+Top-level `DO $$ ... $$;` blocks in the schema files run on every apply, after the diff. They must be idempotent.
 
 ## Layout
 
@@ -251,8 +227,6 @@ Under the SQL root (`--sql-dir`, or the `sql_dir` argument):
 | `schemas/` | recursively, path order | Hand-written DDL; may carry directives |
 | `functions/` | `*.sql`, flat | Extra function definitions |
 | `generated/` | `*.sql`, flat | Generated SQL (policies, grants and so on) |
-
-File order does not matter for correctness: loading is retry-until-stable.
 
 ## What it manages
 
@@ -274,19 +248,13 @@ Within the managed schemas:
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
 
-Not managed: extensions, sequences outside identity columns, domains, comments,
-ownership, and anything outside the managed schemas. Tables whose names start
-with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, sequences outside identity columns, domains, comments, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
-Grants on a recreated view or function are replayed inside the same statement
-as the recreate, so no execution order can leave the object without its ACL.
-When a set of SECURITY DEFINER functions is passed as `locked_functions`,
-their default `PUBLIC` EXECUTE is revoked atomically with their creation.
+Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
 
 ## Configuration
 
-Everything project-specific is a field of the frozen `PgDeclareConfig`, passed
-to the entry points. The defaults describe a plain database.
+Everything project-specific is a field of the frozen `PgDeclareConfig`, passed to the entry points. The defaults describe a plain database.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -311,60 +279,32 @@ to the entry points. The defaults describe a plain database.
 | `report` | logger at INFO | Where user-facing progress lines go |
 | `on_migration_applied` | `None` | Called with `(block, connection_string)` after a block runs |
 
-The plan database must be on the same server as the target and must already
-exist; the library rebuilds `plan_recreate_schemas` in it on every run.
-`CREATE EXTENSION` statements in schema files are skipped when building the
-plan, so provision extensions in the plan database yourself (or list them in
-`bootstrap_sql_files`).
+The plan database must be on the same server as the target and must already exist; the library rebuilds `plan_recreate_schemas` in it on every run. `CREATE EXTENSION` statements in schema files are skipped when building the plan, so provision extensions in the plan database yourself (or list them in `bootstrap_sql_files`).
 
 ## Safety
 
-- **Preview first.** `pgdeclare diff` and `apply --dry-run` write nothing to
-  the target database. A dry run cannot show the effect of pending
-  `@migrate-before` blocks, and says so.
-- **Online, offline, blocked.** Every change is classified. Online changes
-  apply directly. Offline changes (SET NOT NULL, column type changes, a new
-  generation expression) lock or rewrite tables and need `--offline`
-  (`offline=True`). Blocked changes (drops of data) need `@drop`.
-- **One migration at a time.** The DDL phase takes a session advisory lock on
-  the target database and fails fast if another run holds it.
-- **Transactions.** Enum changes commit first (Postgres requires it); the rest
-  of the DDL runs in one transaction with savepoints, so a stuck run changes
-  nothing. Index builds run `CONCURRENTLY` afterwards; an invalid index left by
-  a failed build is dropped and retried.
-- **Names are data.** Every identifier written into SQL is quoted with its
-  embedded quotes doubled, every literal escaped, and `DO` blocks use a dollar
-  tag their body cannot contain, so an object name chosen by a less privileged
-  role cannot inject SQL into the migrator's session.
-- **Passwords are not shown.** A role password declared in the schema files is
-  executed but masked as `PASSWORD '***'` in `diff`, `diff --json`, dry-run
-  output and logs (`Change.to_display_sql()`). Roles are cluster-wide, so
-  building the plan database on the same server creates declared roles there
-  too.
-- **Convergence check.** After applying, the database is diffed again. Anything
-  left over fails the run, because one run must reach the declared schema.
+- **Preview first.** `pgdeclare diff` and `apply --dry-run` write nothing to the target database. A dry run cannot show the effect of pending `@migrate-before` blocks, and says so.
+- **Online, offline, blocked.** Every change is classified. Online changes apply directly. Offline changes (SET NOT NULL, column type changes, a new generation expression) lock or rewrite tables and need `--offline` (`offline=True`). Blocked changes (drops of data) need `@drop`.
+- **One migration at a time.** The DDL phase takes a session advisory lock on the target database and fails fast if another run holds it.
+- **Transactions.** Enum changes commit first (Postgres requires it); the rest of the DDL runs in one transaction with savepoints, so a stuck run changes nothing. Index builds run `CONCURRENTLY` afterwards; an invalid index left by a failed build is dropped and retried.
+- **Names are data.** Every identifier written into SQL is quoted with its embedded quotes doubled, every literal escaped, and `DO` blocks use a dollar tag their body cannot contain, so an object name chosen by a less privileged role cannot inject SQL into the migrator's session.
+- **Passwords are not shown.** A role password declared in the schema files is executed but masked as `PASSWORD '***'` in `diff`, `diff --json`, dry-run output and logs (`Change.to_display_sql()`). Roles are cluster-wide, so building the plan database on the same server creates declared roles there too.
+- **Convergence check.** After applying, the database is diffed again. Anything left over fails the run, because one run must reach the declared schema.
 
 ## Supported PostgreSQL versions
 
 The suite runs against PostgreSQL 14, 15, 16, 17 and 18 in CI.
 
 - `security_invoker` views need PostgreSQL 15 or later.
-- Changing the expression of a generated column uses
-  `ALTER COLUMN ... SET EXPRESSION`, which needs PostgreSQL 17 or later. On
-  14 to 16, do that change by hand in a `@migrate-before` block.
-- PostgreSQL 18 records `NOT NULL` as a constraint; pgdeclare models it on the
-  column on every version, so plans are identical.
+- Changing the expression of a generated column uses `ALTER COLUMN ... SET EXPRESSION`, which needs PostgreSQL 17 or later. On 14 to 16, do that change by hand in a `@migrate-before` block.
+- PostgreSQL 18 records `NOT NULL` as a constraint; pgdeclare models it on the column on every version, so plans are identical.
 
 ## Contributing
 
-Issues and pull requests are welcome on
-[GitHub](https://github.com/powertime-org/pgdeclare). See
-[CONTRIBUTING.md](CONTRIBUTING.md) for running the tests, and
-[SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+Issues and pull requests are welcome on [GitHub](https://github.com/powertime-org/pgdeclare). See [CONTRIBUTING.md](CONTRIBUTING.md) for running the tests, and [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-Extracted from [Powertime](https://powertime.org), where it manages the
-application's schema.
+Extracted from [Powertime](https://powertime.org), where it manages the application's schema.
