@@ -14,6 +14,7 @@ from psycopg2.extras import RealDictCursor
 from .quoting import quote_ident, quote_literal
 from .config import PgDeclareConfig, logger, resolve
 from .models import (
+    PUBLISH_ACTIONS,
     Column,
     Collation,
     Comment,
@@ -24,14 +25,18 @@ from .models import (
     Dependency,
     Domain,
     EnumType,
+    EventTrigger,
     Function,
     Grant,
     Index,
     MaterializedView,
     Policy,
     RangeType,
+    Publication,
+    PublicationTable,
     Role,
     RoleMembership,
+    Rule,
     Schema,
     Sequence,
     Table,
@@ -96,6 +101,8 @@ def introspect_schema(
             triggers = _query_triggers(conn, schema)
             result.triggers.update(triggers)
 
+            result.rules.update(_query_rules(conn, schema))
+
             enums = _query_enums(conn, schema)
             result.enums.update(enums)
 
@@ -143,6 +150,10 @@ def introspect_schema(
 
         # Query memberships for managed roles
         result.role_memberships = _query_role_memberships(conn, managed_roles)
+
+        # Database-level objects, whichever schemas they reach into.
+        result.publications = _query_publications(conn, cfg.search_path_sql)
+        result.event_triggers = _query_event_triggers(conn)
 
     return result
 
@@ -674,6 +685,176 @@ def _query_triggers(conn, schema: str) -> dict[str, Trigger]:
                 function_name=row["function_name"],
             )
             triggers[trigger.qualified_key] = trigger
+
+    return triggers
+
+
+def _query_rules(conn, schema: str) -> dict[str, Rule]:
+    """Query rewrite rules on the tables of `schema`.
+
+    A view's `_RETURN` rule is the view itself and is left to the view diff.
+    """
+    rules: dict[str, Rule] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                r.rulename AS rule_name,
+                c.relname AS table_name,
+                pg_get_ruledef(r.oid) AS definition,
+                r.ev_enabled AS enabled
+            FROM pg_rewrite r
+            JOIN pg_class c ON c.oid = r.ev_class
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+              AND c.relkind = 'r'
+              AND r.rulename <> '_RETURN'
+              AND NOT c.relname ~ '^_'
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.deptype = 'e'
+                    AND ((ext.classid = 'pg_class'::regclass AND ext.objid = c.oid)
+                      OR (ext.classid = 'pg_rewrite'::regclass AND ext.objid = r.oid))
+              )
+            ORDER BY c.relname, r.rulename
+            """,
+            (schema,),
+        )
+        for row in cur.fetchall():
+            rule = Rule(
+                schema=schema,
+                table=row["table_name"],
+                name=row["rule_name"],
+                definition=row["definition"],
+                enabled=row["enabled"],
+            )
+            rules[rule.qualified_key] = rule
+
+    return rules
+
+
+_GENERATED_COLUMNS = {"n": "none", "s": "stored"}
+
+
+def _query_publications(conn, search_path: str) -> dict[str, Publication]:
+    """Query every publication in the database, with its tables and schemas.
+
+    Column lists, row filters and TABLES IN SCHEMA exist from PostgreSQL 15,
+    publish_generated_columns from 18.
+    """
+    version = conn.server_version
+    publications: dict[str, Publication] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Row filters print with names relative to the search_path.
+        cur.execute(f"SET search_path TO {search_path}")
+        gencols = ", p.pubgencols" if version >= 180000 else ""
+        cur.execute(
+            f"""
+            SELECT p.pubname, p.puballtables, p.pubinsert, p.pubupdate,
+                   p.pubdelete, p.pubtruncate, p.pubviaroot{gencols}
+            FROM pg_publication p
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pg_depend ext
+                WHERE ext.classid = 'pg_publication'::regclass
+                  AND ext.objid = p.oid AND ext.deptype = 'e'
+            )
+            ORDER BY p.pubname
+            """
+        )
+        for row in cur.fetchall():
+            publish = tuple(action for action in PUBLISH_ACTIONS if row[f"pub{action}"])
+            publications[row["pubname"]] = Publication(
+                name=row["pubname"],
+                all_tables=bool(row["puballtables"]),
+                publish=publish,
+                via_root=bool(row["pubviaroot"]),
+                generated_columns=_GENERATED_COLUMNS.get(row["pubgencols"])
+                if version >= 180000
+                else None,
+            )
+
+        if version >= 150000:
+            members = """
+                CASE WHEN pr.prattrs IS NULL THEN NULL ELSE ARRAY(
+                    SELECT a.attname FROM pg_attribute a
+                    WHERE a.attrelid = pr.prrelid
+                      AND a.attnum = ANY(pr.prattrs::int2[])
+                    ORDER BY a.attnum
+                ) END AS columns,
+                pg_get_expr(pr.prqual, pr.prrelid) AS row_filter"""
+        else:
+            members = "NULL::name[] AS columns, NULL::text AS row_filter"
+        cur.execute(
+            f"""
+            SELECT p.pubname, n.nspname, c.relname, {members}
+            FROM pg_publication_rel pr
+            JOIN pg_publication p ON p.oid = pr.prpubid
+            JOIN pg_class c ON c.oid = pr.prrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            ORDER BY p.pubname, n.nspname, c.relname
+            """
+        )
+        for row in cur.fetchall():
+            publication = publications.get(row["pubname"])
+            if publication is None:
+                continue
+            member = PublicationTable(
+                schema=row["nspname"],
+                name=row["relname"],
+                columns=tuple(row["columns"] or ()),
+                row_filter=row["row_filter"],
+            )
+            publication.tables[member.qualified_name] = member
+
+        if version >= 150000:
+            cur.execute(
+                """
+                SELECT p.pubname, n.nspname
+                FROM pg_publication_namespace pn
+                JOIN pg_publication p ON p.oid = pn.pnpubid
+                JOIN pg_namespace n ON n.oid = pn.pnnspid
+                ORDER BY p.pubname, n.nspname
+                """
+            )
+            for row in cur.fetchall():
+                publication = publications.get(row["pubname"])
+                if publication is not None:
+                    publication.schemas += (row["nspname"],)
+
+    return publications
+
+
+def _query_event_triggers(conn) -> dict[str, EventTrigger]:
+    """Query every event trigger in the database not owned by an extension."""
+    triggers: dict[str, EventTrigger] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT e.evtname, e.evtevent, np.nspname AS function_schema,
+                   p.proname AS function_name, e.evttags, e.evtenabled
+            FROM pg_event_trigger e
+            JOIN pg_proc p ON p.oid = e.evtfoid
+            JOIN pg_namespace np ON np.oid = p.pronamespace
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pg_depend ext
+                WHERE ext.classid = 'pg_event_trigger'::regclass
+                  AND ext.objid = e.oid AND ext.deptype = 'e'
+            )
+            ORDER BY e.evtname
+            """
+        )
+        for row in cur.fetchall():
+            triggers[row["evtname"]] = EventTrigger(
+                name=row["evtname"],
+                event=row["evtevent"],
+                function_schema=row["function_schema"],
+                function_name=row["function_name"],
+                tags=tuple(sorted(row["evttags"] or ())),
+                enabled=row["evtenabled"],
+            )
 
     return triggers
 

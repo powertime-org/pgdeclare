@@ -34,6 +34,17 @@ may change in minor releases.
 - Column collations are compared and converged (`ALTER COLUMN ... TYPE ...
   COLLATE`), and a new table or column is created with its declared
   `COLLATE`, which used to be dropped.
+- Publications: created, converged in place (`ALTER PUBLICATION ... ADD` /
+  `DROP` tables and `TABLES IN SCHEMA`, column lists and row filters on
+  PostgreSQL 15+, `SET (...)` publish options) and dropped when undeclared,
+  but only when every table they publish is managed. `FOR ALL TABLES` and
+  empty publications are never dropped unless declared. Subscriptions are not
+  managed.
+- Rewrite rules on tables (`CREATE OR REPLACE RULE`, enabled state), never a
+  view's `_RETURN` rule.
+- Event triggers (event, `WHEN TAG` filter, function, enabled state); an
+  undeclared one is dropped only when its function is in a managed schema.
+  Creating one needs a superuser.
 
 ### Changed
 
