@@ -407,6 +407,55 @@ class Domain:
         )
 
 
+@dataclass
+class Sequence:
+    """A standalone sequence (CREATE SEQUENCE, or the one a serial column makes).
+
+    Identity-column sequences are not modelled here: the column owns them.
+    Options are compared as the catalog stores them (pg_sequence), so a
+    declaration that relies on defaults and one that spells them out are equal.
+    The current value is state, not schema, and is never compared.
+    """
+
+    schema: str
+    name: str
+    data_type: str = "bigint"  # format_type(seqtypid): smallint, integer, bigint
+    increment: int = 1
+    min_value: int = 1
+    max_value: int = 9223372036854775807
+    start: int = 1
+    cache: int = 1
+    cycle: bool = False
+    # OWNED BY: (schema, table, column) of the owning column, or None.
+    owned_by: Optional[tuple[str, str, str]] = None
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    def options_equal(self, other: "Sequence") -> bool:
+        """Whether every CREATE/ALTER SEQUENCE option matches (not ownership)."""
+        return (
+            self.data_type == other.data_type
+            and self.increment == other.increment
+            and self.min_value == other.min_value
+            and self.max_value == other.max_value
+            and self.start == other.start
+            and self.cache == other.cache
+            and self.cycle == other.cycle
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Sequence):
+            return NotImplemented
+        return (
+            self.schema == other.schema
+            and self.name == other.name
+            and self.options_equal(other)
+            and self.owned_by == other.owned_by
+        )
+
+
 def normalize_view_reloptions(raw: Optional[list[str]]) -> list[str]:
     """Canonicalize a view's `pg_class.reloptions` array for comparison.
 
@@ -609,6 +658,9 @@ class Schema:
     )  # key = schema.type
     domains: dict[str, Domain] = field(default_factory=dict)  # key = schema.domain
     views: dict[str, View] = field(default_factory=dict)  # key = schema.view
+    sequences: dict[str, Sequence] = field(
+        default_factory=dict
+    )  # key = schema.sequence
     grants: list[Grant] = field(default_factory=list)
     dependencies: list[Dependency] = field(default_factory=list)
     roles: dict[str, Role] = field(default_factory=dict)  # key = role name

@@ -4,6 +4,7 @@ import json
 import tomllib
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psycopg2
 import pytest
@@ -375,3 +376,64 @@ def test_an_owned_plan_database_is_reused_and_kept(tmp_path, target):
         assert _rows(target, f"SELECT 1 FROM pg_database WHERE datname = '{plan}'")
     finally:
         _admin(target, f'DROP DATABASE IF EXISTS "{plan}" WITH (FORCE)')
+
+
+@pytest.mark.integration
+def test_an_undeclared_managed_role_is_a_clear_error(tmp_path, target, capsys):
+    sql_dir = tmp_path / "sql"
+    role = f"pgdeclare_reader_{uuid.uuid4().hex[:8]}"
+    base = ["--database-url", target, "--sql-dir", str(sql_dir), "--role", role]
+    _write(sql_dir, "CREATE TABLE note (id int PRIMARY KEY);")
+    assert main(["diff", *base]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert f"managed role(s) not found: {role}" in err
+    assert "CREATE ROLE" in err
+
+    _write(sql_dir, f'CREATE ROLE "{role}" NOLOGIN;', name="00_roles.sql")
+    try:
+        assert main(["apply", *base]) == EXIT_OK
+    finally:
+        _admin(target, f'DROP ROLE IF EXISTS "{role}"')
+
+
+@pytest.mark.integration
+def test_a_dry_run_rename_is_not_a_blocked_drop(tmp_path, target, capsys):
+    sql_dir = tmp_path / "sql"
+    base = ["--database-url", target, "--sql-dir", str(sql_dir)]
+    _write(sql_dir, "CREATE TABLE note (id int PRIMARY KEY, author text);")
+    assert main(["apply", *base]) == EXIT_OK
+    _admin(target, "INSERT INTO note VALUES (1, 'ada')")
+
+    _write(
+        sql_dir,
+        "CREATE TABLE note (id int PRIMARY KEY, writer text);\n"
+        "-- @migrate-before:2026-02-01_rename_author\n"
+        "ALTER TABLE note RENAME COLUMN author TO writer;\n"
+        "-- @end-migrate\n",
+    )
+    # The dry run cannot see the rename, so the drop is a warning, not an error.
+    assert main(["apply", "--dry-run", *base]) == EXIT_OK
+    assert _rows(target, "SELECT author FROM note") == [("ada",)]
+    assert main(["apply", *base]) == EXIT_OK
+    assert _rows(target, "SELECT writer FROM note") == [("ada",)]
+
+    # With nothing pending, a real data-loss drop still fails the dry run.
+    _write(sql_dir, "CREATE TABLE note (id int PRIMARY KEY);")
+    assert main(["apply", "--dry-run", *base]) == EXIT_ERROR
+
+
+@pytest.mark.integration
+def test_a_role_without_createdb_is_told_what_to_do(tmp_path, target, capsys):
+    sql = str(_write(tmp_path / "sql", "CREATE TABLE note (id int PRIMARY KEY);"))
+    role = f"pgdeclare_nocreatedb_{uuid.uuid4().hex[:8]}"
+    _admin(target, f"CREATE ROLE \"{role}\" LOGIN PASSWORD 'pw'")
+    try:
+        parsed = urlsplit(target)
+        url = parsed._replace(
+            netloc=f"{role}:pw@{parsed.hostname}:{parsed.port or 5432}"
+        ).geturl()
+        assert main(["diff", "--database-url", url, "--sql-dir", sql]) == EXIT_ERROR
+        err = capsys.readouterr().err
+        assert "lacks CREATEDB" in err and "--plan-database" in err
+    finally:
+        _admin(target, f'DROP ROLE IF EXISTS "{role}"')

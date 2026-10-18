@@ -9,13 +9,23 @@ may change in minor releases.
 
 ### Added
 
-- Domain types (`CREATE DOMAIN`) in the managed schemas: created, default and
-  NOT NULL altered in place (`SET NOT NULL` is offline), CHECK constraints
-  added `NOT VALID` then validated, replaced or dropped, and undeclared domains
-  dropped once the columns using them are gone. A base type or collation
-  change drops and re-creates the domain while nothing uses it, and is refused
-  with the dependents named otherwise. Columns typed with a domain introspect
-  and diff by the domain's name.
+### Changed
+
+- README: the plan database's privilege needs, the PostgreSQL 14 `public`
+  ownership caveat, a corrected Python example, and a comparison with other
+  tools.
+
+### Fixed
+
+- `serial` and `bigserial` columns on a fresh database: the table's
+  `nextval()` default used to name a sequence that was never created.
+- A managed role that exists nowhere is a clear error naming the role, not a
+  raw `UndefinedObject` traceback from introspection.
+- `apply --dry-run` with pending `@migrate-before` blocks reports drops it
+  cannot rule out (a rename looks like drop plus add) as warnings, instead of
+  failing with a `@drop` error the real run would not raise.
+- A role without `CREATEDB` is told to create a plan database and pass
+  `--plan-database`, instead of a bare permission error.
 
 ## [0.1.0] - 2026-10-16
 

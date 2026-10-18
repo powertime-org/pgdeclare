@@ -27,6 +27,7 @@ from .models import (
     Role,
     RoleMembership,
     Schema,
+    Sequence,
     Table,
     Trigger,
     View,
@@ -66,6 +67,11 @@ def introspect_schema(
     result = Schema()
 
     with psycopg2.connect(connection_string) as conn:
+        # A managed role that does not exist (yet) has no grants to read, and
+        # asking pg_catalog for them fails with UndefinedObject.
+        result.roles = _query_roles(conn, managed_roles)
+        existing_roles = [r for r in managed_roles if r in result.roles]
+
         # Query each object type
         for schema in schemas:
             tables = _query_tables(conn, schema, cfg.search_path_sql)
@@ -95,7 +101,10 @@ def introspect_schema(
             views = _query_views(conn, schema)
             result.views.update(views)
 
-            for role in managed_roles:
+            sequences = _query_sequences(conn, schema)
+            result.sequences.update(sequences)
+
+            for role in existing_roles:
                 grants = _query_grants(conn, schema, role)
                 result.grants.extend(grants)
 
@@ -103,12 +112,11 @@ def introspect_schema(
         result.dependencies = _query_dependencies(conn, schemas)
 
         # Query schema-level grants for all managed roles
-        for role in managed_roles:
+        for role in existing_roles:
             schema_grants = _query_schema_grants(conn, role)
             result.grants.extend(schema_grants)
 
-        # Query roles and memberships for managed roles
-        result.roles = _query_roles(conn, managed_roles)
+        # Query memberships for managed roles
         result.role_memberships = _query_role_memberships(conn, managed_roles)
 
     return result
@@ -703,6 +711,98 @@ def _query_views(conn, schema: str) -> dict[str, View]:
     return views
 
 
+# The sequences of a schema that the engine manages: every sequence except the
+# ones an identity column owns (pg_depend 'i'; the column manages those), the
+# ones an extension owns, and the ones whose name, or whose owning table's
+# name, starts with `_` (ignored like such tables). A serial column's sequence
+# is included: it is catalog-identical to a declared sequence OWNED BY the
+# column, so the two are modelled alike and the table's nextval() default has
+# something to point at on a fresh database.
+_MANAGED_SEQUENCES_SQL = """
+    SELECT c.oid, c.relname
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S'
+      AND n.nspname = %s
+      AND NOT c.relname ~ '^_'
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+            AND (
+                d.deptype IN ('i', 'e')
+                OR (
+                    d.deptype = 'a'
+                    AND d.refclassid = 'pg_class'::regclass
+                    AND EXISTS (
+                        SELECT 1 FROM pg_class t
+                        WHERE t.oid = d.refobjid AND t.relname ~ '^_'
+                    )
+                )
+            )
+      )
+"""
+
+
+def _query_sequences(conn, schema: str) -> dict[str, Sequence]:
+    """Query the managed sequences of a schema (see _MANAGED_SEQUENCES_SQL)."""
+    sequences: dict[str, Sequence] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            WITH managed AS ({_MANAGED_SEQUENCES_SQL})
+            SELECT
+                m.relname AS sequence_name,
+                format_type(s.seqtypid, NULL) AS data_type,
+                s.seqincrement AS increment,
+                s.seqmin AS min_value,
+                s.seqmax AS max_value,
+                s.seqstart AS start,
+                s.seqcache AS cache,
+                s.seqcycle AS cycle,
+                owner_ns.nspname AS owner_schema,
+                owner_tbl.relname AS owner_table,
+                owner_col.attname AS owner_column
+            FROM managed m
+            JOIN pg_sequence s ON s.seqrelid = m.oid
+            LEFT JOIN pg_depend od
+              ON od.classid = 'pg_class'::regclass AND od.objid = m.oid
+             AND od.refclassid = 'pg_class'::regclass
+             AND od.deptype = 'a' AND od.refobjsubid > 0
+            LEFT JOIN pg_class owner_tbl ON owner_tbl.oid = od.refobjid
+            LEFT JOIN pg_namespace owner_ns ON owner_ns.oid = owner_tbl.relnamespace
+            LEFT JOIN pg_attribute owner_col
+              ON owner_col.attrelid = od.refobjid AND owner_col.attnum = od.refobjsubid
+            ORDER BY m.relname
+            """,
+            (schema,),
+        )
+
+        for row in cur.fetchall():
+            owned_by = None
+            if row["owner_table"] is not None:
+                owned_by = (
+                    row["owner_schema"],
+                    row["owner_table"],
+                    row["owner_column"],
+                )
+            seq = Sequence(
+                schema=schema,
+                name=row["sequence_name"],
+                data_type=row["data_type"],
+                increment=row["increment"],
+                min_value=row["min_value"],
+                max_value=row["max_value"],
+                start=row["start"],
+                cache=row["cache"],
+                cycle=row["cycle"],
+                owned_by=owned_by,
+            )
+            sequences[seq.qualified_name] = seq
+
+    return sequences
+
+
 def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
     """Query grants for a specific role."""
     grants: list[Grant] = []
@@ -804,6 +904,35 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                     schema=schema,
                     privilege=row["privilege_type"],
                     grantee=row["grantee"],
+                    column=None,
+                )
+            )
+
+        # Sequence grants (USAGE, SELECT, UPDATE). information_schema's
+        # table_privileges leaves sequences out, so read the ACL directly, and
+        # only for the sequences the engine manages.
+        cur.execute(
+            f"""
+            WITH managed AS ({_MANAGED_SEQUENCES_SQL})
+            SELECT m.relname AS object_name, a.privilege_type
+            FROM managed m
+            JOIN pg_class c ON c.oid = m.oid
+            CROSS JOIN LATERAL aclexplode(c.relacl) a
+            JOIN pg_roles r ON r.oid = a.grantee
+            WHERE r.rolname = %s
+            ORDER BY m.relname, a.privilege_type
+            """,
+            (schema, grantee),
+        )
+
+        for row in cur.fetchall():
+            grants.append(
+                Grant(
+                    object_type="SEQUENCE",
+                    object_name=row["object_name"],
+                    schema=schema,
+                    privilege=row["privilege_type"],
+                    grantee=grantee,
                     column=None,
                 )
             )

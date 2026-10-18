@@ -25,11 +25,13 @@ Status: **0.1.0.** The engine has run the production schema of [Powertime](https
 
 ```bash
 pip install pgdeclare
-# or
+# or, inside a uv project
 uv add pgdeclare
 ```
 
 Requires Python 3.12+ and a PostgreSQL 14 to 18 server.
+
+Connect as a role that owns the target database's schemas. Each run builds your schema in a scratch plan database on the same server, which by default is created and dropped per run, so the role needs `CREATEDB`. Without it, create a plan database you own (`createdb -O app app_plan`) and pass `--plan-database app_plan`.
 
 ## Quickstart
 
@@ -125,7 +127,7 @@ from pgdeclare import (
 )
 
 url = "postgresql://app:secret@localhost:5432/app"
-config = PgDeclareConfig(schemas=("public",), managed_roles=("app_reader",))
+config = PgDeclareConfig(schemas=("public",))
 
 # Preview: build the declared schema in a plan database (it must exist) and diff.
 desired = build_desired_schema(Path("sql"), url, "app_plan", config=config)
@@ -200,15 +202,16 @@ Within the managed schemas:
 | Enum types | yes | add values (in position) | no (values are never removed) |
 | Composite types | yes | no | no |
 | Domains | yes | default, NOT NULL, CHECK constraints; drop and re-create on a base type or collation change while nothing uses it | yes, after the columns that use it |
+| Sequences (standalone and serial; not identity) | yes, with every option | `ALTER SEQUENCE` options (never `RESTART`; the current value is kept); `OWNED BY` | yes, without `CASCADE` (refused while a default still uses it) |
 | Views | yes | drop and re-create; `WITH (...)` options such as `security_invoker` | yes |
 | Functions | yes | replace, or drop and re-create when the signature changes | yes |
 | Triggers | yes | drop and re-create | yes |
 | Row level security | enable, force, and policies | policies drop and re-create | yes |
-| Grants to managed roles | tables, columns, functions, schemas | revokes before grants | yes |
+| Grants to managed roles | tables, columns, functions, sequences, schemas | revokes before grants | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
 
-Not managed: extensions, sequences outside identity columns, comments, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, comments, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
 Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
 
@@ -243,7 +246,7 @@ The plan database must be on the same server as the target and must already exis
 
 ## Safety
 
-- **Preview first.** `pgdeclare diff` and `apply --dry-run` write nothing to the target database. A dry run cannot show the effect of pending `@migrate-before` blocks, and says so.
+- **Preview first.** `pgdeclare diff` and `apply --dry-run` write nothing to the target database. Declared roles are still created on the server when the plan is built, since roles are cluster-wide. A dry run cannot show the effect of pending `@migrate-before` blocks, and says so: a rename shows as a drop plus an add, reported as a warning rather than a `@drop` error.
 - **Online, offline, blocked.** Every change is classified. Online changes apply directly. Offline changes (SET NOT NULL on a column or a domain, column type changes, a new generation expression) lock or rewrite tables and need `--offline` (`offline=True`). Blocked changes (drops of data) need `@drop`.
 - **One migration at a time.** The DDL phase takes a session advisory lock on the target database and fails fast if another run holds it.
 - **Transactions.** Enum changes commit first (Postgres requires it); the rest of the DDL runs in one transaction with savepoints, so a stuck run changes nothing. Index builds run `CONCURRENTLY` afterwards; an invalid index left by a failed build is dropped and retried.
@@ -256,8 +259,22 @@ The plan database must be on the same server as the target and must already exis
 The suite runs against PostgreSQL 14, 15, 16, 17 and 18 in CI.
 
 - `security_invoker` views need PostgreSQL 15 or later.
+- On 14, `public` in a new database belongs to the bootstrap superuser, so a non-superuser needs `ALTER SCHEMA public OWNER TO <role>` in its plan database.
 - Changing the expression of a generated column uses `ALTER COLUMN ... SET EXPRESSION`, which needs PostgreSQL 17 or later. On 14 to 16, do that change by hand in a `@migrate-before` block.
 - PostgreSQL 18 records `NOT NULL` as a constraint; pgdeclare models it on the column on every version, so plans are identical.
+
+## How it compares
+
+As of October 2026. [pgschema](https://github.com/pgplex/pgschema) and [pg-delta](https://github.com/supabase/pg-toolbelt) cover more object types than pgdeclare 0.1.0 (see [What it manages](#what-it-manages)). pgdeclare's difference is where the steps a diff cannot infer live: next to the DDL they belong to, run once, and recorded.
+
+| Tool | Renames and backfills | Records what ran | Free licence | Notes |
+|------|-----------------------|------------------|--------------|-------|
+| pgdeclare | `@migrate` blocks beside the DDL | Hash ledger; edited blocks are refused | Apache-2.0 | Re-diffs after applying and fails the run if anything is left |
+| [pgschema](https://github.com/pgplex/pgschema) | Outside the tool | No; state only | Apache-2.0 | Terraform-style plan and apply; broad object coverage |
+| [pg-delta](https://github.com/supabase/pg-toolbelt) | Renames come out as drop plus add, edited by hand; never writes row changes | Through Supabase migration files | PostgreSQL | Alpha; very broad coverage; `prove` tests a plan on a clone first |
+| [Atlas](https://atlasgo.io) | Versioned migration files | Yes, in versioned mode | Apache-2.0 Community Edition | The Community Edition omits views, functions, triggers and RLS policies; the full binary is under the Atlas MSA |
+| [pg-schema-diff](https://github.com/stripe/pg-schema-diff) | Renames come out as drop plus add | No | MIT | Strong lock avoidance for online changes |
+| [migra](https://github.com/djrobstep/migra) | Not handled | No | Unlicense | Deprecated; last release 2022 |
 
 ## Contributing
 
