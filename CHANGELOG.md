@@ -5,10 +5,32 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
-## [Unreleased]
+## [0.1.1] - 2026-10-18
 
 ### Added
 
+- `--prove` (`diff --prove`, `apply --dry-run --prove`): rehearse the real
+  run, pending `@migrate` blocks included, on a throwaway clone of the
+  target; it fails if a second diff still finds work or a table lost rows
+  without a `@drop` directive.
+- Standalone sequences (`CREATE SEQUENCE`) in the managed schemas: created
+  with every option spelled out, options converged with `ALTER SEQUENCE`
+  (never `RESTART`, so the current value is kept), `OWNED BY` a column, and
+  dropped when undeclared (without `CASCADE`, so a default still using one
+  refuses the drop). Sequences are created before tables, so a `nextval()`
+  column default resolves; identity-column sequences stay with their column.
+- Grants to managed roles on sequences (`USAGE`, `SELECT`, `UPDATE`).
+- Domains (`CREATE DOMAIN`): created; default, NOT NULL and CHECK
+  constraints altered in place; a base type or collation change drops and
+  re-creates the domain while nothing uses it, and is refused naming the
+  dependents otherwise; dropped when undeclared.
+- Materialized views: created `WITH DATA` or `WITH NO DATA` as declared,
+  storage options converged in place, a changed query dropped and re-created
+  (offline) with its indexes and grants in the same statement; grants on
+  them are managed.
+- Comments (`COMMENT ON`) on the managed objects: created, updated and
+  removed, in a phase after the DDL and index builds, and written again for
+  an object the run recreates.
 - Procedures, aggregates and window functions are managed like functions:
   created, replaced with `CREATE OR REPLACE` when the signature, return type
   and kind are unchanged, otherwise dropped and re-created, and dropped when
@@ -170,5 +192,6 @@ First real release: a schema engine proven in production, extracted and made gen
 
 Placeholder release to reserve the name on PyPI. No functionality.
 
+[0.1.1]: https://github.com/powertime-org/pgdeclare/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/powertime-org/pgdeclare/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/powertime-org/pgdeclare/releases/tag/v0.0.1

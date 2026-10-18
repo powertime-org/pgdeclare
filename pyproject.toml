@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pgdeclare"
-version = "0.1.0"
+version = "0.1.1"
 description = "Declarative Postgres schemas: diff the live database against your SQL files, with before/after migration blocks and a hash ledger."
 readme = "README.md"
 license = "Apache-2.0"
