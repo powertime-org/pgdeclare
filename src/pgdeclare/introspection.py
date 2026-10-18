@@ -66,6 +66,11 @@ def introspect_schema(
     result = Schema()
 
     with psycopg2.connect(connection_string) as conn:
+        # A managed role that does not exist (yet) has no grants to read, and
+        # asking pg_catalog for them fails with UndefinedObject.
+        result.roles = _query_roles(conn, managed_roles)
+        existing_roles = [r for r in managed_roles if r in result.roles]
+
         # Query each object type
         for schema in schemas:
             tables = _query_tables(conn, schema, cfg.search_path_sql)
@@ -95,7 +100,7 @@ def introspect_schema(
             sequences = _query_sequences(conn, schema)
             result.sequences.update(sequences)
 
-            for role in managed_roles:
+            for role in existing_roles:
                 grants = _query_grants(conn, schema, role)
                 result.grants.extend(grants)
 
@@ -103,12 +108,11 @@ def introspect_schema(
         result.dependencies = _query_dependencies(conn, schemas)
 
         # Query schema-level grants for all managed roles
-        for role in managed_roles:
+        for role in existing_roles:
             schema_grants = _query_schema_grants(conn, role)
             result.grants.extend(schema_grants)
 
-        # Query roles and memberships for managed roles
-        result.roles = _query_roles(conn, managed_roles)
+        # Query memberships for managed roles
         result.role_memberships = _query_role_memberships(conn, managed_roles)
 
     return result

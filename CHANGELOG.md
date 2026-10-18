@@ -17,10 +17,23 @@ may change in minor releases.
   column default resolves; identity-column sequences stay with their column.
 - Grants to managed roles on sequences (`USAGE`, `SELECT`, `UPDATE`).
 
+### Changed
+
+- README: the plan database's privilege needs, the PostgreSQL 14 `public`
+  ownership caveat, a corrected Python example, and a comparison with other
+  tools.
+
 ### Fixed
 
 - `serial` and `bigserial` columns on a fresh database: the table's
   `nextval()` default used to name a sequence that was never created.
+- A managed role that exists nowhere is a clear error naming the role, not a
+  raw `UndefinedObject` traceback from introspection.
+- `apply --dry-run` with pending `@migrate-before` blocks reports drops it
+  cannot rule out (a rename looks like drop plus add) as warnings, instead of
+  failing with a `@drop` error the real run would not raise.
+- A role without `CREATEDB` is told to create a plan database and pass
+  `--plan-database`, instead of a bare permission error.
 
 ## [0.1.0] - 2026-10-16
 
