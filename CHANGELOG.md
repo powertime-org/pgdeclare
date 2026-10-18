@@ -9,14 +9,6 @@ may change in minor releases.
 
 ### Added
 
-- Standalone sequences (`CREATE SEQUENCE`) in the managed schemas: created
-  with every option spelled out, options converged with `ALTER SEQUENCE`
-  (never `RESTART`, so the current value is kept), `OWNED BY` a column, and
-  dropped when undeclared (without `CASCADE`, so a default still using one
-  refuses the drop). Sequences are created before tables, so a `nextval()`
-  column default resolves; identity-column sequences stay with their column.
-- Grants to managed roles on sequences (`USAGE`, `SELECT`, `UPDATE`).
-
 ### Changed
 
 - README: the plan database's privilege needs, the PostgreSQL 14 `public`

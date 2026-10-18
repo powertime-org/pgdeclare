@@ -201,6 +201,7 @@ Within the managed schemas:
 | Indexes | yes, `CONCURRENTLY` | drop and re-create | yes |
 | Enum types | yes | add values (in position) | no (values are never removed) |
 | Composite types | yes | no | no |
+| Domains | yes | default, NOT NULL, CHECK constraints; drop and re-create on a base type or collation change while nothing uses it | yes, after the columns that use it |
 | Sequences (standalone and serial; not identity) | yes, with every option | `ALTER SEQUENCE` options (never `RESTART`; the current value is kept); `OWNED BY` | yes, without `CASCADE` (refused while a default still uses it) |
 | Views | yes | drop and re-create; `WITH (...)` options such as `security_invoker` | yes |
 | Functions | yes | replace, or drop and re-create when the signature changes | yes |
@@ -210,7 +211,7 @@ Within the managed schemas:
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
 
-Not managed: extensions, domains, comments, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, comments, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
 Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
 
@@ -246,7 +247,7 @@ The plan database must be on the same server as the target and must already exis
 ## Safety
 
 - **Preview first.** `pgdeclare diff` and `apply --dry-run` write nothing to the target database. Declared roles are still created on the server when the plan is built, since roles are cluster-wide. A dry run cannot show the effect of pending `@migrate-before` blocks, and says so: a rename shows as a drop plus an add, reported as a warning rather than a `@drop` error.
-- **Online, offline, blocked.** Every change is classified. Online changes apply directly. Offline changes (SET NOT NULL, column type changes, a new generation expression) lock or rewrite tables and need `--offline` (`offline=True`). Blocked changes (drops of data) need `@drop`.
+- **Online, offline, blocked.** Every change is classified. Online changes apply directly. Offline changes (SET NOT NULL on a column or a domain, column type changes, a new generation expression) lock or rewrite tables and need `--offline` (`offline=True`). Blocked changes (drops of data) need `@drop`.
 - **One migration at a time.** The DDL phase takes a session advisory lock on the target database and fails fast if another run holds it.
 - **Transactions.** Enum changes commit first (Postgres requires it); the rest of the DDL runs in one transaction with savepoints, so a stuck run changes nothing. Index builds run `CONCURRENTLY` afterwards; an invalid index left by a failed build is dropped and retried.
 - **Names are data.** Every identifier written into SQL is quoted with its embedded quotes doubled, every literal escaped, and `DO` blocks use a dollar tag their body cannot contain, so an object name chosen by a less privileged role cannot inject SQL into the migrator's session.

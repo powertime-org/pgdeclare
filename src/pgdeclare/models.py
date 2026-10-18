@@ -365,6 +365,49 @@ class CompositeType:
 
 
 @dataclass
+class Domain:
+    """PostgreSQL domain type definition (typtype = 'd').
+
+    `base_type` is format_type() of the underlying type, `collation` the
+    quoted, schema-qualified collation when it differs from the base type's
+    default (None otherwise). NOT NULL is modelled on the domain, like a
+    column's, so PostgreSQL 18's NOT NULL constraint rows are not managed twice.
+    `constraints` holds the CHECK constraints, matched by name.
+
+    `dependents` describes what uses the domain in the live database (columns,
+    function arguments, other domains). It is not part of equality: it decides
+    whether a base-type change may drop and recreate the domain.
+    """
+
+    schema: str
+    name: str
+    base_type: str
+    nullable: bool = True
+    default: Optional[str] = None
+    collation: Optional[str] = None
+    constraints: list[Constraint] = field(default_factory=list)
+    dependents: list[str] = field(default_factory=list)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Domain):
+            return NotImplemented
+        return (
+            self.schema == other.schema
+            and self.name == other.name
+            and self.base_type == other.base_type
+            and self.nullable == other.nullable
+            and self.default == other.default
+            and self.collation == other.collation
+            and sorted(self.constraints, key=lambda c: c.name)
+            == sorted(other.constraints, key=lambda c: c.name)
+        )
+
+
+@dataclass
 class Sequence:
     """A standalone sequence (CREATE SEQUENCE, or the one a serial column makes).
 
@@ -613,6 +656,7 @@ class Schema:
     composite_types: dict[str, CompositeType] = field(
         default_factory=dict
     )  # key = schema.type
+    domains: dict[str, Domain] = field(default_factory=dict)  # key = schema.domain
     views: dict[str, View] = field(default_factory=dict)  # key = schema.view
     sequences: dict[str, Sequence] = field(
         default_factory=dict

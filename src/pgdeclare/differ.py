@@ -11,16 +11,22 @@ from typing import Callable, Optional, Union
 from .changes import (
     AddColumn,
     AddConstraint,
+    AddDomainConstraint,
     AddEnumValue,
     AddIdentity,
     AlterColumnDropExpression,
     AlterColumnSetExpression,
     AlterColumnType,
+    AlterDomainDropDefault,
+    AlterDomainDropNotNull,
+    AlterDomainSetDefault,
+    AlterDomainSetNotNull,
     AlterRole,
     AlterSequence,
     AlterViewOptions,
     Change,
     CreateCompositeType,
+    CreateDomain,
     CreateEnum,
     CreateFunction,
     CreateIndex,
@@ -33,12 +39,16 @@ from .changes import (
     DEFERRED_CONSTRAINT_TYPES,
     DisableRLS,
     DropAndCreateConstraint,
+    DropAndCreateDomain,
+    DropAndCreateDomainConstraint,
     DropAndCreateFunction,
     DropAndCreatePolicy,
     DropAndCreateView,
     DropColumn,
     DropConstraint,
     DropDefault,
+    DropDomain,
+    DropDomainConstraint,
     DropFunction,
     DropIdentity,
     DropIndex,
@@ -61,12 +71,14 @@ from .changes import (
     SetSequenceOwner,
     SetNotNull,
     ValidateConstraint,
+    ValidateDomainConstraint,
     grant_replay_note,
 )
 from .config import PgDeclareConfig, resolve
 from .models import (
     ChangeCategory,
     Column,
+    Domain,
     Function,
     Schema,
     Table,
@@ -110,13 +122,17 @@ def compute_diff(
     # Diff each object type
     # Order matters for dependency resolution:
     # - Enums before composite types (composite types may reference enums)
+    # - Domains before tables (columns may be typed with a domain)
     # - Composite types before functions (functions may use composite types)
     # - Views before functions (functions may SELECT from views, so views
     #   must be updated first when column types change)
+    # - Domain drops after tables, views and functions, which drop or retype
+    #   whatever still uses the domain
     # - Sequences before tables (a column default calls nextval() on one);
     #   OWNED BY and sequence drops after tables and views (OWNED BY needs the
     #   column, and a drop must follow the removal of any default using it)
     changes.extend(_diff_enums(desired, actual))
+    changes.extend(_diff_domains(desired, actual, managed_schemas=schemas))
     changes.extend(_diff_composite_types(desired, actual))
     sequences_before, sequences_after = _diff_sequences(desired, actual)
     changes.extend(sequences_before)
@@ -126,6 +142,7 @@ def compute_diff(
     changes.extend(_diff_views(desired, actual))
     changes.extend(sequences_after)
     changes.extend(_diff_functions(desired, actual))
+    changes.extend(_drop_domains(desired, actual))
     changes.extend(_diff_indexes(desired, actual))
     changes.extend(_diff_policies(desired, actual))
     changes.extend(_diff_triggers(desired, actual))
@@ -201,6 +218,16 @@ def compute_diff(
                 ValidateConstraint(
                     schema=change.schema,
                     table=change.table,
+                    constraint_name=change.constraint.name,
+                )
+            )
+    # Domain CHECK constraints are always added NOT VALID, for the same reason.
+    for change in changes:
+        if isinstance(change, (AddDomainConstraint, DropAndCreateDomainConstraint)):
+            validation_changes.append(
+                ValidateDomainConstraint(
+                    schema=change.schema,
+                    domain=change.domain,
                     constraint_name=change.constraint.name,
                 )
             )
@@ -782,6 +809,107 @@ def _diff_composite_types(desired: Schema, actual: Schema) -> list[Change]:
     # Note: We don't automatically drop composite types as it may break dependent objects
 
     return changes
+
+
+def _diff_domains(
+    desired: Schema,
+    actual: Schema,
+    managed_schemas: list[str] | None = None,
+) -> list[Change]:
+    """Create domains and converge the ones that exist.
+
+    Default, NOT NULL and CHECK constraints are altered in place. A changed
+    base type or collation has no ALTER, so the domain is dropped and
+    recreated, which is only safe while nothing uses it; otherwise the change
+    is refused with the dependents named. Drops of undeclared domains come
+    from _drop_domains, later in the plan.
+    """
+    changes: list[Change] = []
+
+    for key, domain in desired.domains.items():
+        current = actual.domains.get(key)
+        if current is None:
+            changes.append(CreateDomain(domain=domain))
+            continue
+
+        if _normalize_type(domain.base_type, managed_schemas) != _normalize_type(
+            current.base_type, managed_schemas
+        ) or (domain.collation or "") != (current.collation or ""):
+            if current.dependents:
+                raise ValueError(
+                    f'cannot change the base type of domain "{domain.schema}".'
+                    f'"{domain.name}" from {current.base_type} to '
+                    f"{domain.base_type}: PostgreSQL has no ALTER for it, and "
+                    "dropping and recreating the domain would drop what uses "
+                    f"it ({'; '.join(current.dependents)}). Move those to the "
+                    "new type in an explicit @migrate-before block, or declare "
+                    "a new domain and retype the columns to it."
+                )
+            changes.append(DropAndCreateDomain(domain=domain))
+            continue
+
+        changes.extend(_diff_domain_properties(domain, current))
+
+    return changes
+
+
+def _diff_domain_properties(desired: Domain, actual: Domain) -> list[Change]:
+    """Default, NOT NULL and CHECK constraint changes of an existing domain."""
+    changes: list[Change] = []
+    schema, name = desired.schema, desired.name
+
+    desired_default = _normalize_default(desired.default)
+    if desired_default != _normalize_default(actual.default):
+        if desired_default is None:
+            changes.append(AlterDomainDropDefault(schema=schema, name=name))
+        else:
+            changes.append(
+                AlterDomainSetDefault(
+                    schema=schema, name=name, default_value=desired.default or ""
+                )
+            )
+
+    if desired.nullable != actual.nullable:
+        if desired.nullable:
+            changes.append(AlterDomainDropNotNull(schema=schema, name=name))
+        else:
+            changes.append(AlterDomainSetNotNull(schema=schema, name=name))
+
+    desired_checks = {c.name: c for c in desired.constraints}
+    actual_checks = {c.name: c for c in actual.constraints}
+    # Drops first: a renamed constraint must not briefly coexist with its
+    # replacement, and a dropped CHECK may be what the new one would violate.
+    for cname in sorted(actual_checks.keys() - desired_checks.keys()):
+        changes.append(
+            DropDomainConstraint(schema=schema, domain=name, constraint_name=cname)
+        )
+    for cname, constraint in sorted(desired_checks.items()):
+        if cname not in actual_checks:
+            changes.append(
+                AddDomainConstraint(schema=schema, domain=name, constraint=constraint)
+            )
+        elif constraint.definition != actual_checks[cname].definition:
+            changes.append(
+                DropAndCreateDomainConstraint(
+                    schema=schema, domain=name, constraint=constraint
+                )
+            )
+
+    return changes
+
+
+def _drop_domains(desired: Schema, actual: Schema) -> list[Change]:
+    """Drop domains that are no longer declared.
+
+    Emitted after the table, view and function changes so the columns and
+    signatures that used the domain are gone first; the executor also retries
+    a drop that still finds a dependent.
+    """
+    return [
+        DropDomain(schema=domain.schema, name=domain.name)
+        for key, domain in sorted(actual.domains.items())
+        if key not in desired.domains
+    ]
 
 
 def _diff_views(desired: Schema, actual: Schema) -> list[Change]:
