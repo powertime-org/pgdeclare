@@ -72,6 +72,7 @@ from .changes import (
     RevokePrivilege,
     RevokePublicExecute,
     RevokeRoleMembership,
+    SetComment,
     SetDefault,
     SetSequenceOwner,
     SetNotNull,
@@ -85,6 +86,7 @@ from .config import PgDeclareConfig, resolve
 from .models import (
     ChangeCategory,
     Column,
+    Comment,
     Domain,
     Function,
     Grant,
@@ -260,6 +262,10 @@ def compute_diff(
                 )
             )
     changes.extend(validation_changes)
+
+    # Comments last: a recreate this run wipes the object's comment, so the
+    # diff needs the full change list to know which ones to write again.
+    changes.extend(_diff_comments(desired, actual, changes))
 
     return changes
 
@@ -503,6 +509,86 @@ def _diff_function_public_execute(
             )
 
     return extra
+
+
+def _recreated_objects(changes: list[Change]) -> tuple[set[str], set[str]]:
+    """Comment keys of the objects this run creates or drops and recreates.
+
+    Returns `(objects, relations)`: the `Comment.key` of every object built
+    fresh, and the `schema.name` of every table or view built fresh, whose
+    column comments are therefore gone too.
+    """
+    objects: set[str] = set()
+    relations: set[str] = set()
+
+    def mark(kind: str, schema: str, name: str, member: str = "", args: str = ""):
+        probe = Comment(kind, schema, name, "", member=member, args=args)
+        objects.add(probe.key)
+
+    for c in changes:
+        if isinstance(c, CreateTable):
+            mark("TABLE", c.table.schema, c.table.name)
+            relations.add(c.table.qualified_name)
+            for constraint in c.table.constraints:
+                mark("CONSTRAINT", c.table.schema, c.table.name, constraint.name)
+        elif isinstance(c, (CreateView, DropAndCreateView)):
+            mark("VIEW", c.view.schema, c.view.name)
+            relations.add(c.view.qualified_name)
+        elif isinstance(c, AddColumn):
+            mark("COLUMN", c.schema, c.table, c.column.name)
+        elif isinstance(c, (AddConstraint, DropAndCreateConstraint)):
+            mark("CONSTRAINT", c.schema, c.table, c.constraint.name)
+        elif isinstance(c, CreateIndex):
+            mark("INDEX", c.index.schema, c.index.name)
+        elif isinstance(c, (CreateFunction, DropAndCreateFunction)):
+            f = c.function
+            mark("FUNCTION", f.schema, f.name, args=f.args)
+        elif isinstance(c, CreateTrigger):
+            mark("TRIGGER", c.trigger.schema, c.trigger.table, c.trigger.name)
+        elif isinstance(c, (CreatePolicy, DropAndCreatePolicy)):
+            p = c.policy
+            mark("POLICY", p.schema, p.table, p.name)
+        elif isinstance(c, CreateEnum):
+            mark("TYPE", c.enum.schema, c.enum.name)
+        elif isinstance(c, CreateCompositeType):
+            mark("TYPE", c.composite_type.schema, c.composite_type.name)
+    return objects, relations
+
+
+def _diff_comments(
+    desired: Schema, actual: Schema, changes: list[Change]
+) -> list[Change]:
+    """Diff `COMMENT ON` text between desired and actual schemas.
+
+    A declared comment is written when the live text differs, and also when
+    the object is created or recreated this run: a DROP takes the comment with
+    it, and the snapshot in `actual` predates the drop. A comment no longer
+    declared is removed with `IS NULL`, unless its object is going away or
+    being rebuilt anyway.
+    """
+    recreated, recreated_relations = _recreated_objects(changes)
+
+    def rebuilt(comment: Comment) -> bool:
+        if comment.key in recreated:
+            return True
+        return (
+            comment.object_type == "COLUMN"
+            and f"{comment.schema}.{comment.name}" in recreated_relations
+        )
+
+    result: list[Change] = []
+    for key in sorted(desired.comments):
+        comment = desired.comments[key]
+        current = actual.comments.get(key)
+        if current is None or current.text != comment.text or rebuilt(comment):
+            result.append(SetComment(comment=comment))
+
+    for key in sorted(actual.comments.keys() - desired.comments.keys()):
+        comment = actual.comments[key]
+        if desired.has_comment_target(comment) and not rebuilt(comment):
+            result.append(SetComment(comment=comment, remove=True))
+
+    return result
 
 
 def _diff_tables(

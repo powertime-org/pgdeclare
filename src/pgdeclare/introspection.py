@@ -15,6 +15,7 @@ from .quoting import quote_ident
 from .config import PgDeclareConfig, logger, resolve
 from .models import (
     Column,
+    Comment,
     CompositeType,
     Constraint,
     Dependency,
@@ -110,6 +111,14 @@ def introspect_schema(
             for role in existing_roles:
                 grants = _query_grants(conn, schema, role)
                 result.grants.extend(grants)
+
+        # Comments last: only those on an object introspected above are kept,
+        # so every filter on those objects (extension-owned, `_`-prefixed
+        # tables, constraint-backing indexes) applies to their comments too.
+        for schema in schemas:
+            for comment in _query_comments(conn, schema):
+                if result.has_comment_target(comment):
+                    result.comments[comment.key] = comment
 
         # Query dependencies (cross-schema)
         result.dependencies = _query_dependencies(conn, schemas)
@@ -713,6 +722,92 @@ def _query_views(conn, schema: str) -> dict[str, View]:
             views[view.qualified_name] = view
 
     return views
+
+
+# One row per comment: (object_type, name, member, args, text). Each branch
+# reads pg_description for one catalog; `%(schema)s` is the managed schema.
+_COMMENTS_SQL = """
+SELECT
+    CASE
+        WHEN d.objsubid <> 0 THEN 'COLUMN'
+        WHEN c.relkind IN ('r', 'p') THEN 'TABLE'
+        WHEN c.relkind = 'v' THEN 'VIEW'
+        ELSE 'INDEX'
+    END AS object_type,
+    c.relname AS name,
+    COALESCE(a.attname, '') AS member,
+    '' AS args,
+    d.description AS text
+FROM pg_description d
+JOIN pg_class c ON d.classoid = 'pg_class'::regclass AND d.objoid = c.oid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_attribute a
+  ON d.objsubid <> 0 AND a.attrelid = c.oid AND a.attnum = d.objsubid
+WHERE n.nspname = %(schema)s
+  AND c.relkind IN ('r', 'p', 'v', 'i')
+  AND (d.objsubid = 0 OR (a.attname IS NOT NULL AND NOT a.attisdropped))
+
+UNION ALL
+SELECT 'CONSTRAINT', c.relname, con.conname, '', d.description
+FROM pg_description d
+JOIN pg_constraint con
+  ON d.classoid = 'pg_constraint'::regclass AND d.objoid = con.oid
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %(schema)s
+
+UNION ALL
+SELECT 'TRIGGER', c.relname, t.tgname, '', d.description
+FROM pg_description d
+JOIN pg_trigger t ON d.classoid = 'pg_trigger'::regclass AND d.objoid = t.oid
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %(schema)s
+
+UNION ALL
+SELECT 'POLICY', c.relname, pol.polname, '', d.description
+FROM pg_description d
+JOIN pg_policy pol ON d.classoid = 'pg_policy'::regclass AND d.objoid = pol.oid
+JOIN pg_class c ON c.oid = pol.polrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %(schema)s
+
+UNION ALL
+SELECT 'FUNCTION', p.proname, '', pg_get_function_identity_arguments(p.oid),
+       d.description
+FROM pg_description d
+JOIN pg_proc p ON d.classoid = 'pg_proc'::regclass AND d.objoid = p.oid
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = %(schema)s
+
+UNION ALL
+SELECT 'TYPE', t.typname, '', '', d.description
+FROM pg_description d
+JOIN pg_type t ON d.classoid = 'pg_type'::regclass AND d.objoid = t.oid
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = %(schema)s
+  AND t.typtype IN ('e', 'c')
+"""
+
+
+def _query_comments(conn, schema: str) -> list[Comment]:
+    """Query `COMMENT ON` text for objects in `schema` from pg_description.
+
+    The caller keeps only the comments whose object it introspected.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(_COMMENTS_SQL, {"schema": schema})
+        return [
+            Comment(
+                object_type=row["object_type"],
+                schema=schema,
+                name=row["name"],
+                member=row["member"],
+                args=row["args"] or "",
+                text=row["text"],
+            )
+            for row in cur.fetchall()
+        ]
 
 
 def _query_materialized_views(conn, schema: str) -> dict[str, MaterializedView]:
