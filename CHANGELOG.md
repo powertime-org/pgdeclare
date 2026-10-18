@@ -17,6 +17,8 @@ may change in minor releases.
 
 ### Fixed
 
+- `CREATE TABLE` quotes inline constraint names, so a name with a quote in it
+  stays a name instead of breaking (or injecting into) the statement.
 - A `DROP` that fails because another object still depends on it
   (`2BP01`) is retried after the rest, like a missing dependency, so dropping
   a stack of views no longer depends on the order they were listed in.

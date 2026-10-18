@@ -18,13 +18,14 @@ from pgdeclare.changes import (
     AddIdentity,
     AlterRole,
     CreateRole,
+    CreateTable,
     DropColumn,
     DropTable,
     GrantPrivilege,
 )
 from pgdeclare.cli import main
 from pgdeclare.introspection import introspect_schema
-from pgdeclare.models import Grant, Role, Schema
+from pgdeclare.models import Column, Constraint, Grant, Role, Schema, Table
 from pgdeclare.quoting import do_block, quote_ident, quote_literal, role_ident
 
 HOSTILE = 'x"; DROP TABLE canary; --'
@@ -91,6 +92,17 @@ def test_hostile_names_stay_inside_their_quotes():
         schema="public", table="t", column="it's", identity_type="d"
     ).to_sql()
     assert "'it''s'" in identity
+
+
+def test_inline_constraint_names_are_quoted():
+    table = Table(
+        schema="public",
+        name="t",
+        columns={"id": Column(name="id", type="integer", nullable=False)},
+        constraints=[Constraint(name=HOSTILE, type="p", definition="PRIMARY KEY (id)")],
+    )
+    sql = CreateTable(table=table).to_sql()
+    assert 'CONSTRAINT "x""; DROP TABLE canary; --" PRIMARY KEY (id)' in sql
 
 
 # =============================================================================

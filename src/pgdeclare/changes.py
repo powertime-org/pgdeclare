@@ -131,7 +131,7 @@ class CreateTable(Change):
         for constraint in self.table.constraints:
             if constraint.type not in DEFERRED_CONSTRAINT_TYPES:
                 inline_constraints.append(
-                    f"    CONSTRAINT {constraint.name} {constraint.definition}"
+                    f"    CONSTRAINT {quote_ident(constraint.name)} {constraint.definition}"
                 )
 
         all_parts = columns_sql + inline_constraints
