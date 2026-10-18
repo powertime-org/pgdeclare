@@ -73,6 +73,14 @@ class PgDeclareConfig:
         grant_public_on_created_schemas: GRANT ALL on every schema the engine
             creates (`ensure_schemas`, the plan database) to PUBLIC. Off by
             default: anyone who can connect could then create objects there.
+        manage_ownership: Diff object owners. Off by default. When on, an
+            owner the schema files state with ``ALTER ... OWNER TO`` is
+            converged with ``ALTER ... OWNER TO`` on the target, for tables,
+            foreign tables, views, materialized views, sequences, functions,
+            types, domains and the managed schemas, provided the owner is one
+            of ``managed_roles`` (and not the role that builds the plan, whose
+            ownership is indistinguishable from the default). Every other
+            owner is left alone.
         dry_run: Preview only: nothing is written, introspection returns an
             empty schema, data probes report "no data".
         lock: Context-manager factory wrapped around every plan-database build.
@@ -100,6 +108,7 @@ class PgDeclareConfig:
     externally_provisioned_schemas: tuple[str, ...] = ()
     secdef_schemas: tuple[str, ...] = ("public",)
     grant_public_on_created_schemas: bool = False
+    manage_ownership: bool = False
     dry_run: bool = False
     lock: Callable[[], AbstractContextManager[object]] = nullcontext
     classify_failure: Callable[

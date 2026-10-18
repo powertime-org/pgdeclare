@@ -37,7 +37,7 @@ from psycopg2 import sql as pgsql
 from . import __version__
 from .changes import Change
 from .config import PgDeclareConfig
-from .differ import compute_diff
+from .differ import compute_diff, undeclared_extensions
 from .executor import format_changes_summary
 from .introspection import check_table_has_data, introspect_schema
 from .ledger import get_applied_migrations, parse_migration_blocks
@@ -148,9 +148,10 @@ _IF_NOT_EXISTS = re.compile(r"^\s*CREATE\s+EXTENSION\s+(?!IF\s+NOT\s+EXISTS)", r
 def declared_extensions(sql_dir: Path, config: PgDeclareConfig) -> list[str]:
     """The CREATE EXTENSION statements in the schema files, made idempotent.
 
-    The engine leaves extensions to the caller (they are cluster-level and often
-    need a superuser). The CLI installs the declared ones so a schema that uses
-    one can be built at all.
+    CREATE EXTENSION is not run while the plan database is built; the caller
+    provisions extensions there. The CLI installs the declared ones in the plan
+    database so a schema that uses one can be built at all. In the target, the
+    diff creates them.
     """
     statements: list[str] = []
     schemas_dir = sql_dir / config.schemas_subdir
@@ -191,6 +192,7 @@ def _build_config(
         "bootstrap_sql_files": bootstrap,
         "bootstrap_source_label": "<declared extensions>",
         "report": report,
+        "manage_ownership": getattr(args, "manage_ownership", False),
     }
     if args.ledger_table:
         kwargs["ledger_table"] = args.ledger_table
@@ -236,17 +238,20 @@ def _stderr(text: str) -> None:
     print(text, file=sys.stderr)
 
 
-def _clone_preparer(
-    cfg: PgDeclareConfig, extensions: list[str]
-) -> Callable[[str], None]:
+def _clone_preparer(cfg: PgDeclareConfig) -> Callable[[str], None]:
     """What `apply` provisions in the target, done in the prove clone instead."""
 
     def prepare(clone_url: str) -> None:
         ensure_schemas(clone_url, cfg.schemas, cfg)
-        for statement in extensions:
-            _autocommit(clone_url, statement)
 
     return prepare
+
+
+def _extension_note(name: str) -> str:
+    return (
+        f"Note: extension {name} is installed but not declared; it is left in "
+        f"place (consent to dropping it with -- @drop extension:{name})"
+    )
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
@@ -264,7 +269,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
                     url,
                     sql_dir,
                     plan_db,
-                    prepare=_clone_preparer(cfg, extensions),
+                    prepare=_clone_preparer(cfg),
                     config=cfg,
                 )
         actual = introspect_schema(url, config=cfg)
@@ -277,6 +282,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     )
     applied = get_applied_migrations(url, cfg)
     pending = [b for b in parse_migration_blocks(sql_dir, cfg) if b.id not in applied]
+    undeclared = undeclared_extensions(desired, actual)
 
     if args.json:
         payload = {
@@ -291,6 +297,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
                 }
                 for b in pending
             ],
+            "undeclared_extensions": undeclared,
         }
         if proof is not None:
             payload["prove"] = prove_result_to_dict(proof)
@@ -304,6 +311,8 @@ def cmd_diff(args: argparse.Namespace) -> int:
                 print(change.to_display_sql())
         else:
             print("No schema changes.")
+        for name in undeclared:
+            print(_extension_note(name))
         fresh = not actual.tables
         for block in pending:
             how = " (fresh database: recorded, not run)" if fresh else ""
@@ -338,8 +347,6 @@ def cmd_apply(args: argparse.Namespace) -> int:
         cfg = _build_config(args, print, bootstrap)
         if not args.dry_run:
             ensure_schemas(url, cfg.schemas, cfg)
-            for statement in extensions:
-                _autocommit(url, statement)
         with plan_database(url, args.plan_database) as plan_db:
             apply_declared_schema(
                 url,
@@ -349,7 +356,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
                 force=args.force,
                 dry_run=args.dry_run,
                 prove=args.prove,
-                prepare_clone=_clone_preparer(cfg, extensions),
+                prepare_clone=_clone_preparer(cfg),
                 config=cfg,
             )
     return EXIT_OK
@@ -387,6 +394,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="NAME",
         help="a role whose definition, memberships and grants are managed; repeatable",
+    )
+    common.add_argument(
+        "--manage-ownership",
+        action="store_true",
+        help="converge object owners the schema files state with ALTER ... OWNER TO "
+        "(the owner must be a --role)",
     )
     common.add_argument(
         "--ledger-table",

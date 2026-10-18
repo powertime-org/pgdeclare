@@ -4,7 +4,7 @@ Migration execution engine.
 Executes schema changes with proper transaction handling:
 - Phase 1: DDL changes with retry-until-stable ordering
 - Phase 2: CONCURRENTLY index operations outside transaction (with retry)
-- Phase 3: COMMENT ON, once every object exists in its final form
+- Phase 3: COMMENT ON and OWNER TO, once every object exists in its final form
 
 The retry-until-stable approach replaces complex priority-based ordering.
 PostgreSQL itself discovers the correct execution order by:
@@ -24,12 +24,15 @@ from .quoting import quote_ident
 from .config import PgDeclareConfig, logger, plain, resolve
 from .changes import (
     AddEnumValue,
+    AlterOwner,
     Change,
     CreateEnum,
     CreateIndex,
     CreateRole,
     SetComment,
     DropDomain,
+    DropExtension,
+    DropForeignTable,
 )
 from .differ import categorize_changes, split_index_operations
 from .models import ChangeCategory
@@ -47,11 +50,16 @@ DEPENDENCY_ERROR_CODES = {
 # CreateRole is cluster-wide - may already exist from retry_executor.py
 IDEMPOTENT_CHANGE_TYPES = (CreateRole,)
 
-# dependent_objects_still_exist. Retryable only for a DropDomain: the column or
-# signature that still uses the domain is dropped or retyped by another change
-# in the same run, and the drop succeeds once that one has.
+# dependent_objects_still_exist. Retryable only for drops without CASCADE
+# (a domain, an extension, a foreign table): what still uses the object is
+# dropped or retyped by another change in the same run, and the drop succeeds
+# once that one has.
 DEPENDENT_OBJECTS_ERROR_CODE = "2BP01"
-RETRY_WHILE_DEPENDED_ON = (DropDomain,)
+RETRY_WHILE_DEPENDED_ON = (DropDomain, DropExtension, DropForeignTable)
+
+# Changes run in the final phase, after the DDL and index phases: comments, and
+# owners (a recreate in the DDL phase resets an object's owner).
+FINAL_PHASE_CHANGE_TYPES = (SetComment, AlterOwner)
 
 # PostgreSQL error code for "already exists" errors
 DUPLICATE_ERROR_CODE = "42710"  # duplicate_object
@@ -167,25 +175,28 @@ def execute_migration(
         )
         return False, []
 
-    # Split into DDL, index and comment operations. Comments go last: an
-    # index only exists after the concurrent phase, and a view or function the
-    # DDL phase drops and recreates takes its comment with it.
-    comment_changes: list[Change] = [c for c in changes if isinstance(c, SetComment)]
+    # Split into DDL, index and final-phase operations. Comments and owners go
+    # last: an index only exists after the concurrent phase, and a view or
+    # function the DDL phase drops and recreates loses its comment and owner.
+    comment_changes: list[Change] = [
+        c for c in changes if isinstance(c, FINAL_PHASE_CHANGE_TYPES)
+    ]
     ddl_changes, index_changes = split_index_operations(
-        [c for c in changes if not isinstance(c, SetComment)]
+        [c for c in changes if not isinstance(c, FINAL_PHASE_CHANGE_TYPES)]
     )
 
+    # The returned statements are a record for reporting (prove prints them),
+    # so they carry the display SQL: a declared password never leaves the process.
     executed_sql: list[str] = []
 
     if dry_run:
         logger.info("Dry run - showing SQL that would be executed:")
         logger.info("")
         for change in changes:
-            sql_stmt = change.to_sql()
             logger.info(f"-- {change.description}")
             logger.info(change.to_display_sql())
             logger.info("")
-            executed_sql.append(sql_stmt)
+            executed_sql.append(change.to_display_sql())
         return True, executed_sql
 
     # Execute DDL changes in transaction
@@ -265,7 +276,7 @@ def _execute_ddl_phase(
 
                             try:
                                 cur.execute(sql_stmt)
-                                executed_sql.append(sql_stmt)
+                                executed_sql.append(change.to_display_sql())
                             except Exception as e:
                                 logger.error(f"Failed: {change.description}")
                                 logger.error(f"SQL: {change.to_display_sql()}")
@@ -365,7 +376,7 @@ def _execute_with_retry_savepoints(
 
                 # Success - release savepoint
                 cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-                executed_sql.append(sql_stmt)
+                executed_sql.append(change.to_display_sql())
                 progress_made = True
                 logger.info(f"    ✓ {change.description}")
 
@@ -516,7 +527,7 @@ def _execute_index_phase(
                             )
 
                         cur.execute(sql_stmt)
-                        executed_sql.append(sql_stmt)
+                        executed_sql.append(change.to_display_sql())
                         success = True
                 finally:
                     conn.close()
@@ -575,7 +586,7 @@ def _execute_comment_phase(
                         logger.error(f"SQL: {change.to_display_sql()}")
                         logger.error(f"Error: {e}")
                         raise
-                    executed_sql.append(sql_stmt)
+                    executed_sql.append(change.to_display_sql())
             conn.commit()
     except Exception as e:
         failure = resolve(config).classify_failure(
