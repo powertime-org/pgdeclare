@@ -53,10 +53,4 @@ Publications and event triggers belong to the database rather than a schema, so 
 
 Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. A recreated materialized view rebuilds its indexes the same way, and a recreated view or materialized view drops the views and materialized views that read from it and builds them back, from their declarations, in that statement too. Whether a materialized view is populated is not compared: a `REFRESH` is runtime state, not drift. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
 
-## Compared with other tools
-
-As of October 2026. Against [pg-delta's coverage list](https://github.com/supabase/pg-toolbelt/blob/main/packages/pg-delta/COVERAGE.md), pgdeclare manages the same object kinds except subscriptions (deliberately unmanaged), foreign data wrappers, security labels, table inheritance (`INHERITS`), replica identity, role settings and CHECK constraints on foreign tables; its comments and grants reach fewer kinds of object, and grants go only to managed roles. It manages every object kind [pgschema](https://github.com/pgplex/pgschema) lists, except grants on types and domains, `WITH GRANT OPTION`, and comments on materialized views.
-
-See the [README](../README.md#how-it-compares) for the overall comparison.
-
 [Back to the README](../README.md)
