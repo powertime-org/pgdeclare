@@ -17,24 +17,31 @@ file layout, bootstrap SQL, locking, failure classification) comes in through
 embeds it.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .config import DEFAULT_CONFIG, PgDeclareConfig
 from .models import (
     ChangeCategory,
+    Collation,
     Column,
     Comment,
     Constraint,
+    DefaultPrivilege,
     Dependency,
     Domain,
     EnumType,
+    EventTrigger,
     Function,
     Grant,
     Index,
     MaterializedView,
     Policy,
+    RangeType,
+    Publication,
+    PublicationTable,
     Role,
     RoleMembership,
+    Rule,
     Schema,
     Sequence,
     Table,
@@ -49,7 +56,9 @@ from .introspection import (
 from .differ import (
     compute_diff,
     categorize_changes,
+    partition_notes,
     split_index_operations,
+    undeclared_partitions,
 )
 from .executor import (
     execute_migration,
@@ -108,19 +117,26 @@ __all__ = [
     "PgDeclareConfig",
     # Models
     "ChangeCategory",
+    "Collation",
     "Column",
     "Comment",
     "Constraint",
+    "DefaultPrivilege",
     "Dependency",
     "Domain",
     "EnumType",
+    "EventTrigger",
     "Function",
     "Grant",
     "Index",
     "MaterializedView",
     "Policy",
+    "RangeType",
+    "Publication",
+    "PublicationTable",
     "Role",
     "RoleMembership",
+    "Rule",
     "Schema",
     "Sequence",
     "Table",
@@ -133,7 +149,9 @@ __all__ = [
     # Differ
     "compute_diff",
     "categorize_changes",
+    "partition_notes",
     "split_index_operations",
+    "undeclared_partitions",
     # Executor
     "execute_migration",
     "cleanup_invalid_indexes",

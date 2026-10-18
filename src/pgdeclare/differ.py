@@ -6,7 +6,7 @@ a list of Change objects needed to synchronize them.
 """
 
 from dataclasses import replace as dataclass_replace
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from .changes import (
     AddColumn,
@@ -14,6 +14,7 @@ from .changes import (
     AddDomainConstraint,
     AddEnumValue,
     AddIdentity,
+    AddPublicationObjects,
     AlterColumnDropExpression,
     AlterColumnSetExpression,
     AlterColumnType,
@@ -22,55 +23,93 @@ from .changes import (
     AlterDomainDropNotNull,
     AlterDomainSetDefault,
     AlterDomainSetNotNull,
+    AlterEventTriggerEnabled,
+    AlterPublicationOptions,
+    AlterRuleEnabled,
+    AlterExtensionSchema,
+    AlterExtensionUpdate,
+    AlterForeignServer,
+    AlterForeignTable,
+    AlterOwner,
     AlterRole,
     AlterSequence,
+    AlterUserMapping,
     AlterViewOptions,
+    AttachPartition,
     Change,
+    CreateCollation,
     CreateCompositeType,
     CreateDomain,
     CreateEnum,
+    CreateEventTrigger,
+    CreateExtension,
+    CreateForeignServer,
+    CreateForeignTable,
     CreateFunction,
     CreateIndex,
     CreateMaterializedView,
+    CreatePartitionedIndex,
     CreatePolicy,
+    CreateRangeType,
+    CreatePublication,
     CreateRole,
+    CreateRule,
     CreateSequence,
+    CreateShellType,
     CreateTable,
     CreateTrigger,
+    CreateUserMapping,
     CreateView,
     DEFERRED_CONSTRAINT_TYPES,
     DisableRLS,
     DropAndCreateConstraint,
     DependentRelation,
+    DropAndCreateCollation,
+    DetachPartition,
     DropAndCreateDomain,
     DropAndCreateDomainConstraint,
+    DropAndCreateForeignTable,
     DropAndCreateFunction,
     DropAndCreateMaterializedView,
     DropAndCreatePolicy,
+    DropAndCreateRangeType,
+    DropAndCreatePublication,
     DropAndCreateView,
+    DropCollation,
     DropColumn,
     DropConstraint,
     DropDefault,
     DropDomain,
     DropDomainConstraint,
+    DropEventTrigger,
+    DropExtension,
+    DropForeignTable,
     DropFunction,
     DropIdentity,
     DropIndex,
     DropMaterializedView,
     DropNotNull,
     DropPolicy,
+    DropRangeType,
+    DropPublication,
+    DropPublicationObjects,
+    DropRule,
     DropSequence,
     DropTable,
     DropTrigger,
+    DropUserMapping,
     DropView,
     EnableRLS,
     ForceRLS,
+    GrantDefaultPrivilege,
     GrantPrivilege,
     GrantRoleMembership,
     NoForceRLS,
     ReplaceFunction,
+    RevokeDefaultPrivilege,
     RevokePrivilege,
     RevokePublicExecute,
+    ReplacePublicationTable,
     RevokeRoleMembership,
     SetComment,
     SetDefault,
@@ -78,23 +117,31 @@ from .changes import (
     SetNotNull,
     ValidateConstraint,
     dependents_note,
+    foreign_column_sql,
     ValidateDomainConstraint,
     grant_replay_note,
     index_rebuild_note,
 )
 from .config import PgDeclareConfig, resolve
+from .quoting import quote_ident
 from .models import (
+    ROUTINE_OWNER_KINDS,
     ChangeCategory,
     Column,
     Comment,
     Domain,
+    ForeignTable,
     Function,
     Grant,
     Index,
     MaterializedView,
+    RangeType,
+    Publication,
     Schema,
     Table,
+    USER_MAPPING_PUBLIC_OPTIONS,
     View,
+    alter_fdw_options_sql,
 )
 
 
@@ -128,14 +175,60 @@ def compute_diff(
     """
     changes: list[Change] = []
 
+    # Partitions created at runtime (pg_partman, a cron job) and not declared
+    # are never touched: they leave the comparison here, with everything on
+    # them. partition_notes() reports them.
+    parents_with_default = {
+        t.parent_key for t in actual.tables.values() if t.partition_bound == "DEFAULT"
+    }
+    actual = _without_undeclared_partitions(desired, actual)
+    # An owner's privileges are implicit, but read back as grants to it. Where
+    # the schema files state the owner, those are the owner's, not grants to
+    # diff: `_diff_owners` moves them with the object.
+    owner_grants = _stated_owner_grants(desired)
+    if owner_grants:
+        desired = dataclass_replace(
+            desired,
+            grants=[
+                g for g in desired.grants if not _is_stated_owner_grant(g, owner_grants)
+            ],
+        )
+        actual = dataclass_replace(
+            actual,
+            grants=[
+                g for g in actual.grants if not _is_stated_owner_grant(g, owner_grants)
+            ],
+        )
+
     # Diff roles first (cluster-wide, needed before schemas)
     changes.extend(_diff_roles(desired, actual))
     changes.extend(_diff_role_memberships(desired, actual))
 
+    # Default privileges no longer declared are revoked before anything is
+    # created, and new ones granted after the object grants. An object created
+    # in this run then gets exactly the grants the diff gives it: the plan
+    # database built it with the declared defaults already in force (see
+    # schema_parser), so its grants are in the desired schema either way.
+    default_privilege_revokes, default_privilege_grants = _diff_default_privileges(
+        desired, actual
+    )
+    changes.extend(default_privilege_revokes)
+
+    # Extensions, then foreign servers and user mappings: types, functions and
+    # foreign tables need them. All are database-wide, not per schema.
+    changes.extend(_diff_extensions(desired, actual))
+    changes.extend(_diff_foreign_servers(desired, actual))
+    changes.extend(_diff_user_mappings(desired, actual))
+
     # Diff each object type
     # Order matters for dependency resolution:
     # - Enums before composite types (composite types may reference enums)
+    # - Collations before domains, ranges and tables, which may use them;
+    #   collation drops last, after everything that could still use one
     # - Domains before tables (columns may be typed with a domain)
+    # - Range types after domains and before composite types and tables
+    #   (a range may be over a domain; a column or attribute may be a range);
+    #   range drops after functions, like domain drops
     # - Composite types before functions (functions may use composite types)
     # - Views before functions (functions may SELECT from views, so views
     #   must be updated first when column types change)
@@ -145,23 +238,44 @@ def compute_diff(
     #   OWNED BY and sequence drops after tables and views (OWNED BY needs the
     #   column, and a drop must follow the removal of any default using it)
     changes.extend(_diff_enums(desired, actual))
+    collations_before, collations_after = _diff_collations(desired, actual)
+    changes.extend(collations_before)
     changes.extend(_diff_domains(desired, actual, managed_schemas=schemas))
+    changes.extend(_diff_ranges(desired, actual, managed_schemas=schemas))
     changes.extend(_diff_composite_types(desired, actual))
     sequences_before, sequences_after = _diff_sequences(desired, actual)
     changes.extend(sequences_before)
     changes.extend(
-        _diff_tables(desired, actual, check_data_fn, managed_schemas=schemas)
+        _diff_tables(
+            desired,
+            actual,
+            check_data_fn,
+            managed_schemas=schemas,
+            parents_with_default=parents_with_default,
+        )
     )
+    changes.extend(_diff_foreign_tables(desired, actual, managed_schemas=schemas))
     changes.extend(_diff_views(desired, actual))
     changes.extend(_diff_materialized_views(desired, actual))
     changes.extend(sequences_after)
     changes.extend(_diff_functions(desired, actual))
+    changes.extend(_drop_ranges(desired, actual))
     changes.extend(_drop_domains(desired, actual))
+    changes.extend(collations_after)
+    changes.extend(_drop_extensions(desired, actual))
     changes.extend(_diff_indexes(desired, actual))
     changes.extend(_diff_policies(desired, actual))
     changes.extend(_diff_triggers(desired, actual))
+    changes.extend(_diff_rules(desired, actual))
+    managed = list(schemas) if schemas is not None else list(resolve(config).schemas)
+    changes.extend(_diff_publications(desired, actual, managed))
+    # Event triggers last among the DDL: one created here fires on every DDL
+    # statement after it.
+    changes.extend(_diff_event_triggers(desired, actual, managed, changes))
     changes.extend(_diff_grants(desired, actual))
+    changes.extend(default_privilege_grants)
     changes = _skip_revokes_on_dropped_relations(changes)
+    changes = _skip_canonical_function_drops(changes, actual)
 
     # Re-apply grants for objects being dropped and recreated.
     #
@@ -185,7 +299,10 @@ def compute_diff(
         tuple[str, str],
         list[
             Union[
-                DropAndCreateView, DropAndCreateFunction, DropAndCreateMaterializedView
+                DropAndCreateView,
+                DropAndCreateFunction,
+                DropAndCreateMaterializedView,
+                DropAndCreateForeignTable,
             ]
         ],
     ] = {}
@@ -196,13 +313,21 @@ def compute_diff(
             recreations.setdefault((c.function.schema, c.function.name), []).append(c)
         elif isinstance(c, DropAndCreateMaterializedView):
             recreations.setdefault((c.matview.schema, c.matview.name), []).append(c)
+        elif isinstance(c, DropAndCreateForeignTable):
+            recreations.setdefault((c.table.schema, c.table.name), []).append(c)
     if recreations:
         for grant in desired.grants:
             for recreate in recreations.get((grant.schema, grant.object_name), []):
                 if isinstance(
-                    recreate, DropAndCreateMaterializedView
+                    recreate, (DropAndCreateMaterializedView, DropAndCreateForeignTable)
                 ) and not _is_relation_grant(grant):
                     continue
+                if (
+                    isinstance(recreate, DropAndCreateFunction)
+                    and grant.args is not None
+                    and grant.args != recreate.function.args
+                ):
+                    continue  # another overload of the same name
                 recreate.grants.append(grant)
         # Say so in the plan, so a recreate's ACL work is visible.
         for recreated in recreations.values():
@@ -239,7 +364,10 @@ def compute_diff(
                 "c",
             )
         elif isinstance(change, DropAndCreateConstraint):
-            needs_validation = change.constraint.type in ("f", "c")
+            needs_validation = change.not_valid and change.constraint.type in (
+                "f",
+                "c",
+            )
         else:
             continue
 
@@ -263,11 +391,94 @@ def compute_diff(
             )
     changes.extend(validation_changes)
 
+    # Owners, like comments, after everything else: a recreate resets the
+    # owner, so the diff needs the full change list (dependents included).
+    changes.extend(_diff_owners(desired, actual, changes))
+
     # Comments last: a recreate this run wipes the object's comment, so the
     # diff needs the full change list to know which ones to write again.
     changes.extend(_diff_comments(desired, actual, changes))
 
     return changes
+
+
+def undeclared_partitions(desired: Schema, actual: Schema) -> list[Table]:
+    """Live partitions the schema files do not declare, sub-partitions included.
+
+    Applications often create partitions at runtime (pg_partman, a cron job).
+    Such a partition is never dropped or altered; the diff leaves it, and
+    everything on it, out of the comparison.
+    """
+    return [
+        table
+        for key, table in sorted(actual.tables.items())
+        if table.partition_of is not None and key not in desired.tables
+    ]
+
+
+def partition_notes(desired: Schema, actual: Schema) -> list[str]:
+    """One line per undeclared live partition of a declared table, for the output.
+
+    These are notes, not changes: the partition is left in place. Partitions of
+    a table that is itself going away are not mentioned; its drop takes them.
+    """
+
+    def root(table: Table) -> str:
+        seen: set[str] = set()
+        while table.parent_key is not None and table.parent_key not in seen:
+            seen.add(table.parent_key)
+            parent = actual.tables.get(table.parent_key)
+            if parent is None:
+                return table.parent_key
+            table = parent
+        return table.qualified_name
+
+    return [
+        f"Partition {table.qualified_name} of {table.parent_key} "
+        f"({table.partition_bound}) is not declared; left in place."
+        for table in undeclared_partitions(desired, actual)
+        if root(table) in desired.tables
+    ]
+
+
+def _without_undeclared_partitions(desired: Schema, actual: Schema) -> Schema:
+    """`actual` without the undeclared partitions and what sits on them."""
+    gone = {t.qualified_name for t in undeclared_partitions(desired, actual)}
+    if not gone:
+        return actual
+
+    def on_gone(schema: str, relation: str) -> bool:
+        return f"{schema}.{relation}" in gone
+
+    indexes = {
+        k: i for k, i in actual.indexes.items() if not on_gone(i.schema, i.table)
+    }
+    gone_indexes = actual.indexes.keys() - indexes.keys()
+
+    def keep_comment(c: Comment) -> bool:
+        if c.object_type == "INDEX":
+            return f"{c.schema}.{c.name}" not in gone_indexes
+        if c.object_type in ("TABLE", "COLUMN", "CONSTRAINT", "TRIGGER", "POLICY"):
+            return not on_gone(c.schema, c.name)
+        return True
+
+    return dataclass_replace(
+        actual,
+        tables={k: t for k, t in actual.tables.items() if k not in gone},
+        indexes=indexes,
+        policies={
+            k: p for k, p in actual.policies.items() if not on_gone(p.schema, p.table)
+        },
+        triggers={
+            k: t for k, t in actual.triggers.items() if not on_gone(t.schema, t.table)
+        },
+        grants=[
+            g
+            for g in actual.grants
+            if not (_is_relation_grant(g) and on_gone(g.schema, g.object_name))
+        ],
+        comments={k: c for k, c in actual.comments.items() if keep_comment(c)},
+    )
 
 
 def _skip_revokes_on_dropped_relations(changes: list[Change]) -> list[Change]:
@@ -282,7 +493,7 @@ def _skip_revokes_on_dropped_relations(changes: list[Change]) -> list[Change]:
             dropped.add((c.schema, c.matview_name))
         elif isinstance(c, DropView):
             dropped.add((c.schema, c.view_name))
-        elif isinstance(c, DropTable):
+        elif isinstance(c, (DropTable, DropForeignTable)):
             dropped.add((c.schema, c.table_name))
     if not dropped:
         return changes
@@ -480,14 +691,14 @@ def _diff_function_public_execute(
 
     extra: list[Change] = []
 
-    # Index the create/recreate changes by (schema, name) so a locked function
+    # Index the create/recreate changes by full signature so a locked function
     # gets its REVOKE appended atomically instead of as a standalone statement.
-    create_changes: dict[
-        tuple[str, str], Union[CreateFunction, DropAndCreateFunction]
-    ] = {}
+    # Keying by name alone would let an overload (or an aggregate) of the same
+    # name absorb the flag, and the locked routine would keep PUBLIC EXECUTE.
+    create_changes: dict[str, Union[CreateFunction, DropAndCreateFunction]] = {}
     for c in changes:
         if isinstance(c, (CreateFunction, DropAndCreateFunction)):
-            create_changes[(c.function.schema, c.function.name)] = c
+            create_changes[c.function.signature] = c
 
     for func in desired.functions.values():
         if not func.security_definer or func.schema not in secdef_schemas:
@@ -495,7 +706,7 @@ def _diff_function_public_execute(
         if func.name.lower() not in locked_functions:
             continue
 
-        recreate = create_changes.get((func.schema, func.name))
+        recreate = create_changes.get(func.signature)
         if recreate is not None:
             # Atomic path: append the REVOKE to the (re)creation change.
             recreate.revoke_public_execute = True
@@ -505,7 +716,12 @@ def _diff_function_public_execute(
         actual_func = actual.functions.get(func.signature)
         if actual_func is not None and actual_func.public_execute:
             extra.append(
-                RevokePublicExecute(schema=func.schema, name=func.name, args=func.args)
+                RevokePublicExecute(
+                    schema=func.schema,
+                    name=func.name,
+                    args=func.args,
+                    keyword=func.keyword,
+                )
             )
 
     return extra
@@ -542,7 +758,7 @@ def _recreated_objects(changes: list[Change]) -> tuple[set[str], set[str]]:
             mark("INDEX", c.index.schema, c.index.name)
         elif isinstance(c, (CreateFunction, DropAndCreateFunction)):
             f = c.function
-            mark("FUNCTION", f.schema, f.name, args=f.args)
+            mark(f.keyword, f.schema, f.name, args=f.args)
         elif isinstance(c, CreateTrigger):
             mark("TRIGGER", c.trigger.schema, c.trigger.table, c.trigger.name)
         elif isinstance(c, (CreatePolicy, DropAndCreatePolicy)):
@@ -552,6 +768,10 @@ def _recreated_objects(changes: list[Change]) -> tuple[set[str], set[str]]:
             mark("TYPE", c.enum.schema, c.enum.name)
         elif isinstance(c, CreateCompositeType):
             mark("TYPE", c.composite_type.schema, c.composite_type.name)
+        elif isinstance(c, (CreateRangeType, DropAndCreateRangeType)):
+            mark("TYPE", c.range_type.schema, c.range_type.name)
+        elif isinstance(c, (CreateCollation, DropAndCreateCollation)):
+            mark("COLLATION", c.collation.schema, c.collation.name)
     return objects, relations
 
 
@@ -596,14 +816,37 @@ def _diff_tables(
     actual: Schema,
     check_data_fn: Optional[Callable[..., bool]] = None,
     managed_schemas: list[str] | None = None,
+    parents_with_default: Optional[set[Optional[str]]] = None,
 ) -> list[Change]:
-    """Diff tables between desired and actual schemas."""
+    """Diff tables between desired and actual schemas.
+
+    A partition's columns belong to its parent: adding, dropping or retyping
+    one happens on the parent and Postgres carries it to every partition. Only
+    a partition's own defaults and NOT NULL are diffed, after everything else,
+    since the parent's changes recurse into its partitions first.
+    """
     changes: list[Change] = []
+    partition_columns: list[Change] = []
+    parents_with_default = parents_with_default or set()
 
     # Tables to create
     for key, table in desired.tables.items():
         if key not in actual.tables:
-            changes.append(CreateTable(table=table))
+            create = CreateTable(table=table)
+            if (
+                table.partition_of is not None
+                and table.partition_bound != "DEFAULT"
+                and table.parent_key in parents_with_default
+            ):
+                # Postgres scans the default partition for rows that now
+                # belong to the new one, under a lock.
+                create.category = ChangeCategory.OFFLINE
+                create.description += " (scans the default partition)"
+            changes.append(create)
+            if table.partition_of is not None:
+                partition_columns.extend(
+                    _diff_partition_columns(table, None, desired, actual)
+                )
             # CreateTable inlines only PRIMARY KEY and CHECK. Everything in
             # DEFERRED_CONSTRAINT_TYPES is added here instead: FOREIGN KEY so
             # circular dependencies resolve (post <-> comment), UNIQUE and
@@ -625,13 +868,44 @@ def _diff_tables(
             if table.rls_forced:
                 changes.append(ForceRLS(schema=table.schema, table=table.name))
         else:
-            # Table exists - diff columns, constraints, and RLS state
+            # Table exists - diff partitioning, columns, constraints, RLS state
             actual_table = actual.tables[key]
-            changes.extend(
-                _diff_columns(table, actual_table, check_data_fn, managed_schemas)
-            )
+            _check_partitioning(table, actual_table)
+            if table.partition_of is not None:
+                assert table.partition_bound is not None
+                if (actual_table.partition_of, actual_table.partition_bound) != (
+                    table.partition_of,
+                    table.partition_bound,
+                ):
+                    changes.append(
+                        AttachPartition(
+                            schema=table.schema,
+                            table=table.name,
+                            parent=table.partition_of,
+                            bound=table.partition_bound,
+                            detach_from=actual_table.partition_of,
+                            old_bound=actual_table.partition_bound,
+                        )
+                    )
+                partition_columns.extend(
+                    _diff_partition_columns(table, actual_table, desired, actual)
+                )
+            else:
+                if actual_table.partition_of is not None:
+                    changes.append(
+                        DetachPartition(
+                            schema=table.schema,
+                            table=table.name,
+                            parent=actual_table.partition_of,
+                        )
+                    )
+                changes.extend(
+                    _diff_columns(table, actual_table, check_data_fn, managed_schemas)
+                )
             changes.extend(_diff_constraints(table, actual_table))
             changes.extend(_diff_rls(table, actual_table))
+
+    changes.extend(partition_columns)
 
     # Tables to drop
     for key, table in actual.tables.items():
@@ -646,6 +920,112 @@ def _diff_tables(
                     has_data=has_data,
                 )
             )
+
+    return changes
+
+
+def _check_partitioning(desired: Table, actual: Table) -> None:
+    """Refuse what Postgres cannot do in place: a partitioning change of a table."""
+    name = f"{quote_ident(desired.schema)}.{quote_ident(desired.name)}"
+    how = (
+        "Do it in an explicit @migrate-before block: create the new table, "
+        "copy the rows (INSERT ... SELECT), drop the old one and rename the new "
+        "one into place."
+    )
+    if desired.partition_key == actual.partition_key:
+        return
+    if actual.partition_key is None:
+        raise ValueError(
+            f"cannot convert table {name} into a partitioned table "
+            f"(PARTITION BY {desired.partition_key}): PostgreSQL has no ALTER "
+            f"for it. {how}"
+        )
+    if desired.partition_key is None:
+        raise ValueError(
+            f"cannot convert partitioned table {name} (PARTITION BY "
+            f"{actual.partition_key}) into a plain table: PostgreSQL has no "
+            f"ALTER for it. {how}"
+        )
+    raise ValueError(
+        f"cannot change the partition key of {name} from PARTITION BY "
+        f"{actual.partition_key} to PARTITION BY {desired.partition_key}: "
+        f"PostgreSQL has no ALTER for it. {how}"
+    )
+
+
+def _diff_partition_columns(
+    desired_child: Table,
+    actual_child: Optional[Table],
+    desired: Schema,
+    actual: Schema,
+) -> list[Change]:
+    """A partition's own column defaults and NOT NULL.
+
+    A partition takes its columns, defaults and NOT NULL from its parent when
+    it is created, and a parent's ALTER COLUMN ... SET/DROP DEFAULT or NOT NULL
+    recurses into it, overwriting a partition's own value. So the value a
+    partition holds once the parent's changes have run is the parent's
+    declared one, unless the parent's value is unchanged and the partition is
+    already attached to it, in which case it keeps its own. Changes are
+    emitted where that differs from the declaration.
+    """
+    parent_key = desired_child.parent_key
+    desired_parent = desired.tables.get(parent_key) if parent_key else None
+    if desired_parent is None:
+        return []
+    actual_parent = actual.tables.get(parent_key) if parent_key else None
+    attached = (
+        actual_child is not None
+        and actual_child.partition_of == desired_child.partition_of
+    )
+    schema, table = desired_child.schema, desired_child.name
+    category = ChangeCategory.ONLINE if actual_child is None else ChangeCategory.OFFLINE
+    changes: list[Change] = []
+
+    for name, col in desired_child.columns.items():
+        parent_col = desired_parent.columns.get(name)
+        if parent_col is None or col.identity or col.generated:
+            continue
+        current = actual_child.columns.get(name) if actual_child else None
+        actual_parent_col = actual_parent.columns.get(name) if actual_parent else None
+
+        def held(attr: str, normalize: Callable[[Any], Any]) -> Any:
+            # What the partition holds after the parent's own changes.
+            assert parent_col is not None
+            if (
+                attached
+                and current is not None
+                and actual_parent_col is not None
+                and normalize(getattr(parent_col, attr))
+                == normalize(getattr(actual_parent_col, attr))
+            ):
+                return getattr(current, attr)
+            return getattr(parent_col, attr)
+
+        nullable = held("nullable", bool)
+        if col.nullable != nullable:
+            if col.nullable:
+                changes.append(DropNotNull(schema=schema, table=table, column=name))
+            else:
+                changes.append(
+                    SetNotNull(
+                        schema=schema, table=table, column=name, category=category
+                    )
+                )
+
+        default = held("default", _normalize_default)
+        if _normalize_default(col.default) != _normalize_default(default):
+            if col.default is None:
+                changes.append(DropDefault(schema=schema, table=table, column=name))
+            else:
+                changes.append(
+                    SetDefault(
+                        schema=schema,
+                        table=table,
+                        column=name,
+                        default_value=col.default,
+                    )
+                )
 
     return changes
 
@@ -776,9 +1156,18 @@ def _diff_column_properties(
     # Type change (skip for generated columns: a same-type SET EXPRESSION needs
     # no AlterColumnType, and a type change on a generated column is not handled
     # automatically here).
-    if not desired.generated and _normalize_type(
-        desired.type, managed_schemas
-    ) != _normalize_type(actual.type, managed_schemas):
+    type_changed = _normalize_type(desired.type, managed_schemas) != _normalize_type(
+        actual.type, managed_schemas
+    )
+    if not desired.generated and (
+        type_changed or desired.collation != actual.collation
+    ):
+        # Without a COLLATE clause a retyped column takes the new type's
+        # default collation; a column only losing its explicit collation has
+        # to be given that default by name.
+        collation = desired.collation
+        if collation is None and not type_changed:
+            collation = 'pg_catalog."default"'
         changes.append(
             AlterColumnType(
                 schema=schema,
@@ -786,6 +1175,7 @@ def _diff_column_properties(
                 column=desired.name,
                 old_type=actual.type,
                 new_type=desired.type,
+                collation=collation,
             )
         )
 
@@ -866,12 +1256,21 @@ def _diff_constraints(
 
     # Constraints to add
     for name, constraint in desired_constraints.items():
+        # Before PostgreSQL 18 a partitioned table's foreign key cannot be
+        # added NOT VALID, so it is validated as it is added: a scan of every
+        # partition under a lock.
+        validated_now = desired_table.partition_key is not None and (
+            constraint.type == "f"
+        )
+        category = ChangeCategory.OFFLINE if validated_now else ChangeCategory.ONLINE
         if name not in actual_constraints:
             changes.append(
                 AddConstraint(
                     schema=schema,
                     table=table_name,
                     constraint=constraint,
+                    not_valid=not validated_now,
+                    category=category,
                 )
             )
         elif constraint.definition != actual_constraints[name].definition:
@@ -881,6 +1280,8 @@ def _diff_constraints(
                     schema=schema,
                     table=table_name,
                     constraint=constraint,
+                    not_valid=not validated_now,
+                    category=category,
                 )
             )
 
@@ -933,18 +1334,49 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
                     DropAndCreateFunction(
                         function=func,
                         old_args=rename_source.args,  # Pass old args for correct DROP
+                        old_kind=rename_source.kind,
                     )
                 )
             else:
                 changes.append(CreateFunction(function=func))
         elif func.definition_hash != actual.functions[key].definition_hash:
-            # Check if return type changed - requires DROP + CREATE instead of REPLACE
+            # A changed return type or kind requires DROP + CREATE: CREATE OR
+            # REPLACE refuses both.
             actual_func = actual.functions[key]
-            if func.get_return_clause() != actual_func.get_return_clause():
-                # Return type changed - use combined Drop+Create to keep them together
-                changes.append(DropAndCreateFunction(function=func))
+            if (
+                func.kind != actual_func.kind
+                or func.get_return_clause() != actual_func.get_return_clause()
+            ):
+                # Use combined Drop+Create to keep them together
+                changes.append(
+                    DropAndCreateFunction(function=func, old_kind=actual_func.kind)
+                )
             else:
                 changes.append(ReplaceFunction(function=func))
+
+    # An aggregate goes with any support function this run drops (DROP ...
+    # CASCADE), so one that is otherwise unchanged is recreated with it.
+    dropped: set[str] = set(functions_to_drop_for_rename)
+    for c in changes:
+        if isinstance(c, DropAndCreateFunction):
+            f = c.function
+            old_args = c.old_args if c.old_args is not None else f.args
+            dropped.add(f"{f.schema}.{f.name}({old_args})")
+    dropped.update(k for k in actual.functions if k not in desired.functions)
+    changed = {
+        c.function.signature
+        for c in changes
+        if isinstance(c, (CreateFunction, ReplaceFunction, DropAndCreateFunction))
+    }
+    for key, func in desired.functions.items():
+        existing = actual.functions.get(key)
+        if (
+            func.kind == "a"
+            and existing is not None
+            and key not in changed
+            and dropped.intersection(existing.support_functions)
+        ):
+            changes.append(DropAndCreateFunction(function=func, old_kind=existing.kind))
 
     # Functions to drop (excluding those handled by parameter rename above)
     for key, func in actual.functions.items():
@@ -954,30 +1386,55 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
                     schema=func.schema,
                     name=func.name,
                     args=func.args,
+                    kind=func.kind,
                 )
             )
 
-    return changes
+    # Aggregates are built after the functions they call. The executor would
+    # retry an early one, but a recreated support function's DROP ... CASCADE
+    # would then take the freshly built aggregate with it.
+    def builds_aggregate(c: Change) -> bool:
+        return (
+            isinstance(c, (CreateFunction, ReplaceFunction, DropAndCreateFunction))
+            and c.function.kind == "a"
+        )
+
+    return [c for c in changes if not builds_aggregate(c)] + [
+        c for c in changes if builds_aggregate(c)
+    ]
 
 
 def _diff_indexes(desired: Schema, actual: Schema) -> list[Change]:
     """Diff indexes between desired and actual schemas."""
     changes: list[Change] = []
 
+    # An index on a partitioned table is built per partition and attached
+    # (CreatePartitionedIndex), and dropped without CONCURRENTLY, which
+    # Postgres refuses for one; that drop runs in the DDL transaction.
+    def create(index: Index) -> CreateIndex:
+        if index.partitioned:
+            return CreatePartitionedIndex(index=index)
+        return CreateIndex(index=index, concurrent=True)
+
     # Indexes to create
     for key, index in desired.indexes.items():
-        if key not in actual.indexes:
-            changes.append(CreateIndex(index=index, concurrent=True))
-        elif index.definition != actual.indexes[key].definition:
+        current = actual.indexes.get(key)
+        if current is None:
+            changes.append(create(index))
+        elif index.definition != current.definition:
             # Index changed - drop and recreate
             changes.append(
                 DropIndex(
                     schema=index.schema,
                     index_name=index.name,
-                    concurrent=True,
+                    concurrent=not current.partitioned,
                 )
             )
-            changes.append(CreateIndex(index=index, concurrent=True))
+            changes.append(create(index))
+        elif index.partitioned and not current.is_valid:
+            # A partitioned index is invalid until every partition has an
+            # index attached to it: a run died half way. Finish the job.
+            changes.append(create(index))
 
     # Indexes to drop
     for key, index in actual.indexes.items():
@@ -986,11 +1443,161 @@ def _diff_indexes(desired: Schema, actual: Schema) -> list[Change]:
                 DropIndex(
                     schema=index.schema,
                     index_name=index.name,
-                    concurrent=True,
+                    concurrent=not index.partitioned,
                 )
             )
 
     return changes
+
+
+def _diff_rules(desired: Schema, actual: Schema) -> list[Change]:
+    """Diff rewrite rules on tables.
+
+    `CREATE OR REPLACE RULE` changes a rule in place, event included. A rule on
+    a table this run drops goes with the table.
+    """
+    changes: list[Change] = []
+    for key, rule in desired.rules.items():
+        current = actual.rules.get(key)
+        if current is None:
+            changes.append(CreateRule(rule=rule))
+        elif rule.definition != current.definition:
+            changes.append(
+                CreateRule(rule=rule, set_enabled=rule.enabled != current.enabled)
+            )
+        elif rule.enabled != current.enabled:
+            changes.append(AlterRuleEnabled(rule=rule))
+
+    for key, rule in actual.rules.items():
+        if key in desired.rules:
+            continue
+        table = f"{rule.schema}.{rule.table}"
+        if table in actual.tables and table not in desired.tables:
+            continue  # DROP TABLE takes the rule with it.
+        changes.append(
+            DropRule(schema=rule.schema, table=rule.table, rule_name=rule.name)
+        )
+    return changes
+
+
+def publication_is_droppable(
+    publication: Publication, actual: Schema, managed_schemas: list[str]
+) -> bool:
+    """Whether an undeclared live publication may be dropped.
+
+    Only when everything it publishes is something pgdeclare manages: at least
+    one table or schema, every table one introspected in a managed schema, and
+    every TABLES IN SCHEMA schema a managed one. FOR ALL TABLES publications,
+    empty ones, and any that reach a table or schema outside that set belong
+    to someone else (a replication tool, another application) and are left
+    alone.
+    """
+    if publication.all_tables or publication.is_empty:
+        return False
+    if any(key not in actual.tables for key in publication.tables):
+        return False
+    return all(schema in managed_schemas for schema in publication.schemas)
+
+
+def _diff_publications(
+    desired: Schema, actual: Schema, managed_schemas: list[str]
+) -> list[Change]:
+    """Diff publications.
+
+    Declared publications converge in place: options with SET (...), tables
+    and schemas with ADD and DROP, a member whose column list or row filter
+    changed is dropped and added back. Switching to or from FOR ALL TABLES
+    needs a drop and re-create. Undeclared ones are dropped only when
+    `publication_is_droppable` says so.
+    """
+    changes: list[Change] = []
+    for name, pub in desired.publications.items():
+        current = actual.publications.get(name)
+        if current is None:
+            changes.append(CreatePublication(publication=pub))
+            continue
+        if pub.all_tables != current.all_tables:
+            changes.append(DropAndCreatePublication(publication=pub))
+            continue
+        if (pub.publish, pub.via_root, pub.generated_columns) != (
+            current.publish,
+            current.via_root,
+            current.generated_columns,
+        ):
+            changes.append(AlterPublicationOptions(publication=pub))
+        if pub.all_tables:
+            continue
+
+        removed_tables = [
+            t for key, t in current.tables.items() if key not in pub.tables
+        ]
+        removed_schemas = [s for s in current.schemas if s not in pub.schemas]
+        if removed_tables or removed_schemas:
+            changes.append(
+                DropPublicationObjects(
+                    name=name, tables=removed_tables, schemas=removed_schemas
+                )
+            )
+        for key, table in pub.tables.items():
+            old = current.tables.get(key)
+            if old is not None and old != table:
+                changes.append(ReplacePublicationTable(name=name, table=table))
+        added_tables = [t for key, t in pub.tables.items() if key not in current.tables]
+        added_schemas = [s for s in pub.schemas if s not in current.schemas]
+        if added_tables or added_schemas:
+            changes.append(
+                AddPublicationObjects(
+                    name=name, tables=added_tables, schemas=added_schemas
+                )
+            )
+
+    for name, current in actual.publications.items():
+        if name not in desired.publications and publication_is_droppable(
+            current, actual, managed_schemas
+        ):
+            changes.append(DropPublication(name=name))
+    return changes
+
+
+def _diff_event_triggers(
+    desired: Schema,
+    actual: Schema,
+    managed_schemas: list[str],
+    changes: list[Change],
+) -> list[Change]:
+    """Diff event triggers.
+
+    There is no ALTER for an event trigger's event, filter or function, so a
+    change to any of them drops and re-creates it; the enabled state has its
+    own ALTER. A function recreated this run (DROP ... CASCADE) takes its
+    event triggers with it, so those are re-created too. An undeclared event
+    trigger is dropped only when its function lives in a managed schema.
+    """
+    recreated = {
+        (c.function.schema, c.function.name)
+        for c in changes
+        if isinstance(c, DropAndCreateFunction)
+    }
+    result: list[Change] = []
+    for name, trigger in desired.event_triggers.items():
+        current = actual.event_triggers.get(name)
+        if current is None:
+            result.append(CreateEventTrigger(trigger=trigger))
+        elif (
+            dataclass_replace(current, enabled=trigger.enabled) != trigger
+            or (trigger.function_schema, trigger.function_name) in recreated
+        ):
+            result.append(CreateEventTrigger(trigger=trigger, replace=True))
+        elif current.enabled != trigger.enabled:
+            result.append(AlterEventTriggerEnabled(name=name, enabled=trigger.enabled))
+
+    for name, current in actual.event_triggers.items():
+        if (
+            name not in desired.event_triggers
+            and current.function_schema in managed_schemas
+        ):
+            result.append(DropEventTrigger(name=name))
+    return result
 
 
 def _diff_policies(desired: Schema, actual: Schema) -> list[Change]:
@@ -1195,6 +1802,139 @@ def _diff_domain_properties(desired: Domain, actual: Domain) -> list[Change]:
     return changes
 
 
+def _in_use_error(kind: str, qualified: str, dependents: list[str]) -> ValueError:
+    schema, _, name = qualified.partition(".")
+    return ValueError(
+        f'cannot change {kind} "{schema}"."{name}": PostgreSQL has no ALTER for '
+        f"it, and dropping and recreating the {kind} would drop what uses it "
+        f"({'; '.join(dependents)}). Move those off it in an explicit "
+        f"@migrate-before block, or declare a new {kind} under another name "
+        "and move them to it."
+    )
+
+
+def _diff_collations(
+    desired: Schema, actual: Schema
+) -> tuple[list[Change], list[Change]]:
+    """Diff collations. Returns (changes before everything, drops after it).
+
+    A changed collation is dropped and recreated, which is only safe while
+    nothing uses it; otherwise the change is refused naming the dependents.
+    Drops come last, after the columns, domains and ranges that used them.
+    """
+    before: list[Change] = []
+    for key, collation in sorted(desired.collations.items()):
+        current = actual.collations.get(key)
+        if current is None:
+            before.append(CreateCollation(collation=collation))
+        elif collation != current:
+            if current.dependents:
+                raise _in_use_error("collation", key, current.dependents)
+            before.append(DropAndCreateCollation(collation=collation))
+    after: list[Change] = [
+        DropCollation(schema=c.schema, name=c.name)
+        for key, c in sorted(actual.collations.items())
+        if key not in desired.collations
+    ]
+    return before, after
+
+
+def _ranges_equal(
+    desired: RangeType, actual: RangeType, managed_schemas: list[str] | None
+) -> bool:
+    return (
+        _normalize_type(desired.subtype, managed_schemas)
+        == _normalize_type(actual.subtype, managed_schemas)
+        and dataclass_replace(desired, subtype=actual.subtype) == actual
+    )
+
+
+def _diff_ranges(
+    desired: Schema,
+    actual: Schema,
+    managed_schemas: list[str] | None = None,
+) -> list[Change]:
+    """Create range types and recreate the ones whose definition changed.
+
+    No option of a range has an ALTER, so a change drops and recreates the
+    type (its multirange goes with it), only while nothing uses either;
+    otherwise the change is refused naming the dependents. A range with a
+    canonical function gets a shell type first: the function's signature
+    names the type, and the range definition names the function. Drops of
+    undeclared ranges come from _drop_ranges, later in the plan.
+    """
+    changes: list[Change] = []
+    for key, range_type in sorted(desired.ranges.items()):
+        current = actual.ranges.get(key)
+        if current is None:
+            if range_type.canonical:
+                changes.append(
+                    CreateShellType(schema=range_type.schema, name=range_type.name)
+                )
+            changes.append(CreateRangeType(range_type=range_type))
+            continue
+        if _ranges_equal(range_type, current, managed_schemas):
+            continue
+        if current.dependents:
+            raise _in_use_error("range type", key, current.dependents)
+        if range_type.canonical:
+            # The canonical function would have to take the type that is
+            # about to be dropped.
+            raise ValueError(
+                f'cannot change range type "{range_type.schema}".'
+                f'"{range_type.name}" to one with a canonical function in '
+                "place: the function's signature names the type. Drop the "
+                "type and the function in an explicit @migrate-before block "
+                "and let the next run create both."
+            )
+        changes.append(DropAndCreateRangeType(range_type=range_type))
+    return changes
+
+
+def _drop_ranges(desired: Schema, actual: Schema) -> list[Change]:
+    """Drop range types that are no longer declared.
+
+    Emitted after the table, view and function changes so whatever used the
+    range is gone first; the executor also retries a drop that still finds a
+    dependent.
+    """
+    return [
+        DropRangeType(
+            schema=r.schema, name=r.name, has_canonical=r.canonical is not None
+        )
+        for key, r in sorted(actual.ranges.items())
+        if key not in desired.ranges
+    ]
+
+
+def _skip_canonical_function_drops(
+    changes: list[Change], actual: Schema
+) -> list[Change]:
+    """Leave a dropped range's canonical function to the range's own drop.
+
+    The function and the type depend on each other, so DropRangeType drops
+    the function with the type, after checking nothing else uses it. A
+    separate DROP FUNCTION ... CASCADE would take the type, and whatever
+    still uses it, down without that check.
+    """
+    dropped = {f"{c.schema}.{c.name}" for c in changes if isinstance(c, DropRangeType)}
+    signatures = {
+        r.canonical_signature
+        for key, r in actual.ranges.items()
+        if key in dropped and r.canonical_signature
+    }
+    if not signatures:
+        return changes
+    return [
+        c
+        for c in changes
+        if not (
+            isinstance(c, DropFunction)
+            and f"{c.schema}.{c.name}({c.args})" in signatures
+        )
+    ]
+
+
 def _drop_domains(desired: Schema, actual: Schema) -> list[Change]:
     """Drop domains that are no longer declared.
 
@@ -1341,6 +2081,28 @@ def _diff_grants(desired: Schema, actual: Schema) -> list[Change]:
         changes.append(GrantPrivilege(grant=desired_by_key[key]))
 
     return changes
+
+
+def _diff_default_privileges(
+    desired: Schema, actual: Schema
+) -> tuple[list[Change], list[Change]]:
+    """Revokes and grants of ALTER DEFAULT PRIVILEGES entries.
+
+    Both sides hold only entries whose grantee is a managed role (see
+    introspection), so an entry for any other grantee is never touched. A
+    change of grant option revokes the privilege and grants it again.
+    """
+    desired_by_key = {p.key: p for p in desired.default_privileges}
+    actual_by_key = {p.key: p for p in actual.default_privileges}
+    revokes: list[Change] = [
+        RevokeDefaultPrivilege(entry=actual_by_key[key])
+        for key in sorted(actual_by_key.keys() - desired_by_key.keys())
+    ]
+    grants: list[Change] = [
+        GrantDefaultPrivilege(entry=desired_by_key[key])
+        for key in sorted(desired_by_key.keys() - actual_by_key.keys())
+    ]
+    return revokes, grants
 
 
 def _diff_roles(desired: Schema, actual: Schema) -> list[Change]:
@@ -1508,3 +2270,316 @@ def split_index_operations(
     index_changes.sort(key=lambda c: 0 if isinstance(c, DropIndex) else 1)
 
     return ddl_changes, index_changes
+
+
+# =============================================================================
+# Extensions, foreign data, ownership
+# =============================================================================
+
+# Installed in every database by initdb; never worth a note.
+_BUILTIN_EXTENSIONS = frozenset({"plpgsql"})
+
+
+def _diff_extensions(desired: Schema, actual: Schema) -> list[Change]:
+    """Create declared extensions; converge a stated version or schema.
+
+    An unstated version or schema is not compared. Undeclared extensions are
+    never dropped here: see `_drop_extensions` and `undeclared_extensions`.
+    """
+    changes: list[Change] = []
+    for name, ext in desired.extensions.items():
+        current = actual.extensions.get(name)
+        if current is None:
+            changes.append(CreateExtension(extension=ext))
+            continue
+        if ext.version is not None and ext.version != current.version:
+            changes.append(
+                AlterExtensionUpdate(
+                    name=name,
+                    version=ext.version,
+                    current_version=current.version or "",
+                )
+            )
+        if ext.schema is not None and ext.schema != current.schema:
+            changes.append(AlterExtensionSchema(name=name, schema=ext.schema))
+    return changes
+
+
+def _drop_extensions(desired: Schema, actual: Schema) -> list[Change]:
+    """Drop the undeclared extensions a `@drop extension:NAME` directive names."""
+    return [
+        DropExtension(name=name)
+        for name in sorted(actual.extensions)
+        if name not in desired.extensions and name in desired.extension_drops
+    ]
+
+
+def undeclared_extensions(desired: Schema, actual: Schema) -> list[str]:
+    """Installed extensions the schema files neither declare nor consent to drop.
+
+    They are left in place (dropping one cascades to every column of its
+    types) and reported, so a forgotten declaration is visible.
+    """
+    return [
+        name
+        for name in sorted(actual.extensions)
+        if name not in desired.extensions
+        and name not in desired.extension_drops
+        and name not in _BUILTIN_EXTENSIONS
+    ]
+
+
+def _diff_foreign_servers(desired: Schema, actual: Schema) -> list[Change]:
+    """Create declared foreign servers and converge their version and options.
+
+    Undeclared servers are never dropped: other schemas' foreign tables and
+    user mappings may depend on them. The wrapper and TYPE have no ALTER, and
+    recreating the server would cascade to its mappings and foreign tables,
+    so a change to either is refused.
+    """
+    changes: list[Change] = []
+    for name, srv in desired.foreign_servers.items():
+        current = actual.foreign_servers.get(name)
+        if current is None:
+            changes.append(CreateForeignServer(server=srv))
+            continue
+        if srv.fdw != current.fdw or srv.type != current.type:
+            raise ValueError(
+                f"cannot change the foreign data wrapper or TYPE of server "
+                f"{quote_ident(name)} ({current.fdw}, {current.type!r} -> "
+                f"{srv.fdw}, {srv.type!r}): PostgreSQL has no ALTER for them, "
+                "and recreating the server drops its user mappings and foreign "
+                "tables. Recreate it in an explicit @migrate-before block."
+            )
+        set_version = srv.version is not None and srv.version != current.version
+        if set_version or srv.options != current.options:
+            changes.append(
+                AlterForeignServer(
+                    server=srv,
+                    current_options=dict(current.options),
+                    set_version=set_version,
+                )
+            )
+    return changes
+
+
+def _diff_user_mappings(desired: Schema, actual: Schema) -> list[Change]:
+    """Create and converge declared user mappings.
+
+    A secret option (anything but USER_MAPPING_PUBLIC_OPTIONS) the declaration
+    does not set is left alone, so a password provisioned outside the schema
+    files survives. An undeclared mapping is dropped only when it is a managed
+    role's on a declared server; anything else is not this schema's business.
+    """
+    changes: list[Change] = []
+    managed_roles = set(desired.roles)
+    for key, mapping in desired.user_mappings.items():
+        current = actual.user_mappings.get(key)
+        if current is None:
+            changes.append(CreateUserMapping(mapping=mapping))
+            continue
+        if mapping.options is None or current.options is None:
+            continue  # Options not readable on one side: not compared.
+        compared = {
+            name: value
+            for name, value in current.options.items()
+            if name in mapping.options or name in USER_MAPPING_PUBLIC_OPTIONS
+        }
+        if mapping.options != compared:
+            changes.append(AlterUserMapping(mapping=mapping, current_options=compared))
+    for key, current in actual.user_mappings.items():
+        if (
+            key not in desired.user_mappings
+            and current.server in desired.foreign_servers
+            and current.user in managed_roles
+        ):
+            changes.append(DropUserMapping(mapping=current))
+    return changes
+
+
+def _diff_foreign_tables(
+    desired: Schema, actual: Schema, managed_schemas: list[str] | None = None
+) -> list[Change]:
+    """Create, alter and drop foreign tables.
+
+    A foreign table keeps no rows locally, so column changes are catalog-only
+    and a drop needs no `@drop`. A changed server has no ALTER: the table is
+    recreated, its grants replayed in the same statement.
+    """
+    changes: list[Change] = []
+    for key, table in desired.foreign_tables.items():
+        current = actual.foreign_tables.get(key)
+        if current is None:
+            changes.append(CreateForeignTable(table=table))
+        elif table.server != current.server:
+            changes.append(DropAndCreateForeignTable(table=table))
+        else:
+            actions = _foreign_table_actions(table, current, managed_schemas)
+            if actions:
+                changes.append(
+                    AlterForeignTable(
+                        schema=table.schema, table_name=table.name, actions=actions
+                    )
+                )
+    for key, table in actual.foreign_tables.items():
+        if key not in desired.foreign_tables:
+            changes.append(DropForeignTable(schema=table.schema, table_name=table.name))
+    return changes
+
+
+def _foreign_table_actions(
+    desired: ForeignTable, actual: ForeignTable, managed_schemas: list[str] | None
+) -> list[str]:
+    """The `ALTER FOREIGN TABLE` actions turning `actual` into `desired`."""
+    actions: list[str] = []
+    for name in actual.columns:
+        if name not in desired.columns:
+            actions.append(f"DROP COLUMN {quote_ident(name)}")
+    for name, column in desired.columns.items():
+        if name not in actual.columns:
+            actions.append(
+                "ADD COLUMN "
+                + foreign_column_sql(column, desired.column_options.get(name))
+            )
+    for name, column in desired.columns.items():
+        current = actual.columns.get(name)
+        if current is None:
+            continue
+        ident = quote_ident(name)
+        if column.generated != current.generated:
+            raise ValueError(
+                f"cannot change the generation expression of foreign table column "
+                f"{quote_ident(desired.schema)}.{quote_ident(desired.name)}.{ident}; "
+                "drop and re-add the column in an explicit @migrate-before block."
+            )
+        if _normalize_type(column.type, managed_schemas) != _normalize_type(
+            current.type, managed_schemas
+        ):
+            actions.append(f"ALTER COLUMN {ident} TYPE {column.type}")
+        if column.nullable != current.nullable:
+            verb = "DROP" if column.nullable else "SET"
+            actions.append(f"ALTER COLUMN {ident} {verb} NOT NULL")
+        if _normalize_default(column.default) != _normalize_default(current.default):
+            if column.default is None:
+                actions.append(f"ALTER COLUMN {ident} DROP DEFAULT")
+            else:
+                actions.append(f"ALTER COLUMN {ident} SET DEFAULT {column.default}")
+        column_options = alter_fdw_options_sql(
+            desired.column_options.get(name, {}), actual.column_options.get(name, {})
+        )
+        if column_options:
+            actions.append(f"ALTER COLUMN {ident} {column_options}")
+    table_options = alter_fdw_options_sql(desired.options, actual.options)
+    if table_options:
+        actions.append(table_options)
+    return actions
+
+
+def _owner_keys_rebuilt(changes: list[Change]) -> set[str]:
+    """Owner keys of the objects this run creates or drops and recreates.
+
+    A fresh object belongs to the migrating role, whatever the live owner was.
+    """
+    keys: set[str] = set()
+
+    def mark(kind: str, schema: str, name: str, args: str = "") -> None:
+        if kind in ROUTINE_OWNER_KINDS:
+            keys.add(f"{kind}:{schema}.{name}({args})")
+        else:
+            keys.add(f"{kind}:{schema}.{name}")
+
+    for c in changes:
+        if isinstance(c, CreateTable):
+            mark("TABLE", c.table.schema, c.table.name)
+        elif isinstance(c, (CreateForeignTable, DropAndCreateForeignTable)):
+            mark("FOREIGN TABLE", c.table.schema, c.table.name)
+        elif isinstance(c, (CreateView, DropAndCreateView)):
+            mark("VIEW", c.view.schema, c.view.name)
+        elif isinstance(c, (CreateMaterializedView, DropAndCreateMaterializedView)):
+            mark("MATERIALIZED VIEW", c.matview.schema, c.matview.name)
+        elif isinstance(c, CreateSequence):
+            mark("SEQUENCE", c.sequence.schema, c.sequence.name)
+        elif isinstance(c, (CreateFunction, DropAndCreateFunction)):
+            f = c.function
+            mark(f.keyword, f.schema, f.name, f.args)
+        elif isinstance(c, CreateEnum):
+            mark("TYPE", c.enum.schema, c.enum.name)
+        elif isinstance(c, CreateCompositeType):
+            mark("TYPE", c.composite_type.schema, c.composite_type.name)
+        elif isinstance(c, (CreateDomain, DropAndCreateDomain)):
+            mark("DOMAIN", c.domain.schema, c.domain.name)
+        elif isinstance(c, (CreateRangeType, DropAndCreateRangeType)):
+            mark("TYPE", c.range_type.schema, c.range_type.name)
+        elif isinstance(c, (CreateCollation, DropAndCreateCollation)):
+            mark("COLLATION", c.collation.schema, c.collation.name)
+        if isinstance(c, (DropAndCreateView, DropAndCreateMaterializedView)):
+            for dep in c.dependents:
+                if dep.relation is not None:
+                    kind = "MATERIALIZED VIEW" if dep.kind == "m" else "VIEW"
+                    mark(kind, dep.schema, dep.name)
+    return keys
+
+
+def _diff_owners(
+    desired: Schema, actual: Schema, changes: list[Change]
+) -> list[Change]:
+    """`ALTER ... OWNER TO` for every stated owner the target does not have.
+
+    `desired.owners` holds only owners the schema files state (see
+    `PgDeclareConfig.manage_ownership`), so nothing else is touched. An object
+    built fresh in this run gets its owner written whatever the live one was.
+    """
+    rebuilt = _owner_keys_rebuilt(changes)
+    result: list[Change] = []
+    for key in sorted(desired.owners):
+        wanted = desired.owners[key]
+        current = actual.owners.get(key)
+        if current is None or current.owner != wanted.owner or key in rebuilt:
+            result.append(AlterOwner(owner=wanted))
+    return result
+
+
+# Owner kind -> the grant object types its implicit privileges read back as.
+# Relations of every kind read back as TABLE (and their columns as COLUMN), an
+# aggregate or window function as FUNCTION. Types, domains and collations have
+# no modelled grants.
+_OWNER_GRANT_TYPES: dict[str, tuple[str, ...]] = {
+    "SCHEMA": ("SCHEMA",),
+    "TABLE": ("TABLE", "COLUMN"),
+    "VIEW": ("TABLE", "COLUMN"),
+    "MATERIALIZED VIEW": ("TABLE", "COLUMN"),
+    "FOREIGN TABLE": ("TABLE", "COLUMN"),
+    "SEQUENCE": ("SEQUENCE",),
+    "FUNCTION": ("FUNCTION",),
+    "PROCEDURE": ("PROCEDURE",),
+    "AGGREGATE": ("FUNCTION",),
+}
+
+# (grant object type, schema, object name, routine signature or None, owner)
+_OwnerGrantKey = tuple[str, str, str, Optional[str], str]
+
+
+def _stated_owner_grants(desired: Schema) -> set[_OwnerGrantKey]:
+    """The exact objects whose stated owner's privileges are not grants.
+
+    Keyed by grant object type and, for a routine, its signature, so a grant
+    to the same role on another object of that name (a function named like
+    the owned table, another overload) is still diffed.
+    """
+    keys: set[_OwnerGrantKey] = set()
+    for o in desired.owners.values():
+        schema = o.name if o.kind == "SCHEMA" else o.schema
+        args = o.args if o.kind in ROUTINE_OWNER_KINDS else None
+        for grant_type in _OWNER_GRANT_TYPES.get(o.kind, ()):
+            keys.add((grant_type, schema, o.name, args, o.owner))
+    return keys
+
+
+def _is_stated_owner_grant(grant: Grant, owner_grants: set[_OwnerGrantKey]) -> bool:
+    args = grant.args
+    if grant.object_type in ("FUNCTION", "PROCEDURE") and args is None:
+        # A routine grant without a signature cannot be pinned to one
+        # overload, so it is never taken for an owner's privilege.
+        return False
+    key = (grant.object_type, grant.schema, grant.object_name, args, grant.grantee)
+    return key in owner_grants

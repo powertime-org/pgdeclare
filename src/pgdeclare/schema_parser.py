@@ -16,14 +16,17 @@ from pathlib import Path
 from typing import Optional
 
 import psycopg2
+from pglast import ast, parse_sql
 from psycopg2.extensions import make_dsn
 
-from .quoting import quote_ident
+from .quoting import do_block, quote_ident, role_ident
 from .config import PgDeclareConfig, logger, resolve
 from .introspection import introspect_schema
-from .models import Schema
+from .models import DEFAULT_PRIVILEGE_OBJECT_TYPES, Extension, Schema
 from .statement_parser import (
+    ALTER_DEFAULT_PRIVILEGES,
     ParsedStatement,
+    _strip_leading_comments,
     parse_sql_content,
     collect_sql_files_recursive,
     parse_role_from_sql,
@@ -135,6 +138,106 @@ def _inject_role_passwords(schema: Schema, passwords: dict[str, str]) -> None:
             schema.roles[role_name].password = password
 
 
+def parse_extension_statement(raw_sql: str) -> Optional[Extension]:
+    """The extension a `CREATE EXTENSION` statement declares, or None."""
+    try:
+        tree = parse_sql(raw_sql)
+    except Exception:  # noqa: BLE001 - PostgreSQL rejects it too
+        return None
+    for raw_stmt in tree:
+        stmt = raw_stmt.stmt
+        if not isinstance(stmt, ast.CreateExtensionStmt) or not stmt.extname:
+            continue
+        ext = Extension(name=stmt.extname)
+        for option in stmt.options or ():
+            if not isinstance(option, ast.DefElem):
+                continue
+            arg = option.arg
+            if option.defname == "schema" and isinstance(arg, ast.String):
+                ext.schema = arg.sval
+            elif option.defname == "new_version" and isinstance(arg, ast.String):
+                ext.version = arg.sval
+            elif option.defname == "cascade":
+                ext.cascade = bool(getattr(arg, "boolval", True))
+        return ext
+    return None
+
+
+def _declared_extensions(contents: list[tuple[str, str]]) -> dict[str, Extension]:
+    """Extensions the schema files declare. `contents` is (source, SQL) pairs.
+
+    CREATE EXTENSION is not run in the plan database (the caller provisions
+    extensions there), so the declarations are read from the files.
+    """
+    extensions: dict[str, Extension] = {}
+    for source, content in contents:
+        for stmt in parse_sql_content(
+            strip_migrate_blocks(content), source_file=source
+        ):
+            if stmt.statement_type != "CREATE EXTENSION":
+                continue
+            ext = parse_extension_statement(_strip_comment_lines(stmt.raw_sql))
+            if ext is not None:
+                extensions[ext.name] = ext
+    return extensions
+
+
+def _strip_comment_lines(sql: str) -> str:
+    return "\n".join(
+        line for line in sql.splitlines() if not line.strip().startswith("--")
+    )
+
+
+EXTENSION_DROP_PREFIX = "extension:"
+
+
+def extension_drop_directives(directives: "list[str] | set[str]") -> set[str]:
+    """Names from `@drop extension:NAME` directives."""
+    return {
+        d[len(EXTENSION_DROP_PREFIX) :]
+        for d in directives
+        if d.lower().startswith(EXTENSION_DROP_PREFIX)
+        and len(d) > len(EXTENSION_DROP_PREFIX)
+    }
+
+
+def _schema_file_contents(
+    sql_dir: Path, config: PgDeclareConfig
+) -> list[tuple[str, str]]:
+    schemas_dir = sql_dir / config.schemas_subdir
+    if not schemas_dir.exists():
+        return []
+    return [
+        (str(path.relative_to(schemas_dir)), path.read_text())
+        for path in collect_sql_files_recursive(schemas_dir)
+    ]
+
+
+def _declared_owners_only(
+    schema: Schema, plan_url: str, config: PgDeclareConfig
+) -> None:
+    """Keep only the owners the schema files state.
+
+    Everything in the plan database belongs to the role building it unless an
+    `ALTER ... OWNER TO` moved it, so an owner is "stated" when it is a managed
+    role other than that one. Without `manage_ownership`, none is kept.
+    """
+    if not config.manage_ownership:
+        schema.owners.clear()
+        return
+    with psycopg2.connect(plan_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_user")
+            row = cur.fetchone()
+    builder = row[0] if row else None
+    managed = set(config.managed_roles)
+    schema.owners = {
+        key: owner
+        for key, owner in schema.owners.items()
+        if owner.owner in managed and owner.owner != builder
+    }
+
+
 def build_desired_schema(
     sql_dir: Path,
     connection_string: str,
@@ -231,6 +334,18 @@ def _build_desired_schema(
 
     # Inject passwords into introspected roles
     _inject_role_passwords(schema, passwords)
+
+    schema.extensions = _declared_extensions(_schema_file_contents(sql_dir, config))
+    from .ledger import parse_migration_blocks  # ledger imports this module
+
+    schema.extension_drops = extension_drop_directives(
+        [
+            d
+            for block in parse_migration_blocks(sql_dir, config)
+            for d in block.drop_directives
+        ]
+    )
+    _declared_owners_only(schema, plan_url, config)
 
     return schema
 
@@ -402,6 +517,18 @@ def _apply_to_plan_database(
     with psycopg2.connect(plan_url) as conn:
         conn.autocommit = True  # Schema operations need autocommit
         with conn.cursor() as cur:
+            # Publications and event triggers belong to the database, not to a
+            # schema, so a reused plan database still holds the previous
+            # build's. Clear them, or one removed from the files would still
+            # look declared.
+            _clear_database_level_objects(cur)
+
+            # Foreign servers live outside every schema, so a reused plan
+            # database would keep a server (and its user mappings) after its
+            # declaration is gone. Drop the ones this role can; an extension's
+            # own servers stay with the extension.
+            cur.execute(_DROP_PLAN_SERVERS)
+
             # Drop and recreate schemas
             for name in cfg.plan_recreate_schemas:
                 cur.execute(f"DROP SCHEMA IF EXISTS {quote_ident(name)} CASCADE")
@@ -420,6 +547,9 @@ def _apply_to_plan_database(
                     cur.execute(f"GRANT {stock} ON SCHEMA public TO PUBLIC")
 
     if use_retry and statements:
+        _reset_default_privileges(plan_url)
+        statements = _load_default_privileges_first(plan_url, statements, cfg)
+        statements = _event_triggers_last(statements)
         # Use retry-until-stable execution
         logger.info(
             f"Executing {len(statements)} statements with retry-until-stable..."
@@ -443,6 +573,136 @@ def _apply_to_plan_database(
                     conn.rollback()
                     logger.error(f"Failed to apply schema to plan database: {e}")
                     raise
+
+
+# Run ahead of the ALTER DEFAULT PRIVILEGES statements, which need their roles
+# and schemas. SET is run again with the rest (a new session).
+_DEFAULT_PRIVILEGE_PREREQUISITES = frozenset({"CREATE ROLE", "CREATE SCHEMA"})
+
+
+def _load_default_privileges_first(
+    plan_url: str, statements: list[ParsedStatement], config: PgDeclareConfig
+) -> list[ParsedStatement]:
+    """Run the declared ALTER DEFAULT PRIVILEGES before every other object.
+
+    Default privileges act on objects created after them, so in file order a
+    table declared above the statement would miss the grant in the plan while
+    the live database, where the defaults are already in force, gives it. Run
+    first, they reach every declared object, as they do on a database that
+    has had them since its first apply, and the plan no longer depends on the
+    order the statements happen to load in.
+
+    Returns the statements still to run. One that cannot run yet (its role is
+    made by a DO block, say) stays in the list and loads with the rest.
+    """
+    first = [s for s in statements if s.statement_type == ALTER_DEFAULT_PRIVILEGES]
+    if not first:
+        return statements
+    first = [
+        s
+        for s in statements
+        if s.statement_type in _DEFAULT_PRIVILEGE_PREREQUISITES
+        or s.statement_type == "SET"
+    ] + first
+    result = execute_with_retry(plan_url, first, config=config)
+    if result.duplicates:
+        # Load everything in one pass, which reports the duplicates as usual.
+        return statements
+    done = {id(s) for s in first if s.statement_type != "SET"} - {
+        id(f.statement) for f in result.failed_statements
+    }
+    return [s for s in statements if id(s) not in done]
+
+
+def _reset_default_privileges(plan_url: str) -> None:
+    """Put every default ACL in the plan database back to the built-in one.
+
+    A plan database passed in by name persists between runs, and so do its
+    schema-less default privileges (those in a recreated schema go with it).
+    Left in place, a declaration removed from the files would still show in
+    the plan. A row this role cannot alter (it is no member of the target
+    role) is left alone.
+    """
+    with psycopg2.connect(plan_url) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.rolname, n.nspname, d.defaclobjtype::text,
+                       array_agg(DISTINCT coalesce(g.rolname, 'public'))
+                FROM pg_default_acl d
+                JOIN pg_roles r ON r.oid = d.defaclrole
+                LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
+                CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+                LEFT JOIN pg_roles g ON g.oid = a.grantee
+                GROUP BY 1, 2, 3
+                """
+            )
+            rows = cur.fetchall()
+            for role, schema, objtype, grantees in rows:
+                keyword = DEFAULT_PRIVILEGE_OBJECT_TYPES.get(objtype)
+                if keyword is None:
+                    continue
+                prefix = f"ALTER DEFAULT PRIVILEGES FOR ROLE {role_ident(role)}"
+                if schema is not None:
+                    prefix += f" IN SCHEMA {quote_ident(schema)}"
+                sql = [
+                    f"{prefix} REVOKE ALL ON {keyword} FROM {role_ident(g)}"
+                    for g in grantees
+                ]
+                if schema is None:
+                    # The built-in default: the owner's privileges, and PUBLIC
+                    # may execute functions and use types.
+                    sql.append(f"{prefix} GRANT ALL ON {keyword} TO {role_ident(role)}")
+                    if objtype in ("f", "T"):
+                        sql.append(f"{prefix} GRANT ALL ON {keyword} TO PUBLIC")
+                try:
+                    for statement in sql:
+                        cur.execute(statement)
+                except psycopg2.Error as exc:
+                    logger.info(
+                        f"Leaving default privileges for role {role} in the plan "
+                        f"database: {exc}"
+                    )
+
+
+def _clear_database_level_objects(cur) -> None:
+    """Drop every publication and event trigger in the plan database."""
+    cur.execute("SELECT pubname FROM pg_catalog.pg_publication")
+    for (name,) in cur.fetchall():
+        cur.execute(f"DROP PUBLICATION {quote_ident(name)}")
+    cur.execute("SELECT evtname FROM pg_catalog.pg_event_trigger")
+    for (name,) in cur.fetchall():
+        cur.execute(f"DROP EVENT TRIGGER {quote_ident(name)}")
+
+
+_EVENT_TRIGGER_DDL = re.compile(r"(?:CREATE|ALTER)\s+EVENT\s+TRIGGER\b", re.IGNORECASE)
+
+
+def _event_triggers_last(statements: list[ParsedStatement]) -> list[ParsedStatement]:
+    """Move CREATE / ALTER EVENT TRIGGER to the end of the plan build.
+
+    An event trigger fires on every DDL statement after it, so building it
+    last keeps it from running (and perhaps failing) on the rest of the plan.
+    """
+    first: list[ParsedStatement] = []
+    last: list[ParsedStatement] = []
+    for stmt in statements:
+        sql = _strip_leading_comments(stmt.raw_sql).lstrip()
+        (last if _EVENT_TRIGGER_DDL.match(sql) else first).append(stmt)
+    return first + last
+
+
+_DROP_PLAN_SERVERS = do_block(
+    "DECLARE r record; BEGIN"
+    " FOR r IN SELECT s.srvname FROM pg_foreign_server s"
+    " WHERE pg_has_role(s.srvowner, 'USAGE')"
+    " AND NOT EXISTS (SELECT 1 FROM pg_depend d"
+    " WHERE d.classid = 'pg_foreign_server'::regclass AND d.objid = s.oid"
+    " AND d.deptype = 'e')"
+    " LOOP EXECUTE format('DROP SERVER %I CASCADE', r.srvname); END LOOP;"
+    " END"
+)
 
 
 def _replace_db_in_url(connection_string: str, new_db: str) -> str:
@@ -642,6 +902,15 @@ def _build_schema_from_git_branch(
 
     # Inject passwords into introspected roles
     _inject_role_passwords(schema, passwords)
+
+    schemas_path = config.git_path(config.schemas_subdir)
+    schema.extensions = _declared_extensions(
+        [
+            (path, git_read_file(branch, path, repo_root) or "")
+            for path in git_list_sql_files_dfs(branch, schemas_path, repo_root)
+        ]
+    )
+    _declared_owners_only(schema, plan_url, config)
 
     return schema
 

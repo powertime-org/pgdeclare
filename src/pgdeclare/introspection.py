@@ -11,28 +11,43 @@ from typing import Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from .quoting import quote_ident
+from .quoting import quote_ident, quote_literal
 from .config import PgDeclareConfig, logger, resolve
 from .models import (
+    PUBLISH_ACTIONS,
     Column,
+    Collation,
     Comment,
     CompositeType,
     Constraint,
+    DEFAULT_PRIVILEGE_OBJECT_TYPES,
+    DefaultPrivilege,
     Dependency,
     Domain,
     EnumType,
+    EventTrigger,
+    Extension,
+    ForeignServer,
+    ForeignTable,
     Function,
     Grant,
     Index,
     MaterializedView,
+    ObjectOwner,
     Policy,
+    RangeType,
+    Publication,
+    PublicationTable,
     Role,
     RoleMembership,
+    Rule,
     Schema,
     Sequence,
     Table,
     Trigger,
+    UserMapping,
     View,
+    parse_options,
 )
 
 
@@ -81,6 +96,7 @@ def introspect_schema(
 
             functions = _query_functions(conn, schema)
             result.functions.update(functions)
+            result.functions.update(_query_aggregates(conn, schema))
 
             indexes = _query_indexes(conn, schema)
             result.indexes.update(indexes)
@@ -91,6 +107,8 @@ def introspect_schema(
             triggers = _query_triggers(conn, schema)
             result.triggers.update(triggers)
 
+            result.rules.update(_query_rules(conn, schema))
+
             enums = _query_enums(conn, schema)
             result.enums.update(enums)
 
@@ -100,6 +118,9 @@ def introspect_schema(
             domains = _query_domains(conn, schema, cfg.search_path_sql)
             result.domains.update(domains)
 
+            result.ranges.update(_query_ranges(conn, schema, cfg.search_path_sql))
+            result.collations.update(_query_collations(conn, schema))
+
             views = _query_views(conn, schema)
             result.views.update(views)
 
@@ -107,6 +128,10 @@ def introspect_schema(
 
             sequences = _query_sequences(conn, schema)
             result.sequences.update(sequences)
+
+            result.foreign_tables.update(
+                _query_foreign_tables(conn, schema, cfg.search_path_sql)
+            )
 
             for role in existing_roles:
                 grants = _query_grants(conn, schema, role)
@@ -120,6 +145,17 @@ def introspect_schema(
                 if result.has_comment_target(comment):
                     result.comments[comment.key] = comment
 
+        # Database-wide objects: extensions, foreign servers, user mappings.
+        result.extensions = _query_extensions(conn)
+        result.foreign_servers = _query_foreign_servers(conn)
+        result.user_mappings = _query_user_mappings(conn)
+
+        if cfg.manage_ownership:
+            # Like comments: only owners of objects introspected above.
+            for owner in _query_owners(conn, schemas):
+                if result.has_owner_target(owner):
+                    result.owners[owner.key] = owner
+
         # Query dependencies (cross-schema)
         result.dependencies = _query_dependencies(conn, schemas)
         result.relation_dependents = _query_relation_dependents(conn, schemas)
@@ -129,8 +165,16 @@ def introspect_schema(
             schema_grants = _query_schema_grants(conn, role)
             result.grants.extend(schema_grants)
 
+        result.default_privileges = _query_default_privileges(
+            conn, schemas, existing_roles
+        )
+
         # Query memberships for managed roles
         result.role_memberships = _query_role_memberships(conn, managed_roles)
+
+        # Database-level objects, whichever schemas they reach into.
+        result.publications = _query_publications(conn, cfg.search_path_sql)
+        result.event_triggers = _query_event_triggers(conn)
 
     return result
 
@@ -146,10 +190,20 @@ def _query_tables(conn, schema: str, search_path: str = "public") -> dict[str, T
             SELECT
                 c.relname AS table_name,
                 c.relrowsecurity AS rls_enabled,
-                c.relforcerowsecurity AS rls_forced
+                c.relforcerowsecurity AS rls_forced,
+                CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) END
+                    AS partition_key,
+                pn.nspname AS parent_schema,
+                pc.relname AS parent_name,
+                CASE WHEN c.relispartition
+                    THEN pg_get_expr(c.relpartbound, c.oid) END AS partition_bound
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind = 'r'
+            -- A partition has exactly one pg_inherits row, naming its parent.
+            LEFT JOIN pg_inherits i ON c.relispartition AND i.inhrelid = c.oid
+            LEFT JOIN pg_class pc ON pc.oid = i.inhparent
+            LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+            WHERE c.relkind IN ('r', 'p')
               AND n.nspname = %s
               AND c.relname NOT LIKE 'pg_%%'
               AND NOT c.relname ~ '^_'
@@ -171,6 +225,13 @@ def _query_tables(conn, schema: str, search_path: str = "public") -> dict[str, T
                 name=table_name,
                 rls_enabled=row["rls_enabled"],
                 rls_forced=row["rls_forced"],
+                partition_key=row["partition_key"],
+                partition_of=(
+                    (row["parent_schema"], row["parent_name"])
+                    if row["parent_name"] is not None
+                    else None
+                ),
+                partition_bound=row["partition_bound"],
             )
 
             # Query columns for this table
@@ -206,10 +267,17 @@ def _query_columns(
                 NOT a.attnotnull AS is_nullable,
                 pg_get_expr(d.adbin, d.adrelid) AS column_default,
                 a.attidentity AS identity_type,
-                a.attgenerated AS generated_kind
+                a.attgenerated AS generated_kind,
+                CASE
+                    WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation
+                    THEN quote_ident(cn.nspname) || '.' || quote_ident(co.collname)
+                END AS collation
             FROM pg_attribute a
             JOIN pg_class c ON c.oid = a.attrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_type ty ON ty.oid = a.atttypid
+            LEFT JOIN pg_collation co ON co.oid = a.attcollation
+            LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
             WHERE c.relname = %s
               AND n.nspname = %s
@@ -253,6 +321,7 @@ def _query_columns(
                 default=default,
                 identity=identity,
                 generated=generated,
+                collation=row["collation"],
             )
             columns[col.name] = col
 
@@ -280,6 +349,14 @@ def _query_constraints(conn, schema: str, table_name: str) -> list[Constraint]:
               -- Nullability is modelled on the column (SetNotNull/DropNotNull), so
               -- these rows would be managed twice. Earlier versions have none.
               AND con.contype != 'n'
+              -- A constraint with a parent is a clone Postgres made and keeps in
+              -- step: a partition's copy of the parent's PRIMARY KEY, UNIQUE or
+              -- FOREIGN KEY, or the per-partition rows of a foreign key that
+              -- references a partitioned table. The parent's row is the one managed.
+              AND con.conparentid = 0
+              -- A partition inherits its parent's CHECK constraints (conislocal
+              -- false); only the ones declared on the partition itself are its own.
+              AND (con.conislocal OR NOT c.relispartition)
             ORDER BY con.conname
             """,
             (table_name, schema),
@@ -299,7 +376,11 @@ def _query_constraints(conn, schema: str, table_name: str) -> list[Constraint]:
 
 
 def _query_functions(conn, schema: str) -> dict[str, Function]:
-    """Query functions from pg_proc."""
+    """Query functions, procedures and window functions from pg_proc.
+
+    Aggregates come from `_query_aggregates`: `pg_get_functiondef` cannot
+    print them.
+    """
     functions: dict[str, Function] = {}
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -311,6 +392,7 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
                 p.prosecdef AS security_definer,
                 pg_get_functiondef(p.oid) AS full_definition,
                 p.oid AS func_oid,
+                p.prokind AS kind,
                 -- PUBLIC retains EXECUTE if the ACL is default (NULL => PUBLIC
                 -- EXECUTE) or an explicit grantee=0 EXECUTE entry exists.
                 (
@@ -323,12 +405,19 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = %s
-              AND p.prokind = 'f'
+              AND p.prokind IN ('f', 'p', 'w')
               -- Objects an extension owns belong to the extension, not the schema files.
               AND NOT EXISTS (
                   SELECT 1 FROM pg_depend ext
                   WHERE ext.classid = 'pg_proc'::regclass AND ext.objid = p.oid
                     AND ext.deptype = 'e'
+              )
+              -- A range type's constructor functions are part of the type
+              -- (internal dependency): created and dropped with it.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend own
+                  WHERE own.classid = 'pg_proc'::regclass AND own.objid = p.oid
+                    AND own.refclassid = 'pg_type'::regclass AND own.deptype = 'i'
               )
             ORDER BY p.oid
             """,
@@ -345,10 +434,164 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
                 definition_hash=hashlib.sha256(full_def.encode()).hexdigest()[:16],
                 security_definer=row["security_definer"],
                 public_execute=row["public_execute"],
+                kind=row["kind"],
             )
             functions[func.signature] = func
 
     return functions
+
+
+# FINALFUNC_MODIFY / MFINALFUNC_MODIFY spellings of pg_aggregate.aggfinalmodify.
+_FINALFUNC_MODIFY = {"r": "READ_ONLY", "s": "SHAREABLE", "w": "READ_WRITE"}
+_PARALLEL = {"s": "SAFE", "r": "RESTRICTED"}
+# pg_aggregate columns naming a support function, with the CREATE AGGREGATE
+# option each one is written as, in the order they are written.
+_AGGREGATE_FUNCTIONS = (
+    ("aggtransfn", "SFUNC"),
+    ("aggfinalfn", "FINALFUNC"),
+    ("aggcombinefn", "COMBINEFUNC"),
+    ("aggserialfn", "SERIALFUNC"),
+    ("aggdeserialfn", "DESERIALFUNC"),
+    ("aggmtransfn", "MSFUNC"),
+    ("aggminvtransfn", "MINVFUNC"),
+    ("aggmfinalfn", "MFINALFUNC"),
+)
+
+
+def _query_aggregates(conn, schema: str) -> dict[str, Function]:
+    """Query aggregates from pg_aggregate, rendering each one's CREATE statement.
+
+    `pg_get_functiondef` refuses aggregates, so the definition is written here,
+    from the catalog, with every name quoted. It is compared like a function's:
+    two aggregates are equal when their rendered definitions are.
+    """
+    support_cols = ", ".join(
+        f"a.{col}::oid AS {col}" for col, _ in _AGGREGATE_FUNCTIONS
+    )
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                p.proname AS name,
+                pg_get_function_identity_arguments(p.oid) AS args,
+                format_type(p.prorettype, NULL) AS result_type,
+                p.proparallel AS parallel,
+                a.aggkind, {support_cols},
+                a.aggfinalextra, a.aggmfinalextra,
+                a.aggfinalmodify, a.aggmfinalmodify,
+                format_type(a.aggtranstype, NULL) AS stype,
+                a.aggtransspace,
+                CASE WHEN a.aggmtranstype <> 0
+                     THEN format_type(a.aggmtranstype, NULL) END AS mstype,
+                a.aggmtransspace,
+                a.agginitval, a.aggminitval,
+                op.oprname AS sortop_name, opn.nspname AS sortop_schema
+            FROM pg_aggregate a
+            JOIN pg_proc p ON p.oid = a.aggfnoid
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            LEFT JOIN pg_operator op ON op.oid = a.aggsortop
+            LEFT JOIN pg_namespace opn ON opn.oid = op.oprnamespace
+            WHERE n.nspname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_proc'::regclass AND ext.objid = p.oid
+                    AND ext.deptype = 'e'
+              )
+            ORDER BY p.oid
+            """,
+            (schema,),
+        )
+        rows = cur.fetchall()
+        support_oids = sorted(
+            {row[col] for row in rows for col, _ in _AGGREGATE_FUNCTIONS if row[col]}
+        )
+        support: dict[int, tuple[str, str, str]] = {}
+        if support_oids:
+            cur.execute(
+                """
+                SELECT p.oid, n.nspname, p.proname,
+                       pg_get_function_identity_arguments(p.oid) AS args
+                FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE p.oid = ANY(%s::oid[])
+                """,
+                (support_oids,),
+            )
+            for r in cur.fetchall():
+                support[r["oid"]] = (r["nspname"], r["proname"], r["args"] or "")
+
+    aggregates: dict[str, Function] = {}
+    for row in rows:
+        args = row["args"] or ""
+        options: list[str] = []
+        signatures: list[str] = []
+        for col, option in _AGGREGATE_FUNCTIONS:
+            target = support.get(row[col]) if row[col] else None
+            if target is None:
+                continue
+            fn_schema, fn_name, fn_args = target
+            signatures.append(f"{fn_schema}.{fn_name}({fn_args})")
+            options.append(
+                f"{option} = {quote_ident(fn_schema)}.{quote_ident(fn_name)}"
+            )
+            if option == "SFUNC":
+                options.append(f"STYPE = {row['stype']}")
+                if row["aggtransspace"]:
+                    options.append(f"SSPACE = {row['aggtransspace']}")
+            elif option == "FINALFUNC":
+                if row["aggfinalextra"]:
+                    options.append("FINALFUNC_EXTRA")
+                options.append(
+                    f"FINALFUNC_MODIFY = {_FINALFUNC_MODIFY[row['aggfinalmodify']]}"
+                )
+            elif option == "MSFUNC":
+                options.append(f"MSTYPE = {row['mstype']}")
+                if row["aggmtransspace"]:
+                    options.append(f"MSSPACE = {row['aggmtransspace']}")
+            elif option == "MFINALFUNC":
+                if row["aggmfinalextra"]:
+                    options.append("MFINALFUNC_EXTRA")
+                options.append(
+                    f"MFINALFUNC_MODIFY = {_FINALFUNC_MODIFY[row['aggmfinalmodify']]}"
+                )
+        if row["agginitval"] is not None:
+            options.append(f"INITCOND = {quote_literal(row['agginitval'])}")
+        if row["aggminitval"] is not None:
+            options.append(f"MINITCOND = {quote_literal(row['aggminitval'])}")
+        if row["sortop_name"]:
+            # An operator name is made of operator characters only, so it
+            # cannot carry a quote; the schema is quoted like any name.
+            options.append(
+                f"SORTOP = OPERATOR({quote_ident(row['sortop_schema'])}."
+                f"{row['sortop_name']})"
+            )
+        if row["parallel"] in _PARALLEL:
+            options.append(f"PARALLEL = {_PARALLEL[row['parallel']]}")
+        if row["aggkind"] == "h":
+            options.append("HYPOTHETICAL")
+
+        func = Function(
+            schema=schema,
+            name=row["name"],
+            args=args,
+            full_definition="",
+            kind="a",
+            result_type=f"{row['aggkind']}:{row['result_type']}",
+            support_functions=tuple(signatures),
+            # Aggregates are never SECURITY DEFINER.
+            security_definer=False,
+        )
+        body = ",\n    ".join(options)
+        func.full_definition = (
+            f"CREATE OR REPLACE AGGREGATE {func.sql_name} (\n    {body}\n)\n"
+        )
+        func.definition_hash = hashlib.sha256(
+            func.full_definition.encode()
+        ).hexdigest()[:16]
+        aggregates[func.signature] = func
+
+    return aggregates
 
 
 def _query_indexes(conn, schema: str) -> dict[str, Index]:
@@ -368,12 +611,16 @@ def _query_indexes(conn, schema: str) -> dict[str, Index]:
                 i.indexname AS index_name,
                 i.tablename AS table_name,
                 i.indexdef AS index_definition,
-                ix.indisvalid AS is_valid
+                ix.indisvalid AS is_valid,
+                c.relkind = 'I' AS partitioned
             FROM pg_indexes i
             JOIN pg_class c ON c.relname = i.indexname
             JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname
             JOIN pg_index ix ON ix.indexrelid = c.oid
             WHERE i.schemaname = %s
+              -- A partition's index attached to its parent's index is created
+              -- and kept by Postgres; the parent's index is the one managed.
+              AND NOT c.relispartition
               -- Exclude indexes that back constraints (PK, UNIQUE, EXCLUDE)
               -- These are managed by _query_constraints / AddConstraint
               AND NOT EXISTS (
@@ -398,6 +645,7 @@ def _query_indexes(conn, schema: str) -> dict[str, Index]:
                 schema=schema,
                 definition=row["index_definition"],
                 is_valid=row["is_valid"],
+                partitioned=row["partitioned"],
             )
             indexes[idx.qualified_name] = idx
 
@@ -473,6 +721,9 @@ def _query_triggers(conn, schema: str) -> dict[str, Trigger]:
             JOIN pg_namespace np ON np.oid = p.pronamespace
             WHERE n.nspname = %s
               AND NOT t.tgisinternal
+              -- A partition's clone of a row trigger on its parent (internal
+              -- before PostgreSQL 15, ordinary since); the parent's is managed.
+              AND t.tgparentid = 0
             ORDER BY c.relname, t.tgname
             """,
             (schema,),
@@ -488,6 +739,176 @@ def _query_triggers(conn, schema: str) -> dict[str, Trigger]:
                 function_name=row["function_name"],
             )
             triggers[trigger.qualified_key] = trigger
+
+    return triggers
+
+
+def _query_rules(conn, schema: str) -> dict[str, Rule]:
+    """Query rewrite rules on the tables of `schema`.
+
+    A view's `_RETURN` rule is the view itself and is left to the view diff.
+    """
+    rules: dict[str, Rule] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                r.rulename AS rule_name,
+                c.relname AS table_name,
+                pg_get_ruledef(r.oid) AS definition,
+                r.ev_enabled AS enabled
+            FROM pg_rewrite r
+            JOIN pg_class c ON c.oid = r.ev_class
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+              AND c.relkind = 'r'
+              AND r.rulename <> '_RETURN'
+              AND NOT c.relname ~ '^_'
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.deptype = 'e'
+                    AND ((ext.classid = 'pg_class'::regclass AND ext.objid = c.oid)
+                      OR (ext.classid = 'pg_rewrite'::regclass AND ext.objid = r.oid))
+              )
+            ORDER BY c.relname, r.rulename
+            """,
+            (schema,),
+        )
+        for row in cur.fetchall():
+            rule = Rule(
+                schema=schema,
+                table=row["table_name"],
+                name=row["rule_name"],
+                definition=row["definition"],
+                enabled=row["enabled"],
+            )
+            rules[rule.qualified_key] = rule
+
+    return rules
+
+
+_GENERATED_COLUMNS = {"n": "none", "s": "stored"}
+
+
+def _query_publications(conn, search_path: str) -> dict[str, Publication]:
+    """Query every publication in the database, with its tables and schemas.
+
+    Column lists, row filters and TABLES IN SCHEMA exist from PostgreSQL 15,
+    publish_generated_columns from 18.
+    """
+    version = conn.server_version
+    publications: dict[str, Publication] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # Row filters print with names relative to the search_path.
+        cur.execute(f"SET search_path TO {search_path}")
+        gencols = ", p.pubgencols" if version >= 180000 else ""
+        cur.execute(
+            f"""
+            SELECT p.pubname, p.puballtables, p.pubinsert, p.pubupdate,
+                   p.pubdelete, p.pubtruncate, p.pubviaroot{gencols}
+            FROM pg_publication p
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pg_depend ext
+                WHERE ext.classid = 'pg_publication'::regclass
+                  AND ext.objid = p.oid AND ext.deptype = 'e'
+            )
+            ORDER BY p.pubname
+            """
+        )
+        for row in cur.fetchall():
+            publish = tuple(action for action in PUBLISH_ACTIONS if row[f"pub{action}"])
+            publications[row["pubname"]] = Publication(
+                name=row["pubname"],
+                all_tables=bool(row["puballtables"]),
+                publish=publish,
+                via_root=bool(row["pubviaroot"]),
+                generated_columns=_GENERATED_COLUMNS.get(row["pubgencols"])
+                if version >= 180000
+                else None,
+            )
+
+        if version >= 150000:
+            members = """
+                CASE WHEN pr.prattrs IS NULL THEN NULL ELSE ARRAY(
+                    SELECT a.attname FROM pg_attribute a
+                    WHERE a.attrelid = pr.prrelid
+                      AND a.attnum = ANY(pr.prattrs::int2[])
+                    ORDER BY a.attnum
+                ) END AS columns,
+                pg_get_expr(pr.prqual, pr.prrelid) AS row_filter"""
+        else:
+            members = "NULL::name[] AS columns, NULL::text AS row_filter"
+        cur.execute(
+            f"""
+            SELECT p.pubname, n.nspname, c.relname, {members}
+            FROM pg_publication_rel pr
+            JOIN pg_publication p ON p.oid = pr.prpubid
+            JOIN pg_class c ON c.oid = pr.prrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            ORDER BY p.pubname, n.nspname, c.relname
+            """
+        )
+        for row in cur.fetchall():
+            publication = publications.get(row["pubname"])
+            if publication is None:
+                continue
+            member = PublicationTable(
+                schema=row["nspname"],
+                name=row["relname"],
+                columns=tuple(row["columns"] or ()),
+                row_filter=row["row_filter"],
+            )
+            publication.tables[member.qualified_name] = member
+
+        if version >= 150000:
+            cur.execute(
+                """
+                SELECT p.pubname, n.nspname
+                FROM pg_publication_namespace pn
+                JOIN pg_publication p ON p.oid = pn.pnpubid
+                JOIN pg_namespace n ON n.oid = pn.pnnspid
+                ORDER BY p.pubname, n.nspname
+                """
+            )
+            for row in cur.fetchall():
+                publication = publications.get(row["pubname"])
+                if publication is not None:
+                    publication.schemas += (row["nspname"],)
+
+    return publications
+
+
+def _query_event_triggers(conn) -> dict[str, EventTrigger]:
+    """Query every event trigger in the database not owned by an extension."""
+    triggers: dict[str, EventTrigger] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT e.evtname, e.evtevent, np.nspname AS function_schema,
+                   p.proname AS function_name, e.evttags, e.evtenabled
+            FROM pg_event_trigger e
+            JOIN pg_proc p ON p.oid = e.evtfoid
+            JOIN pg_namespace np ON np.oid = p.pronamespace
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pg_depend ext
+                WHERE ext.classid = 'pg_event_trigger'::regclass
+                  AND ext.objid = e.oid AND ext.deptype = 'e'
+            )
+            ORDER BY e.evtname
+            """
+        )
+        for row in cur.fetchall():
+            triggers[row["evtname"]] = EventTrigger(
+                name=row["evtname"],
+                event=row["evtevent"],
+                function_schema=row["function_schema"],
+                function_name=row["function_name"],
+                tags=tuple(sorted(row["evttags"] or ())),
+                enabled=row["evtenabled"],
+            )
 
     return triggers
 
@@ -676,6 +1097,170 @@ def _query_domains(conn, schema: str, search_path: str = "public") -> dict[str, 
     return domains
 
 
+def _query_ranges(
+    conn, schema: str, search_path: str = "public"
+) -> dict[str, RangeType]:
+    """Query range types (typtype = 'r') from pg_range.
+
+    `search_path` is set first, as for columns, so the subtype is named the
+    way the SQL files wrote it. Options left at their default (the subtype's
+    default operator class and collation, no functions) come back as NULL.
+
+    Dependents cover the range, its multirange and both array types, minus
+    what the type itself owns: the constructor functions and the casts carry
+    an internal dependency on it and go away with it.
+    """
+    ranges: dict[str, RangeType] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SET search_path TO {search_path}")
+        cur.execute(
+            """
+            SELECT
+                t.typname AS range_name,
+                format_type(r.rngsubtype, NULL) AS subtype,
+                CASE WHEN NOT oc.opcdefault
+                    THEN quote_ident(ocn.nspname) || '.' || quote_ident(oc.opcname)
+                END AS subtype_opclass,
+                CASE
+                    WHEN r.rngcollation <> 0 AND r.rngcollation <> st.typcollation
+                    THEN quote_ident(cn.nspname) || '.' || quote_ident(co.collname)
+                END AS collation,
+                quote_ident(pcn.nspname) || '.' || quote_ident(pc.proname)
+                    AS canonical,
+                pcn.nspname || '.' || pc.proname || '('
+                    || pg_get_function_identity_arguments(pc.oid) || ')'
+                    AS canonical_signature,
+                quote_ident(pdn.nspname) || '.' || quote_ident(pd.proname)
+                    AS subtype_diff,
+                quote_ident(mn.nspname) || '.' || quote_ident(mt.typname)
+                    AS multirange_type_name,
+                ARRAY(
+                    SELECT DISTINCT pg_describe_object(d.classid, d.objid, d.objsubid)
+                    FROM pg_depend d
+                    WHERE d.refclassid = 'pg_type'::regclass
+                      AND d.refobjid IN (t.oid, t.typarray, mt.oid, mt.typarray)
+                      AND d.deptype = 'n'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_depend own
+                          WHERE own.classid = d.classid AND own.objid = d.objid
+                            AND own.refclassid = 'pg_type'::regclass
+                            AND own.refobjid IN (t.oid, mt.oid)
+                            AND own.deptype = 'i'
+                      )
+                    ORDER BY 1
+                ) AS dependents
+            FROM pg_range r
+            JOIN pg_type t ON t.oid = r.rngtypid
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            JOIN pg_type st ON st.oid = r.rngsubtype
+            JOIN pg_opclass oc ON oc.oid = r.rngsubopc
+            JOIN pg_namespace ocn ON ocn.oid = oc.opcnamespace
+            JOIN pg_type mt ON mt.oid = r.rngmultitypid
+            JOIN pg_namespace mn ON mn.oid = mt.typnamespace
+            LEFT JOIN pg_collation co ON co.oid = r.rngcollation
+            LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
+            LEFT JOIN pg_proc pc ON pc.oid = r.rngcanonical
+            LEFT JOIN pg_namespace pcn ON pcn.oid = pc.pronamespace
+            LEFT JOIN pg_proc pd ON pd.oid = r.rngsubdiff
+            LEFT JOIN pg_namespace pdn ON pdn.oid = pd.pronamespace
+            WHERE n.nspname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_type'::regclass AND ext.objid = t.oid
+                    AND ext.deptype = 'e'
+              )
+            ORDER BY t.typname
+            """,
+            (schema,),
+        )
+        for row in cur.fetchall():
+            range_type = RangeType(
+                schema=schema,
+                name=row["range_name"],
+                subtype=row["subtype"],
+                subtype_opclass=row["subtype_opclass"],
+                collation=row["collation"],
+                canonical=row["canonical"],
+                subtype_diff=row["subtype_diff"],
+                multirange_type_name=row["multirange_type_name"],
+                dependents=list(row["dependents"] or []),
+                canonical_signature=row["canonical_signature"],
+            )
+            ranges[range_type.qualified_name] = range_type
+
+    return ranges
+
+
+_COLLATION_PROVIDERS = {"c": "libc", "i": "icu", "b": "builtin"}
+
+
+def _query_collations(conn, schema: str) -> dict[str, Collation]:
+    """Query collations from pg_collation.
+
+    Where the locale lives moved between versions (`collcollate` for ICU on
+    14, `colliculocale` on 15 and 16, `colllocale` from 17), so the optional
+    columns are read through to_jsonb(), which yields NULL for a column the
+    server does not have.
+    """
+    collations: dict[str, Collation] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                co.collname AS collation_name,
+                co.collprovider AS provider,
+                co.collisdeterministic AS deterministic,
+                co.collcollate::text AS lc_collate,
+                co.collctype::text AS lc_ctype,
+                COALESCE(
+                    to_jsonb(co) ->> 'colllocale',
+                    to_jsonb(co) ->> 'colliculocale',
+                    co.collcollate::text
+                ) AS locale,
+                to_jsonb(co) ->> 'collicurules' AS rules,
+                ARRAY(
+                    SELECT pg_describe_object(d.classid, d.objid, d.objsubid)
+                    FROM pg_depend d
+                    WHERE d.refclassid = 'pg_collation'::regclass
+                      AND d.refobjid = co.oid
+                      AND d.deptype = 'n'
+                    ORDER BY 1
+                ) AS dependents
+            FROM pg_collation co
+            JOIN pg_namespace n ON n.oid = co.collnamespace
+            WHERE n.nspname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_collation'::regclass
+                    AND ext.objid = co.oid AND ext.deptype = 'e'
+              )
+            ORDER BY co.collname
+            """,
+            (schema,),
+        )
+        for row in cur.fetchall():
+            provider = _COLLATION_PROVIDERS.get(row["provider"]) or row["provider"]
+            libc = provider == "libc"
+            collation = Collation(
+                schema=schema,
+                name=row["collation_name"],
+                provider=provider,
+                locale=None if libc else row["locale"],
+                lc_collate=row["lc_collate"] if libc else None,
+                lc_ctype=row["lc_ctype"] if libc else None,
+                deterministic=row["deterministic"],
+                rules=row["rules"],
+                dependents=list(row["dependents"] or []),
+            )
+            collations[collation.qualified_name] = collation
+
+    return collations
+
+
 def _query_views(conn, schema: str) -> dict[str, View]:
     """Query views from pg_views, plus their reloptions from pg_class.
 
@@ -744,7 +1329,7 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_attribute a
   ON d.objsubid <> 0 AND a.attrelid = c.oid AND a.attnum = d.objsubid
 WHERE n.nspname = %(schema)s
-  AND c.relkind IN ('r', 'p', 'v', 'i')
+  AND c.relkind IN ('r', 'p', 'v', 'i', 'I')
   AND (d.objsubid = 0 OR (a.attname IS NOT NULL AND NOT a.attisdropped))
 
 UNION ALL
@@ -773,8 +1358,13 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = %(schema)s
 
 UNION ALL
-SELECT 'FUNCTION', p.proname, '', pg_get_function_identity_arguments(p.oid),
-       d.description
+SELECT
+    CASE p.prokind
+        WHEN 'p' THEN 'PROCEDURE'
+        WHEN 'a' THEN 'AGGREGATE'
+        ELSE 'FUNCTION'
+    END,
+    p.proname, '', pg_get_function_identity_arguments(p.oid), d.description
 FROM pg_description d
 JOIN pg_proc p ON d.classoid = 'pg_proc'::regclass AND d.objoid = p.oid
 JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -786,7 +1376,15 @@ FROM pg_description d
 JOIN pg_type t ON d.classoid = 'pg_type'::regclass AND d.objoid = t.oid
 JOIN pg_namespace n ON n.oid = t.typnamespace
 WHERE n.nspname = %(schema)s
-  AND t.typtype IN ('e', 'c')
+  AND t.typtype IN ('e', 'c', 'r')
+
+UNION ALL
+SELECT 'COLLATION', co.collname, '', '', d.description
+FROM pg_description d
+JOIN pg_collation co
+  ON d.classoid = 'pg_collation'::regclass AND d.objoid = co.oid
+JOIN pg_namespace n ON n.oid = co.collnamespace
+WHERE n.nspname = %(schema)s
 """
 
 
@@ -1125,18 +1723,23 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                 )
             )
 
-        # Function grants
+        # Function, procedure and aggregate grants. specific_name is
+        # `<name>_<oid>`, which is how the view names one overload; the oid
+        # tells a procedure (GRANT ... ON PROCEDURE) from the rest.
         cur.execute(
             """
             SELECT
-                routine_name AS object_name,
-                'FUNCTION' AS object_type,
-                privilege_type,
-                grantee,
-                NULL AS column_name
-            FROM information_schema.role_routine_grants
-            WHERE grantee = %s
-              AND routine_schema = %s
+                g.routine_name AS object_name,
+                CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END
+                    AS object_type,
+                g.privilege_type,
+                g.grantee,
+                pg_get_function_identity_arguments(p.oid) AS args
+            FROM information_schema.role_routine_grants g
+            LEFT JOIN pg_proc p
+              ON p.oid = substring(g.specific_name::text from '_([0-9]+)$')::oid
+            WHERE g.grantee = %s
+              AND g.routine_schema = %s
             """,
             (grantee, schema),
         )
@@ -1150,6 +1753,7 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                     privilege=row["privilege_type"],
                     grantee=row["grantee"],
                     column=None,
+                    args=row["args"],
                 )
             )
 
@@ -1221,6 +1825,78 @@ def _query_schema_grants(conn, grantee: str) -> list[Grant]:
                 )
             )
     return grants
+
+
+def _query_default_privileges(
+    conn, schemas: list[str], grantees: list[str]
+) -> list[DefaultPrivilege]:
+    """ALTER DEFAULT PRIVILEGES entries whose grantee is a managed role.
+
+    Entries are read for every schema-less (global) row and for rows in the
+    managed schemas, whoever the target role is.
+
+    A global row holds the whole default ACL for its object type, the built-in
+    one included: the target role's own privileges, and PUBLIC's EXECUTE or
+    USAGE on functions and types. PostgreSQL deletes the row once it equals
+    `acldefault()` again, so the built-in items are left out here. Otherwise a
+    target role that is managed would show its own owner privileges only while
+    some other default privilege kept the row alive, and removing that one
+    would revoke them. A schema row holds only what was granted in it, so it
+    is read as is.
+    """
+    if not grantees:
+        return []
+    privileges: list[DefaultPrivilege] = []
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # acldefault() spells a sequence 's'; pg_default_acl spells it 'S'.
+        cur.execute(
+            """
+            SELECT r.rolname AS target_role,
+                   n.nspname AS schema_name,
+                   d.defaclobjtype::text AS objtype,
+                   a.privilege_type,
+                   g.rolname AS grantee,
+                   a.is_grantable
+            FROM pg_default_acl d
+            JOIN pg_roles r ON r.oid = d.defaclrole
+            LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
+            CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+            JOIN pg_roles g ON g.oid = a.grantee
+            WHERE g.rolname = ANY(%s)
+              AND (d.defaclnamespace = 0 OR n.nspname = ANY(%s))
+              AND NOT (
+                d.defaclnamespace = 0
+                AND EXISTS (
+                  SELECT 1
+                  FROM aclexplode(acldefault(
+                    CASE d.defaclobjtype WHEN 'S' THEN 's' ELSE d.defaclobjtype END,
+                    d.defaclrole
+                  )) b
+                  WHERE b.grantee = a.grantee
+                    AND b.privilege_type = a.privilege_type
+                    AND b.is_grantable = a.is_grantable
+                )
+              )
+            ORDER BY 1, 2 NULLS FIRST, 3, 4, 5
+            """,
+            (list(grantees), list(schemas)),
+        )
+        for row in cur.fetchall():
+            object_type = DEFAULT_PRIVILEGE_OBJECT_TYPES.get(row["objtype"])
+            if object_type is None:
+                # An object type a newer server added; not modelled.
+                continue
+            privileges.append(
+                DefaultPrivilege(
+                    target_role=row["target_role"],
+                    schema=row["schema_name"],
+                    object_type=object_type,
+                    privilege=row["privilege_type"],
+                    grantee=row["grantee"],
+                    grantable=bool(row["is_grantable"]),
+                )
+            )
+    return privileges
 
 
 def _query_dependencies(conn, schemas: list[str]) -> list[Dependency]:
@@ -1444,3 +2120,248 @@ def _query_role_memberships(conn, role_names: list[str]) -> list[RoleMembership]
             memberships.append(membership)
 
     return memberships
+
+
+# Objects an extension owns are part of the extension, never the schema files.
+_NOT_EXTENSION_MEMBER = """
+    NOT EXISTS (
+        SELECT 1 FROM pg_depend ext
+        WHERE ext.classid = '{catalog}'::regclass AND ext.objid = {oid}
+          AND ext.deptype = 'e'
+    )
+"""
+
+
+def _query_extensions(conn) -> dict[str, Extension]:
+    """Every extension installed in the database, with its schema and version."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT e.extname, n.nspname, e.extversion
+            FROM pg_extension e
+            JOIN pg_namespace n ON n.oid = e.extnamespace
+            ORDER BY e.extname
+            """
+        )
+        return {
+            row["extname"]: Extension(
+                name=row["extname"], schema=row["nspname"], version=row["extversion"]
+            )
+            for row in cur.fetchall()
+        }
+
+
+def _query_foreign_servers(conn) -> dict[str, ForeignServer]:
+    """Foreign servers, other than those an extension owns."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT s.srvname, w.fdwname, s.srvtype, s.srvversion, s.srvoptions
+            FROM pg_foreign_server s
+            JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw
+            WHERE {_NOT_EXTENSION_MEMBER.format(catalog="pg_foreign_server", oid="s.oid")}
+            ORDER BY s.srvname
+            """
+        )
+        return {
+            row["srvname"]: ForeignServer(
+                name=row["srvname"],
+                fdw=row["fdwname"],
+                type=row["srvtype"],
+                version=row["srvversion"],
+                options=parse_options(row["srvoptions"]),
+            )
+            for row in cur.fetchall()
+        }
+
+
+def _query_user_mappings(conn) -> dict[tuple[str, str], UserMapping]:
+    """User mappings on the servers `_query_foreign_servers` reads.
+
+    pg_user_mappings hides the options from a role that is neither the mapped
+    user nor allowed to use the server's owner (nor a superuser). Those
+    mappings come back with `options=None`, using the view's own visibility
+    rule, so that hidden options are not mistaken for none.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                um.srvname,
+                um.usename,
+                um.umoptions,
+                (
+                    (um.umuser <> 0 AND um.usename = current_user
+                     AND (pg_has_role(s.srvowner, 'USAGE')
+                          OR has_server_privilege(s.oid, 'USAGE')))
+                    OR (um.umuser = 0 AND pg_has_role(s.srvowner, 'USAGE'))
+                    OR COALESCE(
+                        (SELECT rolsuper FROM pg_roles WHERE rolname = current_user),
+                        false
+                    )
+                ) AS options_visible
+            FROM pg_user_mappings um
+            JOIN pg_foreign_server s ON s.oid = um.srvid
+            WHERE {_NOT_EXTENSION_MEMBER.format(catalog="pg_foreign_server", oid="s.oid")}
+            ORDER BY um.srvname, um.usename
+            """
+        )
+        mappings: dict[tuple[str, str], UserMapping] = {}
+        for row in cur.fetchall():
+            mapping = UserMapping(
+                server=row["srvname"],
+                user=row["usename"],
+                options=(
+                    parse_options(row["umoptions"]) if row["options_visible"] else None
+                ),
+            )
+            mappings[mapping.key] = mapping
+        return mappings
+
+
+def _query_foreign_tables(
+    conn, schema: str, search_path: str = "public"
+) -> dict[str, ForeignTable]:
+    """Foreign tables in `schema`, with their columns and options."""
+    tables: dict[str, ForeignTable] = {}
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SET search_path TO {search_path}")
+        cur.execute(
+            f"""
+            SELECT c.oid, c.relname, s.srvname, ft.ftoptions
+            FROM pg_foreign_table ft
+            JOIN pg_class c ON c.oid = ft.ftrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_foreign_server s ON s.oid = ft.ftserver
+            WHERE n.nspname = %s
+              AND c.relkind = 'f'
+              AND NOT c.relname ~ '^_'
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_class", oid="c.oid")}
+            ORDER BY c.relname
+            """,
+            (schema,),
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            table = ForeignTable(
+                schema=schema,
+                name=row["relname"],
+                server=row["srvname"],
+                options=parse_options(row["ftoptions"]),
+            )
+            cur.execute(
+                """
+                SELECT
+                    a.attname,
+                    format_type(a.atttypid, a.atttypmod) AS data_type,
+                    NOT a.attnotnull AS is_nullable,
+                    pg_get_expr(d.adbin, d.adrelid) AS column_default,
+                    a.attgenerated AS generated_kind,
+                    a.attfdwoptions
+                FROM pg_attribute a
+                LEFT JOIN pg_attrdef d
+                  ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                WHERE a.attrelid = %s AND a.attnum > 0 AND NOT a.attisdropped
+                ORDER BY a.attnum
+                """,
+                (row["oid"],),
+            )
+            for col in cur.fetchall():
+                default = col["column_default"]
+                generated = None
+                if (col["generated_kind"] or "") == "s":
+                    generated, default = default, None
+                table.columns[col["attname"]] = Column(
+                    name=col["attname"],
+                    type=col["data_type"],
+                    nullable=col["is_nullable"],
+                    default=default,
+                    generated=generated,
+                )
+                if col["attfdwoptions"]:
+                    table.column_options[col["attname"]] = parse_options(
+                        col["attfdwoptions"]
+                    )
+            tables[table.qualified_name] = table
+    return tables
+
+
+def _query_owners(conn, schemas: list[str]) -> list[ObjectOwner]:
+    """Owners of the relations, functions, types and schemas in `schemas`.
+
+    Sequences linked to a column (serial, OWNED BY) are left out: their owner
+    follows the table's, and PostgreSQL refuses to change it on its own.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                CASE c.relkind
+                    WHEN 'r' THEN 'TABLE'
+                    WHEN 'p' THEN 'TABLE'
+                    WHEN 'f' THEN 'FOREIGN TABLE'
+                    WHEN 'v' THEN 'VIEW'
+                    WHEN 'm' THEN 'MATERIALIZED VIEW'
+                    WHEN 'S' THEN 'SEQUENCE'
+                END AS kind,
+                n.nspname AS schema,
+                c.relname AS name,
+                '' AS args,
+                pg_get_userbyid(c.relowner) AS owner
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = ANY(%(schemas)s)
+              AND c.relkind IN ('r', 'p', 'f', 'v', 'm', 'S')
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_class", oid="c.oid")}
+              AND NOT (c.relkind = 'S' AND EXISTS (
+                  SELECT 1 FROM pg_depend d
+                  WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                    AND d.refclassid = 'pg_class'::regclass
+                    AND d.deptype IN ('a', 'i')
+              ))
+            UNION ALL
+            SELECT CASE p.prokind
+                       WHEN 'p' THEN 'PROCEDURE'
+                       WHEN 'a' THEN 'AGGREGATE'
+                       ELSE 'FUNCTION'
+                   END,
+                   n.nspname, p.proname,
+                   pg_get_function_identity_arguments(p.oid),
+                   pg_get_userbyid(p.proowner)
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = ANY(%(schemas)s)
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_proc", oid="p.oid")}
+            UNION ALL
+            SELECT CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
+                   n.nspname, t.typname, '', pg_get_userbyid(t.typowner)
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            LEFT JOIN pg_class c ON c.oid = t.typrelid
+            WHERE n.nspname = ANY(%(schemas)s)
+              AND (t.typtype IN ('e', 'd', 'r') OR (t.typtype = 'c' AND c.relkind = 'c'))
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_type", oid="t.oid")}
+            UNION ALL
+            SELECT 'COLLATION', n.nspname, co.collname, '',
+                   pg_get_userbyid(co.collowner)
+            FROM pg_collation co
+            JOIN pg_namespace n ON n.oid = co.collnamespace
+            WHERE n.nspname = ANY(%(schemas)s)
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_collation", oid="co.oid")}
+            UNION ALL
+            SELECT 'SCHEMA', '', n.nspname, '', pg_get_userbyid(n.nspowner)
+            FROM pg_namespace n
+            WHERE n.nspname = ANY(%(schemas)s)
+            """,
+            {"schemas": list(schemas)},
+        )
+        return [
+            ObjectOwner(
+                kind=row["kind"],
+                schema=row["schema"],
+                name=row["name"],
+                owner=row["owner"],
+                args=row["args"],
+            )
+            for row in cur.fetchall()
+        ]

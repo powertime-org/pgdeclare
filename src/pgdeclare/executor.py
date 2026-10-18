@@ -4,7 +4,7 @@ Migration execution engine.
 Executes schema changes with proper transaction handling:
 - Phase 1: DDL changes with retry-until-stable ordering
 - Phase 2: CONCURRENTLY index operations outside transaction (with retry)
-- Phase 3: COMMENT ON, once every object exists in its final form
+- Phase 3: COMMENT ON and OWNER TO, once every object exists in its final form
 
 The retry-until-stable approach replaces complex priority-based ordering.
 PostgreSQL itself discovers the correct execution order by:
@@ -24,12 +24,20 @@ from .quoting import quote_ident
 from .config import PgDeclareConfig, logger, plain, resolve
 from .changes import (
     AddEnumValue,
+    AlterOwner,
     Change,
     CreateEnum,
     CreateIndex,
+    CreatePartitionedIndex,
     CreateRole,
     SetComment,
+    DropCollation,
     DropDomain,
+    DropRangeType,
+    DropExtension,
+    DropForeignTable,
+    DropMaterializedView,
+    DropView,
 )
 from .differ import categorize_changes, split_index_operations
 from .models import ChangeCategory
@@ -47,11 +55,26 @@ DEPENDENCY_ERROR_CODES = {
 # CreateRole is cluster-wide - may already exist from retry_executor.py
 IDEMPOTENT_CHANGE_TYPES = (CreateRole,)
 
-# dependent_objects_still_exist. Retryable only for a DropDomain: the column or
-# signature that still uses the domain is dropped or retyped by another change
-# in the same run, and the drop succeeds once that one has.
+# dependent_objects_still_exist. Retryable for the drops written without
+# CASCADE: a view or materialized view another one still reads from, a domain,
+# range type or collation a column or signature still uses, an extension or
+# foreign table something still depends on. What still uses the object is
+# dropped or changed by another change in the same run, and the drop succeeds
+# once that one has.
 DEPENDENT_OBJECTS_ERROR_CODE = "2BP01"
-RETRY_WHILE_DEPENDED_ON = (DropDomain,)
+RETRY_WHILE_DEPENDED_ON = (
+    DropView,
+    DropMaterializedView,
+    DropDomain,
+    DropRangeType,
+    DropCollation,
+    DropExtension,
+    DropForeignTable,
+)
+
+# Changes run in the final phase, after the DDL and index phases: comments, and
+# owners (a recreate in the DDL phase resets an object's owner).
+FINAL_PHASE_CHANGE_TYPES = (SetComment, AlterOwner)
 
 # PostgreSQL error code for "already exists" errors
 DUPLICATE_ERROR_CODE = "42710"  # duplicate_object
@@ -167,25 +190,28 @@ def execute_migration(
         )
         return False, []
 
-    # Split into DDL, index and comment operations. Comments go last: an
-    # index only exists after the concurrent phase, and a view or function the
-    # DDL phase drops and recreates takes its comment with it.
-    comment_changes: list[Change] = [c for c in changes if isinstance(c, SetComment)]
+    # Split into DDL, index and final-phase operations. Comments and owners go
+    # last: an index only exists after the concurrent phase, and a view or
+    # function the DDL phase drops and recreates loses its comment and owner.
+    comment_changes: list[Change] = [
+        c for c in changes if isinstance(c, FINAL_PHASE_CHANGE_TYPES)
+    ]
     ddl_changes, index_changes = split_index_operations(
-        [c for c in changes if not isinstance(c, SetComment)]
+        [c for c in changes if not isinstance(c, FINAL_PHASE_CHANGE_TYPES)]
     )
 
+    # The returned statements are a record for reporting (prove prints them),
+    # so they carry the display SQL: a declared password never leaves the process.
     executed_sql: list[str] = []
 
     if dry_run:
         logger.info("Dry run - showing SQL that would be executed:")
         logger.info("")
         for change in changes:
-            sql_stmt = change.to_sql()
             logger.info(f"-- {change.description}")
             logger.info(change.to_display_sql())
             logger.info("")
-            executed_sql.append(sql_stmt)
+            executed_sql.append(change.to_display_sql())
         return True, executed_sql
 
     # Execute DDL changes in transaction
@@ -265,7 +291,7 @@ def _execute_ddl_phase(
 
                             try:
                                 cur.execute(sql_stmt)
-                                executed_sql.append(sql_stmt)
+                                executed_sql.append(change.to_display_sql())
                             except Exception as e:
                                 logger.error(f"Failed: {change.description}")
                                 logger.error(f"SQL: {change.to_display_sql()}")
@@ -365,7 +391,7 @@ def _execute_with_retry_savepoints(
 
                 # Success - release savepoint
                 cur.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-                executed_sql.append(sql_stmt)
+                executed_sql.append(change.to_display_sql())
                 progress_made = True
                 logger.info(f"    ✓ {change.description}")
 
@@ -509,6 +535,12 @@ def _execute_index_phase(
                 conn.autocommit = True
                 try:
                     with conn.cursor() as cur:
+                        if isinstance(change, CreatePartitionedIndex):
+                            # Several statements, resumable: an invalid parent
+                            # index is kept and only its gaps are filled.
+                            executed_sql.extend(change.execute(cur))
+                            success = True
+                            continue
                         # For CreateIndex, clean up any invalid index with same name first
                         if isinstance(change, CreateIndex):
                             _cleanup_invalid_index(
@@ -516,7 +548,7 @@ def _execute_index_phase(
                             )
 
                         cur.execute(sql_stmt)
-                        executed_sql.append(sql_stmt)
+                        executed_sql.append(change.to_display_sql())
                         success = True
                 finally:
                     conn.close()
@@ -575,7 +607,7 @@ def _execute_comment_phase(
                         logger.error(f"SQL: {change.to_display_sql()}")
                         logger.error(f"Error: {e}")
                         raise
-                    executed_sql.append(sql_stmt)
+                    executed_sql.append(change.to_display_sql())
             conn.commit()
     except Exception as e:
         failure = resolve(config).classify_failure(
@@ -649,9 +681,10 @@ def cleanup_invalid_indexes(connection_string: str, schema: str) -> list[str]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT i.indexname
+                SELECT i.indexname, c.relkind = 'I'
                 FROM pg_indexes i
                 JOIN pg_class c ON c.relname = i.indexname
+                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname
                 JOIN pg_index ix ON ix.indexrelid = c.oid
                 WHERE NOT ix.indisvalid
                   AND i.schemaname = %s
@@ -659,11 +692,12 @@ def cleanup_invalid_indexes(connection_string: str, schema: str) -> list[str]:
                 (schema,),
             )
 
-            for row in cur.fetchall():
-                index_name = row[0]
+            for index_name, partitioned in cur.fetchall():
                 logger.info(f"Dropping invalid index: {schema}.{index_name}")
+                # Postgres refuses DROP INDEX CONCURRENTLY on a partitioned index.
+                concurrently = "" if partitioned else "CONCURRENTLY "
                 cur.execute(
-                    f"DROP INDEX CONCURRENTLY IF EXISTS {quote_ident(schema)}.{quote_ident(index_name)}"
+                    f"DROP INDEX {concurrently}IF EXISTS {quote_ident(schema)}.{quote_ident(index_name)}"
                 )
                 dropped.append(index_name)
 

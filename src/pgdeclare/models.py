@@ -32,6 +32,9 @@ class Column:
     # pg_get_expr), or None when the column is not generated. Mutually
     # exclusive with `default`: a generated column never carries a DEFAULT.
     generated: Optional[str] = None
+    # Quoted, schema-qualified collation (`"public"."de"`) when it differs from
+    # the type's own; None for the type's default and for types without one.
+    collation: Optional[str] = None
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Column):
@@ -43,6 +46,7 @@ class Column:
             and self.default == other.default
             and self.identity == other.identity
             and self.generated == other.generated
+            and self.collation == other.collation
         )
 
 
@@ -75,15 +79,52 @@ class Table:
     constraints: list[Constraint] = field(default_factory=list)
     rls_enabled: bool = False  # ALTER TABLE ... ENABLE ROW LEVEL SECURITY
     rls_forced: bool = False  # ALTER TABLE ... FORCE ROW LEVEL SECURITY
+    # Declarative partitioning. `partition_key` is pg_get_partkeydef() of a
+    # partitioned table ("RANGE (created_at)"), None for a plain table.
+    # `partition_of` is the (schema, name) of the parent when this table is a
+    # partition, and `partition_bound` its bound as pg_get_expr() prints it
+    # ("FOR VALUES FROM (...) TO (...)" or "DEFAULT"). A sub-partitioned child
+    # has all three.
+    partition_key: Optional[str] = None
+    partition_of: Optional[tuple[str, str]] = None
+    partition_bound: Optional[str] = None
 
     @property
     def qualified_name(self) -> str:
         return f"{self.schema}.{self.name}"
 
+    @property
+    def parent_key(self) -> Optional[str]:
+        """`schema.name` of the partitioned parent, or None for a non-partition."""
+        if self.partition_of is None:
+            return None
+        return f"{self.partition_of[0]}.{self.partition_of[1]}"
+
+
+_ROUTINE_KEYWORDS = {"p": "PROCEDURE", "a": "AGGREGATE"}
+
+
+def routine_keyword(kind: str) -> str:
+    """FUNCTION, PROCEDURE or AGGREGATE for a pg_proc.prokind."""
+    return _ROUTINE_KEYWORDS.get(kind, "FUNCTION")
+
+
+def routine_args_sql(kind: str, args: str) -> str:
+    """Identity arguments as DDL writes them.
+
+    `pg_get_function_identity_arguments` prints nothing for an aggregate that
+    takes no arguments, but DROP and COMMENT ON AGGREGATE spell it `(*)`.
+    """
+    return "*" if kind == "a" and not args else args
+
 
 @dataclass
 class Function:
-    """Database function definition."""
+    """A function, procedure, aggregate or window function (one pg_proc row).
+
+    For an aggregate, which `pg_get_functiondef` cannot print, the engine
+    renders `full_definition` itself from pg_aggregate.
+    """
 
     schema: str
     name: str
@@ -97,6 +138,16 @@ class Function:
     # Consumed only by _diff_function_public_execute (the SECDEF lockdown
     # pass); NOT part of the managed-role grant set-diff.
     public_execute: bool = True
+    # pg_proc.prokind: 'f' function, 'p' procedure, 'a' aggregate, 'w' window
+    # function. CREATE OR REPLACE cannot change it, so a change of kind is a
+    # drop and re-create.
+    kind: str = "f"
+    # Aggregates only: the result type and pg_aggregate.aggkind, neither of
+    # which CREATE OR REPLACE AGGREGATE can change.
+    result_type: str = ""
+    # Aggregates only: signatures of the functions the aggregate calls (state,
+    # final, combine and so on). Dropping one of them drops the aggregate.
+    support_functions: tuple[str, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -106,6 +157,21 @@ class Function:
     def signature(self) -> str:
         """Full function signature including arguments."""
         return f"{self.schema}.{self.name}({self.args})"
+
+    @property
+    def keyword(self) -> str:
+        """The object keyword DDL uses for this routine."""
+        return routine_keyword(self.kind)
+
+    @property
+    def args_sql(self) -> str:
+        """The argument list as written in DDL (`*` for a zero-argument aggregate)."""
+        return routine_args_sql(self.kind, self.args)
+
+    @property
+    def sql_name(self) -> str:
+        """`"schema"."name"(args)`, as DROP, COMMENT and REVOKE name it."""
+        return f"{quote_ident(self.schema)}.{quote_ident(self.name)}({self.args_sql})"
 
     def returns_primitive_type(self) -> bool:
         """
@@ -221,6 +287,8 @@ class Function:
         import re
 
         # Match RETURNS ... up to LANGUAGE or AS keyword
+        if self.kind == "a":
+            return self.result_type
         match = re.search(
             r"RETURNS\s+(.*?)(?=\s+LANGUAGE|\s+AS\s)",
             self.full_definition,
@@ -248,6 +316,9 @@ class Index:
     schema: str
     definition: str  # Full CREATE INDEX statement from pg_indexes
     is_valid: bool = True  # False if index creation failed (CONCURRENTLY)
+    # An index on a partitioned table (relkind 'I'). Its definition reads
+    # `ON ONLY`, and it is built per partition and attached, not in one go.
+    partitioned: bool = False
 
     @property
     def qualified_name(self) -> str:
@@ -310,6 +381,78 @@ class Trigger:
         if not isinstance(other, Trigger):
             return NotImplemented
         return self.definition == other.definition
+
+
+@dataclass
+class Rule:
+    """A rewrite rule on a table (never a view's `_RETURN` rule)."""
+
+    schema: str
+    table: str
+    name: str
+    definition: str  # pg_get_ruledef(), trailing semicolon included
+    # pg_rewrite.ev_enabled: 'O' (origin, the default), 'D' (disabled),
+    # 'R' (replica) or 'A' (always).
+    enabled: str = "O"
+
+    @property
+    def qualified_key(self) -> str:
+        return f"{self.schema}.{self.table}.{self.name}"
+
+
+@dataclass
+class EventTrigger:
+    """A database-level event trigger."""
+
+    name: str
+    event: str  # ddl_command_start, ddl_command_end, sql_drop, ...
+    function_schema: str
+    function_name: str
+    # WHEN TAG IN (...) filter, sorted; empty for no filter.
+    tags: tuple[str, ...] = ()
+    # pg_event_trigger.evtenabled: 'O', 'D', 'R' or 'A', as for rules.
+    enabled: str = "O"
+
+
+@dataclass
+class PublicationTable:
+    """One table published by a publication."""
+
+    schema: str
+    name: str
+    # Column list (PostgreSQL 15+), in column order; empty for all columns.
+    columns: tuple[str, ...] = ()
+    # Row filter (PostgreSQL 15+) as pg_get_expr() prints it, or None.
+    row_filter: Optional[str] = None
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+PUBLISH_ACTIONS = ("insert", "update", "delete", "truncate")
+
+
+@dataclass
+class Publication:
+    """A logical replication publication (database-level)."""
+
+    name: str
+    all_tables: bool = False  # FOR ALL TABLES
+    tables: dict[str, PublicationTable] = field(
+        default_factory=dict
+    )  # key = schema.table
+    # TABLES IN SCHEMA (PostgreSQL 15+), sorted.
+    schemas: tuple[str, ...] = ()
+    publish: tuple[str, ...] = PUBLISH_ACTIONS
+    via_root: bool = False  # publish_via_partition_root
+    # publish_generated_columns (PostgreSQL 18+): 'none' or 'stored'; None on
+    # servers that do not have the option.
+    generated_columns: Optional[str] = None
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.all_tables and not self.tables and not self.schemas
 
 
 @dataclass
@@ -405,6 +548,65 @@ class Domain:
             and sorted(self.constraints, key=lambda c: c.name)
             == sorted(other.constraints, key=lambda c: c.name)
         )
+
+
+@dataclass
+class RangeType:
+    """A range type (CREATE TYPE ... AS RANGE) and its multirange.
+
+    `subtype` is format_type() of the subtype. The other options are quoted,
+    schema-qualified names, or None where PostgreSQL chose the default: the
+    subtype's default btree operator class, the subtype's own collation, no
+    canonical or subtype_diff function. `multirange_type_name` is always set
+    from the catalog, so a declared name and a derived one compare the same.
+
+    `dependents` describes what uses the range or its multirange in the live
+    database, and `canonical_signature` is the canonical function's
+    `Function.signature`. Neither takes part in equality.
+    """
+
+    schema: str
+    name: str
+    subtype: str
+    subtype_opclass: Optional[str] = None
+    collation: Optional[str] = None
+    canonical: Optional[str] = None
+    subtype_diff: Optional[str] = None
+    multirange_type_name: Optional[str] = None
+    dependents: list[str] = field(default_factory=list, compare=False)
+    canonical_signature: Optional[str] = field(default=None, compare=False)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+@dataclass
+class Collation:
+    """A collation (CREATE COLLATION).
+
+    `provider` is `libc`, `icu` or `builtin`. A libc collation has
+    `lc_collate` and `lc_ctype`; an ICU or builtin one has `locale`, and
+    `rules` holds ICU tailoring rules (PostgreSQL 16+). The collation version
+    is runtime state and is not compared.
+
+    `dependents` describes what uses the collation in the live database
+    (columns, domains, range types, indexes). It is not part of equality.
+    """
+
+    schema: str
+    name: str
+    provider: str = "libc"
+    locale: Optional[str] = None
+    lc_collate: Optional[str] = None
+    lc_ctype: Optional[str] = None
+    deterministic: bool = True
+    rules: Optional[str] = None
+    dependents: list[str] = field(default_factory=list, compare=False)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
 
 
 @dataclass
@@ -560,22 +762,90 @@ class MaterializedView:
 class Grant:
     """Privilege grant definition."""
 
-    object_type: str  # TABLE, FUNCTION, SCHEMA, SEQUENCE
+    object_type: str  # TABLE, COLUMN, FUNCTION, PROCEDURE, SCHEMA, SEQUENCE
     object_name: str  # Object name (may include schema)
     schema: str
     privilege: str  # SELECT, INSERT, UPDATE, DELETE, EXECUTE, USAGE, etc.
     grantee: str  # Role receiving the grant
     column: Optional[str] = None  # For column-level grants
+    # Routines only: the identity signature (pg_get_function_identity_arguments),
+    # so each overload is its own object. None when unknown (a grant built by
+    # hand), which names the routine without arguments.
+    args: Optional[str] = None
+
+    @property
+    def object_sql(self) -> str:
+        """The routine as GRANT names it: with its signature when that is known.
+
+        An ordered-set aggregate's identity arguments (`... ORDER BY ...`) are
+        not valid in GRANT, so such a routine is named without them.
+        """
+        name = f"{quote_ident(self.schema)}.{quote_ident(self.object_name)}"
+        if self.args is None or "ORDER BY" in self.args:
+            return name
+        return f"{name}({self.args})"
+
+    @property
+    def target(self) -> str:
+        """The object this grant is on, without privilege or grantee."""
+        if self.column:
+            return f"{self.object_type}:{self.schema}.{self.object_name}:{self.column}"
+        if self.args is not None:
+            return f"{self.object_type}:{self.schema}.{self.object_name}({self.args})"
+        return f"{self.object_type}:{self.schema}.{self.object_name}"
 
     @property
     def key(self) -> str:
         """Unique key for grant lookup."""
-        if self.column:
-            return f"{self.object_type}:{self.schema}.{self.object_name}:{self.column}:{self.privilege}:{self.grantee}"
-        return f"{self.object_type}:{self.schema}.{self.object_name}:{self.privilege}:{self.grantee}"
+        return f"{self.target}:{self.privilege}:{self.grantee}"
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Grant):
+            return NotImplemented
+        return self.key == other.key
+
+
+# pg_default_acl.defaclobjtype -> the keyword ALTER DEFAULT PRIVILEGES uses.
+# ROUTINES is an alias of FUNCTIONS and is stored as 'f'.
+DEFAULT_PRIVILEGE_OBJECT_TYPES = {
+    "r": "TABLES",
+    "S": "SEQUENCES",
+    "f": "FUNCTIONS",
+    "T": "TYPES",
+    "n": "SCHEMAS",
+}
+
+
+@dataclass
+class DefaultPrivilege:
+    """One privilege of an ALTER DEFAULT PRIVILEGES entry (pg_default_acl).
+
+    `target_role` is the role whose future objects receive the privilege (the
+    `FOR ROLE`; the session user when the declaration names none). `schema` is
+    the `IN SCHEMA`, or None for an entry that applies in every schema.
+    `object_type` is the plural keyword: TABLES, SEQUENCES, FUNCTIONS, TYPES or
+    SCHEMAS.
+    """
+
+    target_role: str
+    schema: Optional[str]
+    object_type: str
+    privilege: str
+    grantee: str
+    grantable: bool = False
+
+    @property
+    def key(self) -> str:
+        """Unique key, grant option included, so a change of it re-grants."""
+        scope = self.schema if self.schema is not None else "*"
+        option = ":grantable" if self.grantable else ""
+        return (
+            f"{self.target_role}:{scope}:{self.object_type}:"
+            f"{self.privilege}:{self.grantee}{option}"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DefaultPrivilege):
             return NotImplemented
         return self.key == other.key
 
@@ -668,6 +938,7 @@ class RoleMembership:
 
 # Object kinds that sit on a relation and are named `ON schema.table`.
 _COMMENT_ON_RELATION = frozenset({"CONSTRAINT", "TRIGGER", "POLICY"})
+_COMMENT_ON_ROUTINE = {"FUNCTION": "f", "PROCEDURE": "p", "AGGREGATE": "a"}
 
 
 @dataclass
@@ -675,10 +946,11 @@ class Comment:
     """A `COMMENT ON` an object the engine manages.
 
     `object_type` is the keyword the COMMENT statement uses: TABLE, VIEW,
-    COLUMN, INDEX, FUNCTION, TYPE, CONSTRAINT, TRIGGER or POLICY. `name` is
-    the object itself, or for a column, constraint, trigger or policy the
-    relation it belongs to, with the member in `member`. `args` is a function's
-    identity signature, as `pg_get_function_identity_arguments` prints it.
+    COLUMN, INDEX, FUNCTION, PROCEDURE, AGGREGATE, TYPE, COLLATION, CONSTRAINT,
+    TRIGGER or POLICY. `name` is the object itself, or for a column,
+    constraint, trigger or policy the relation it belongs to, with the member
+    in `member`. `args` is a routine's identity signature, as
+    `pg_get_function_identity_arguments` prints it.
     """
 
     object_type: str
@@ -691,8 +963,8 @@ class Comment:
     @property
     def key(self) -> str:
         """Unique key for the commented object (not the text)."""
-        if self.object_type == "FUNCTION":
-            return f"FUNCTION:{self.schema}.{self.name}({self.args})"
+        if self.object_type in _COMMENT_ON_ROUTINE:
+            return f"{self.object_type}:{self.schema}.{self.name}({self.args})"
         if self.member:
             return f"{self.object_type}:{self.schema}.{self.name}.{self.member}"
         return f"{self.object_type}:{self.schema}.{self.name}"
@@ -701,8 +973,10 @@ class Comment:
     def target_sql(self) -> str:
         """The object as written after `COMMENT ON`, every name quoted."""
         qualified = f"{quote_ident(self.schema)}.{quote_ident(self.name)}"
-        if self.object_type == "FUNCTION":
-            return f"FUNCTION {qualified}({self.args})"
+        kind = _COMMENT_ON_ROUTINE.get(self.object_type)
+        if kind is not None:
+            args = routine_args_sql(kind, self.args)
+            return f"{self.object_type} {qualified}({args})"
         if self.object_type == "COLUMN":
             return f"COLUMN {qualified}.{quote_ident(self.member)}"
         if self.object_type in _COMMENT_ON_RELATION:
@@ -713,6 +987,211 @@ class Comment:
         if not isinstance(other, Comment):
             return NotImplemented
         return self.key == other.key and self.text == other.text
+
+
+def parse_options(raw: Optional[list[str]]) -> dict[str, str]:
+    """A catalog `OPTIONS` array (`{name=value,...}`) as a dict, in order."""
+    options: dict[str, str] = {}
+    for item in raw or []:
+        name, _, value = item.partition("=")
+        options[name] = value
+    return options
+
+
+def fdw_options_sql(
+    options: dict[str, str], masked: frozenset[str] = frozenset()
+) -> str:
+    """`OPTIONS (name 'value', ...)`, or `""` when there are none.
+
+    The value of every option named in `masked` is written as `'***'`.
+    """
+    if not options:
+        return ""
+    parts = [
+        f"{quote_ident(name)} {quote_literal('***' if name in masked else value)}"
+        for name, value in options.items()
+    ]
+    return f"OPTIONS ({', '.join(parts)})"
+
+
+def alter_fdw_options_sql(
+    desired: dict[str, str],
+    actual: dict[str, str],
+    masked: frozenset[str] = frozenset(),
+) -> str:
+    """`OPTIONS (ADD ..., SET ..., DROP ...)` turning `actual` into `desired`.
+
+    Returns `""` when the two are equal. Values of options in `masked` are
+    written as `'***'`.
+    """
+    parts: list[str] = []
+    for name, value in desired.items():
+        shown = quote_literal("***" if name in masked else value)
+        if name not in actual:
+            parts.append(f"ADD {quote_ident(name)} {shown}")
+        elif actual[name] != value:
+            parts.append(f"SET {quote_ident(name)} {shown}")
+    for name in actual:
+        if name not in desired:
+            parts.append(f"DROP {quote_ident(name)}")
+    if not parts:
+        return ""
+    return f"OPTIONS ({', '.join(parts)})"
+
+
+def option_names_changed(desired: dict[str, str], actual: dict[str, str]) -> list[str]:
+    """Names of the options that differ, for plan descriptions (never values)."""
+    names = {n for n in desired if actual.get(n) != desired[n]}
+    names |= {n for n in actual if n not in desired}
+    return sorted(names)
+
+
+@dataclass
+class Extension:
+    """An extension declared with `CREATE EXTENSION`, or installed in a database.
+
+    On the declared side `schema` and `version` are None unless the statement
+    names them (`WITH SCHEMA`, `VERSION`): an unstated one is not compared, so
+    a database on an older version of an extension is not updated behind the
+    declaration's back. On the introspected side both are always set.
+    """
+
+    name: str
+    schema: Optional[str] = None
+    version: Optional[str] = None
+    cascade: bool = False
+
+
+@dataclass
+class ForeignServer:
+    """A foreign server (`CREATE SERVER ... FOREIGN DATA WRAPPER ...`)."""
+
+    name: str
+    fdw: str
+    type: Optional[str] = None
+    version: Optional[str] = None
+    options: dict[str, str] = field(default_factory=dict)
+
+
+# User-mapping options whose values are not secret. Every other option (a
+# `password` above all) is masked in plan output and logs, and left alone on
+# the target when the declaration does not set it, so a password provisioned by
+# hand outside the schema files survives.
+USER_MAPPING_PUBLIC_OPTIONS = frozenset({"user", "password_required"})
+
+
+@dataclass
+class UserMapping:
+    """A user mapping (`CREATE USER MAPPING FOR user SERVER server`).
+
+    `user` is the role name, or `public` for `FOR PUBLIC`. `options` is None
+    when the connecting role is not allowed to read them (pg_user_mappings
+    hides them); then they are not compared.
+    """
+
+    server: str
+    user: str
+    options: Optional[dict[str, str]] = field(default_factory=dict)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.server, self.user)
+
+    @property
+    def secret_options(self) -> frozenset[str]:
+        """Names of the options whose values are masked for display."""
+        return frozenset(
+            n for n in (self.options or {}) if n not in USER_MAPPING_PUBLIC_OPTIONS
+        )
+
+    @property
+    def user_sql(self) -> str:
+        """The mapped user as written after FOR: `PUBLIC` or a quoted role."""
+        return "PUBLIC" if self.user == "public" else quote_ident(self.user)
+
+    @property
+    def label(self) -> str:
+        return f"{self.user} on server {self.server}"
+
+
+@dataclass
+class ForeignTable:
+    """A foreign table (relkind 'f') in a managed schema.
+
+    `column_options` holds each column's `OPTIONS (...)` (postgres_fdw's
+    `column_name`, say), keyed by column name; columns without options are
+    absent.
+    """
+
+    schema: str
+    name: str
+    server: str
+    columns: dict[str, Column] = field(default_factory=dict)
+    options: dict[str, str] = field(default_factory=dict)
+    column_options: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+# The keyword `ALTER <kind> ... OWNER TO` takes for each owner kind.
+OWNER_KINDS = frozenset(
+    {
+        "TABLE",
+        "FOREIGN TABLE",
+        "VIEW",
+        "MATERIALIZED VIEW",
+        "SEQUENCE",
+        "FUNCTION",
+        "PROCEDURE",
+        "AGGREGATE",
+        "TYPE",
+        "DOMAIN",
+        "COLLATION",
+        "SCHEMA",
+    }
+)
+# Owner kinds that name a routine, with its identity arguments.
+ROUTINE_OWNER_KINDS = frozenset({"FUNCTION", "PROCEDURE", "AGGREGATE"})
+
+
+@dataclass
+class ObjectOwner:
+    """The owner of a managed object (`pg_class.relowner` and friends).
+
+    `kind` is one of OWNER_KINDS. A schema has its name in `name` and an
+    empty `schema`; a function, procedure or aggregate (a window function is a
+    FUNCTION) carries its identity arguments in `args`.
+    """
+
+    kind: str
+    schema: str
+    name: str
+    owner: str
+    args: str = ""
+
+    @property
+    def key(self) -> str:
+        if self.kind == "SCHEMA":
+            return f"SCHEMA:{self.name}"
+        if self.kind in ROUTINE_OWNER_KINDS:
+            return f"{self.kind}:{self.schema}.{self.name}({self.args})"
+        return f"{self.kind}:{self.schema}.{self.name}"
+
+    @property
+    def target_sql(self) -> str:
+        """The object as written after `ALTER`, every name quoted."""
+        if self.kind not in OWNER_KINDS:
+            raise ValueError(f"unexpected owner kind {self.kind!r}")
+        if self.kind == "SCHEMA":
+            return f"SCHEMA {quote_ident(self.name)}"
+        qualified = f"{quote_ident(self.schema)}.{quote_ident(self.name)}"
+        if self.kind in ROUTINE_OWNER_KINDS:
+            # A zero-argument aggregate is spelled `(*)`.
+            args = "*" if self.kind == "AGGREGATE" and not self.args else self.args
+            return f"{self.kind} {qualified}({args})"
+        return f"{self.kind} {qualified}"
 
 
 @dataclass
@@ -746,6 +1225,10 @@ class Schema:
         default_factory=dict
     )  # key = schema.type
     domains: dict[str, Domain] = field(default_factory=dict)  # key = schema.domain
+    ranges: dict[str, RangeType] = field(default_factory=dict)  # key = schema.range
+    collations: dict[str, Collation] = field(
+        default_factory=dict
+    )  # key = schema.collation
     views: dict[str, View] = field(default_factory=dict)  # key = schema.view
     materialized_views: dict[str, MaterializedView] = field(
         default_factory=dict
@@ -759,10 +1242,34 @@ class Schema:
         default_factory=dict
     )  # key = schema.sequence
     grants: list[Grant] = field(default_factory=list)
+    default_privileges: list[DefaultPrivilege] = field(default_factory=list)
     dependencies: list[Dependency] = field(default_factory=list)
     roles: dict[str, Role] = field(default_factory=dict)  # key = role name
     role_memberships: list[RoleMembership] = field(default_factory=list)
     comments: dict[str, Comment] = field(default_factory=dict)  # key = Comment.key
+    rules: dict[str, Rule] = field(default_factory=dict)  # key = schema.table.rule
+    # Database-level objects: every one in the database is introspected, and
+    # the differ decides which of them it may touch.
+    publications: dict[str, Publication] = field(default_factory=dict)  # key = name
+    event_triggers: dict[str, EventTrigger] = field(default_factory=dict)  # key = name
+    # Extensions: on the declared side, the CREATE EXTENSION statements of the
+    # schema files; on the live side, every installed extension.
+    extensions: dict[str, Extension] = field(default_factory=dict)  # key = name
+    # Extensions a `-- @drop extension:NAME` directive consents to dropping.
+    extension_drops: set[str] = field(default_factory=set)
+    foreign_servers: dict[str, ForeignServer] = field(
+        default_factory=dict
+    )  # key = server name
+    user_mappings: dict[tuple[str, str], UserMapping] = field(
+        default_factory=dict
+    )  # key = (server, user)
+    foreign_tables: dict[str, ForeignTable] = field(
+        default_factory=dict
+    )  # key = schema.table
+    # Owners, filled only with `PgDeclareConfig.manage_ownership`. On the
+    # declared side only owners the schema files state (a managed role other
+    # than the role building the plan) are kept.
+    owners: dict[str, ObjectOwner] = field(default_factory=dict)  # key = .key
 
     def get_table(self, schema: str, name: str) -> Optional[Table]:
         """Get table by schema and name."""
@@ -810,11 +1317,48 @@ class Schema:
             return f"{relation}.{comment.member}" in self.policies
         if kind == "INDEX":
             return relation in self.indexes
-        if kind == "FUNCTION":
-            return f"{relation}({comment.args})" in self.functions
+        if kind in _COMMENT_ON_ROUTINE:
+            func = self.functions.get(f"{relation}({comment.args})")
+            return func is not None and func.keyword == kind
         if kind == "TYPE":
-            return relation in self.enums or relation in self.composite_types
+            return (
+                relation in self.enums
+                or relation in self.composite_types
+                or relation in self.ranges
+            )
+        if kind == "COLLATION":
+            return relation in self.collations
         return False
+
+    def has_owner_target(self, owner: ObjectOwner) -> bool:
+        """Whether the object `owner` describes is one this schema models."""
+        relation = f"{owner.schema}.{owner.name}"
+        kind = owner.kind
+        if kind == "TABLE":
+            return relation in self.tables
+        if kind == "FOREIGN TABLE":
+            return relation in self.foreign_tables
+        if kind == "VIEW":
+            return relation in self.views
+        if kind == "MATERIALIZED VIEW":
+            return relation in self.materialized_views
+        if kind == "SEQUENCE":
+            return relation in self.sequences
+        if kind in ROUTINE_OWNER_KINDS:
+            func = self.functions.get(f"{relation}({owner.args})")
+            return func is not None and func.keyword == kind
+        if kind == "TYPE":
+            return (
+                relation in self.enums
+                or relation in self.composite_types
+                or relation in self.ranges
+            )
+        if kind == "DOMAIN":
+            return relation in self.domains
+        if kind == "COLLATION":
+            return relation in self.collations
+        # Schemas: the caller only asks about managed ones.
+        return kind == "SCHEMA"
 
     def get_role(self, name: str) -> Optional[Role]:
         """Get role by name."""

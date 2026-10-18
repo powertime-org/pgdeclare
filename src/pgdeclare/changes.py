@@ -14,23 +14,40 @@ from typing import Optional, Union
 from .quoting import do_block, dollar_tag, quote_ident, quote_literal, role_ident
 from .models import (
     ChangeCategory,
+    Collation,
     Column,
     Comment,
     CompositeType,
     Constraint,
+    DefaultPrivilege,
     Domain,
     EnumType,
+    EventTrigger,
+    Extension,
+    ForeignServer,
+    ForeignTable,
     Function,
     Grant,
     Index,
     MaterializedView,
+    ObjectOwner,
     Policy,
+    RangeType,
+    Publication,
+    PublicationTable,
     Role,
     RoleMembership,
+    Rule,
     Sequence,
     Table,
     Trigger,
+    UserMapping,
     View,
+    routine_args_sql,
+    routine_keyword,
+    alter_fdw_options_sql,
+    fdw_options_sql,
+    option_names_changed,
 )
 
 
@@ -103,12 +120,52 @@ class CreateTable(Change):
     def __post_init__(self):
         self.object_name = self.table.qualified_name
         if not self.description:
-            self.description = f"Create table {self.table.qualified_name}"
+            if self.table.partition_of is not None:
+                self.description = (
+                    f"Create partition {self.table.qualified_name} of "
+                    f"{self.table.parent_key} ({self.table.partition_bound})"
+                )
+            else:
+                self.description = f"Create table {self.table.qualified_name}"
+
+    def _inline_constraints(self) -> list[str]:
+        # Only PRIMARY KEY and CHECK constraints are inlined. FOREIGN KEY,
+        # UNIQUE and EXCLUDE are emitted as separate AddConstraint changes by
+        # the differ; see DEFERRED_CONSTRAINT_TYPES for why.
+        return [
+            f"    CONSTRAINT {quote_ident(constraint.name)} {constraint.definition}"
+            for constraint in self.table.constraints
+            if constraint.type not in DEFERRED_CONSTRAINT_TYPES
+        ]
+
+    def _partition_sql(self) -> str:
+        """`CREATE TABLE ... PARTITION OF parent ... FOR VALUES ...`.
+
+        The columns, their defaults and NOT NULL come from the parent; a
+        partition's own overrides are written by the differ afterwards.
+        """
+        table = self.table
+        assert table.partition_of is not None
+        parent = (
+            f"{quote_ident(table.partition_of[0])}.{quote_ident(table.partition_of[1])}"
+        )
+        sql = f"CREATE TABLE {quote_ident(table.schema)}.{quote_ident(table.name)} PARTITION OF {parent}"
+        constraints = self._inline_constraints()
+        if constraints:
+            sql += f" (\n{',\n'.join(constraints)}\n)"
+        sql += f" {table.partition_bound}"
+        if table.partition_key:
+            sql += f" PARTITION BY {table.partition_key}"
+        return sql + ";"
 
     def to_sql(self) -> str:
+        if self.table.partition_of is not None:
+            return self._partition_sql()
         columns_sql = []
         for col in self.table.columns.values():
             col_def = f"    {quote_ident(col.name)} {col.type}"
+            if col.collation:
+                col_def += f" COLLATE {col.collation}"
             # Add IDENTITY clause before NOT NULL
             if col.identity == "a":
                 col_def += " GENERATED ALWAYS AS IDENTITY"
@@ -124,18 +181,93 @@ class CreateTable(Change):
                 col_def += f" DEFAULT {col.default}"
             columns_sql.append(col_def)
 
-        # Only PRIMARY KEY and CHECK constraints are inlined. FOREIGN KEY,
-        # UNIQUE and EXCLUDE are emitted as separate AddConstraint changes by
-        # the differ; see DEFERRED_CONSTRAINT_TYPES for why.
-        inline_constraints = []
-        for constraint in self.table.constraints:
-            if constraint.type not in DEFERRED_CONSTRAINT_TYPES:
-                inline_constraints.append(
-                    f"    CONSTRAINT {constraint.name} {constraint.definition}"
+        all_parts = columns_sql + self._inline_constraints()
+        partition_by = (
+            f" PARTITION BY {self.table.partition_key}"
+            if self.table.partition_key
+            else ""
+        )
+        return f"CREATE TABLE {quote_ident(self.table.schema)}.{quote_ident(self.table.name)} (\n{',\n'.join(all_parts)}\n){partition_by};"
+
+
+def _qualified(name: tuple[str, str]) -> str:
+    return f"{quote_ident(name[0])}.{quote_ident(name[1])}"
+
+
+@dataclass
+class AttachPartition(Change):
+    """Attach a table as a partition, detaching it from its current parent first.
+
+    Used for a changed bound (detach and attach again to the same parent), a
+    partition moved to another parent, and a plain table declared as a
+    partition. ATTACH scans the table to check every row fits the bound, and a
+    default partition to check none of its rows do, under a lock, so this is
+    offline. Both statements run in one transaction.
+    """
+
+    schema: str = "public"
+    table: str = ""
+    parent: tuple[str, str] = ("public", "")
+    bound: str = ""
+    detach_from: Optional[tuple[str, str]] = None
+    old_bound: Optional[str] = None
+    category: ChangeCategory = ChangeCategory.OFFLINE
+    description: str = ""
+    object_type: str = "TABLE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table}"
+        if not self.description:
+            parent = f"{self.parent[0]}.{self.parent[1]}"
+            if self.detach_from == self.parent:
+                self.description = (
+                    f"Change bound of partition {self.object_name} of {parent}: "
+                    f"{self.old_bound} -> {self.bound} (DETACH, then ATTACH, "
+                    "which scans the partition to validate it)"
+                )
+            else:
+                self.description = (
+                    f"Attach {self.object_name} to {parent} as a partition "
+                    f"({self.bound}; ATTACH scans the table to validate it)"
                 )
 
-        all_parts = columns_sql + inline_constraints
-        return f"CREATE TABLE {quote_ident(self.table.schema)}.{quote_ident(self.table.name)} (\n{',\n'.join(all_parts)}\n);"
+    def to_sql(self) -> str:
+        table = f"{quote_ident(self.schema)}.{quote_ident(self.table)}"
+        statements = []
+        if self.detach_from is not None:
+            statements.append(
+                f"ALTER TABLE {_qualified(self.detach_from)} DETACH PARTITION {table};"
+            )
+        statements.append(
+            f"ALTER TABLE {_qualified(self.parent)} ATTACH PARTITION {table} {self.bound};"
+        )
+        return "\n".join(statements)
+
+
+@dataclass
+class DetachPartition(Change):
+    """Detach a partition that is now declared as a plain table."""
+
+    schema: str = "public"
+    table: str = ""
+    parent: tuple[str, str] = ("public", "")
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TABLE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table}"
+        if not self.description:
+            self.description = (
+                f"Detach partition {self.object_name} from "
+                f"{self.parent[0]}.{self.parent[1]}"
+            )
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER TABLE {_qualified(self.parent)} DETACH PARTITION "
+            f"{quote_ident(self.schema)}.{quote_ident(self.table)};"
+        )
 
 
 @dataclass
@@ -194,6 +326,8 @@ class AddColumn(Change):
 
     def to_sql(self) -> str:
         sql = f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} ADD COLUMN {quote_ident(self.column.name)} {self.column.type}"
+        if self.column.collation:
+            sql += f" COLLATE {self.column.collation}"
         # Add IDENTITY clause before NOT NULL
         if self.column.identity == "a":
             sql += " GENERATED ALWAYS AS IDENTITY"
@@ -246,6 +380,9 @@ class AlterColumnType(Change):
     column: str = ""
     old_type: str = ""
     new_type: str = ""
+    # The COLLATE clause written with the type: a quoted collation name, or
+    # None for no clause (the new type's default).
+    collation: Optional[str] = None
     category: ChangeCategory = ChangeCategory.TRY_FIRST
     description: str = ""
     object_type: str = "COLUMN"
@@ -253,10 +390,16 @@ class AlterColumnType(Change):
     def __post_init__(self):
         self.object_name = f"{self.schema}.{self.table}.{self.column}"
         if not self.description:
-            self.description = f"Alter column {self.column} type from {self.old_type} to {self.new_type}"
+            if self.old_type == self.new_type:
+                self.description = (
+                    f"Alter column {self.column} collation to {self.collation}"
+                )
+            else:
+                self.description = f"Alter column {self.column} type from {self.old_type} to {self.new_type}"
 
     def to_sql(self) -> str:
-        return f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} ALTER COLUMN {quote_ident(self.column)} TYPE {self.new_type} USING {quote_ident(self.column)}::{self.new_type};"
+        collate = f" COLLATE {self.collation}" if self.collation else ""
+        return f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} ALTER COLUMN {quote_ident(self.column)} TYPE {self.new_type}{collate} USING {quote_ident(self.column)}::{self.new_type};"
 
 
 @dataclass
@@ -538,6 +681,10 @@ class DropAndCreateConstraint(Change):
     constraint: Constraint = field(
         default_factory=lambda: Constraint(name="", type="", definition="")
     )
+    # Re-add CHECK and FOREIGN KEY constraints NOT VALID (validated afterwards).
+    # False where Postgres refuses NOT VALID: a foreign key on a partitioned
+    # table before PostgreSQL 18.
+    not_valid: bool = True
     category: ChangeCategory = ChangeCategory.ONLINE
     description: str = ""
     object_type: str = "CONSTRAINT"
@@ -553,7 +700,11 @@ class DropAndCreateConstraint(Change):
         # Wrap in DO block for atomicity - if ADD fails, DROP is rolled back
         drop_sql = f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} DROP CONSTRAINT IF EXISTS {quote_ident(self.constraint.name)}"
         # Add the new constraint (NOT VALID for CHECK/FK constraints)
-        not_valid_clause = " NOT VALID" if self.constraint.type in ("f", "c") else ""
+        not_valid_clause = (
+            " NOT VALID"
+            if self.not_valid and self.constraint.type in ("f", "c")
+            else ""
+        )
         add_sql = f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} ADD CONSTRAINT {quote_ident(self.constraint.name)} {self.constraint.definition}{not_valid_clause}"
         # Escape single quotes for EXECUTE
         escaped_add = add_sql.replace("'", "''")
@@ -591,19 +742,24 @@ def _replay_grants_sql(grants: list[Grant]) -> str:
     return "".join(parts)
 
 
-def _revoke_public_execute_sql(schema: str, name: str, args: str) -> str:
+def _revoke_public_execute_sql(
+    schema: str, name: str, args: str, keyword: str = "FUNCTION"
+) -> str:
     """Bare `REVOKE EXECUTE ... FROM public` (no trailing `;`, no DO wrapper).
 
     Used for SECDEF lockdowns. Emitted either appended atomically to a
     function's CREATE/recreate (so PostgreSQL's default PUBLIC EXECUTE grant is
     revoked in the same change), or standalone for pure ACL drift.
     """
-    return f"REVOKE EXECUTE ON FUNCTION {quote_ident(schema)}.{quote_ident(name)}({args}) FROM public"
+    # GRANT/REVOKE has no AGGREGATE object type; an aggregate is a FUNCTION here.
+    if keyword == "AGGREGATE":
+        keyword = "FUNCTION"
+    return f"REVOKE EXECUTE ON {keyword} {quote_ident(schema)}.{quote_ident(name)}({args}) FROM public"
 
 
 @dataclass
 class CreateFunction(Change):
-    """Create or replace a function."""
+    """Create a function, procedure or aggregate (CREATE OR REPLACE)."""
 
     function: Function = field(
         default_factory=lambda: Function(
@@ -622,14 +778,20 @@ class CreateFunction(Change):
     def __post_init__(self):
         self.object_name = self.function.signature
         if not self.description:
-            self.description = f"Create function {self.function.signature}"
+            self.description = (
+                f"Create {self.function.keyword.lower()} {self.function.signature}"
+            )
 
     def to_sql(self) -> str:
         # The full_definition already contains CREATE OR REPLACE FUNCTION
+        # (or PROCEDURE, or AGGREGATE)
         sql = self.function.full_definition
         if self.revoke_public_execute:
             revoke = _revoke_public_execute_sql(
-                self.function.schema, self.function.name, self.function.args
+                self.function.schema,
+                self.function.name,
+                self.function.args,
+                self.function.keyword,
             )
             # Run in the same change (one savepoint/unit) so the default PUBLIC
             # EXECUTE granted at CREATE time is immediately revoked.
@@ -653,7 +815,9 @@ class ReplaceFunction(Change):
     def __post_init__(self):
         self.object_name = self.function.signature
         if not self.description:
-            self.description = f"Replace function {self.function.signature}"
+            self.description = (
+                f"Replace {self.function.keyword.lower()} {self.function.signature}"
+            )
 
     def to_sql(self) -> str:
         return self.function.full_definition
@@ -661,11 +825,14 @@ class ReplaceFunction(Change):
 
 @dataclass
 class DropFunction(Change):
-    """Drop a function."""
+    """Drop a function, procedure or aggregate."""
 
     schema: str = "public"
     name: str = ""
     args: str = ""
+    # pg_proc.prokind of the routine dropped; DROP FUNCTION refuses a
+    # procedure or an aggregate.
+    kind: str = "f"
     category: ChangeCategory = ChangeCategory.ONLINE
     description: str = ""
     object_type: str = "FUNCTION"
@@ -673,16 +840,23 @@ class DropFunction(Change):
     def __post_init__(self):
         self.object_name = f"{self.schema}.{self.name}({self.args})"
         if not self.description:
-            self.description = f"Drop function {self.object_name}"
+            keyword = routine_keyword(self.kind).lower()
+            self.description = f"Drop {keyword} {self.object_name}"
 
     def to_sql(self) -> str:
         # Use CASCADE to handle trigger dependencies
-        return f"DROP FUNCTION IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.name)}({self.args}) CASCADE;"
+        keyword = routine_keyword(self.kind)
+        args = routine_args_sql(self.kind, self.args)
+        return f"DROP {keyword} IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.name)}({args}) CASCADE;"
 
 
 @dataclass
 class DropAndCreateFunction(Change):
-    """Drop and recreate a function (required when return type or parameter names change)."""
+    """Drop and recreate a routine.
+
+    Required when the return type, the parameter names or the kind (function,
+    procedure, aggregate) change, none of which CREATE OR REPLACE can do.
+    """
 
     function: Function = field(
         default_factory=lambda: Function(
@@ -692,6 +866,9 @@ class DropAndCreateFunction(Change):
     old_args: Optional[str] = (
         None  # For parameter renames: args of the function to drop
     )
+    # pg_proc.prokind of the routine to drop, when it differs from the new
+    # one's: DROP has to name what is there now.
+    old_kind: Optional[str] = None
     category: ChangeCategory = ChangeCategory.ONLINE
     description: str = ""
     object_type: str = "FUNCTION"
@@ -707,8 +884,8 @@ class DropAndCreateFunction(Change):
         self.object_name = self.function.signature
         if not self.description:
             self.description = (
-                f"Drop and recreate function {self.function.signature}"
-                + grant_replay_note(len(self.grants))
+                f"Drop and recreate {self.function.keyword.lower()} "
+                f"{self.function.signature}" + grant_replay_note(len(self.grants))
             )
 
     def to_sql(self) -> str:
@@ -716,16 +893,23 @@ class DropAndCreateFunction(Change):
         # Wrap in DO block for atomicity - if CREATE fails, DROP is rolled back
         # CASCADE is safe here: dependents (triggers/views) are dropped atomically but
         # recreated when their owning tables are processed; if CREATE fails, everything rolls back
-        drop_args = self.old_args if self.old_args is not None else self.function.args
-        drop_sql = f"DROP FUNCTION IF EXISTS {quote_ident(self.function.schema)}.{quote_ident(self.function.name)}({drop_args}) CASCADE"
+        drop_kind = self.old_kind if self.old_kind is not None else self.function.kind
+        drop_args = routine_args_sql(
+            drop_kind,
+            self.old_args if self.old_args is not None else self.function.args,
+        )
+        drop_sql = f"DROP {routine_keyword(drop_kind)} IF EXISTS {quote_ident(self.function.schema)}.{quote_ident(self.function.name)}({drop_args}) CASCADE"
         # Escape single quotes in function definition for EXECUTE
         escaped_def = self.function.full_definition.replace("'", "''")
         inner = f"{drop_sql}; EXECUTE '{escaped_def}';"
         inner += _replay_grants_sql(self.grants)
         if self.revoke_public_execute:
             revoke = _revoke_public_execute_sql(
-                self.function.schema, self.function.name, self.function.args
-            )
+                self.function.schema,
+                self.function.name,
+                self.function.args,
+                self.function.keyword,
+            ).replace("'", "''")
             inner += f" EXECUTE '{revoke}';"
         return do_block(f"BEGIN {inner} END")
 
@@ -783,6 +967,175 @@ class DropIndex(Change):
     def to_sql(self) -> str:
         concurrently = "CONCURRENTLY " if self.concurrent else ""
         return f"DROP INDEX {concurrently}IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.index_name)};"
+
+
+# Postgres truncates identifiers to NAMEDATALEN - 1 bytes.
+_MAX_IDENTIFIER_BYTES = 63
+
+
+def _truncate_identifier(name: str, reserve: int = 0) -> str:
+    raw = name.encode()[: _MAX_IDENTIFIER_BYTES - reserve]
+    return raw.decode(errors="ignore")
+
+
+@dataclass
+class CreatePartitionedIndex(CreateIndex):
+    """Create an index on a partitioned table without a long lock.
+
+    `CREATE INDEX` on a partitioned table cannot be CONCURRENTLY, and builds
+    every partition's index under a lock. Instead, the parent's index is
+    created `ON ONLY` the parent (invalid and empty), each partition's index
+    is built CONCURRENTLY and attached to it, and the parent's index turns
+    valid once every partition has one. A sub-partitioned partition gets an
+    `ON ONLY` index of its own, filled the same way.
+
+    The partitions are read when the change runs, so ones created at runtime
+    and not declared get the index too, and a run that died half way resumes:
+    an existing parent index is kept and only partitions without an attached
+    index are built.
+    """
+
+    def __post_init__(self):
+        if not self.description:
+            self.description = (
+                f"Create index {self.index.name} on partitioned table "
+                f"{self.index.table} (per partition CONCURRENTLY, then attached)"
+            )
+        super().__post_init__()
+
+    def to_sql(self) -> str:
+        return (
+            f"{self.index.definition};\n"
+            "-- then, for each partition: CREATE INDEX CONCURRENTLY on it and "
+            f"ALTER INDEX {quote_ident(self.index.schema)}."
+            f"{quote_ident(self.index.name)} ATTACH PARTITION <its index>"
+        )
+
+    def execute(self, cur) -> list[str]:
+        """Run the build on an autocommit cursor; returns the statements run."""
+        executed: list[str] = []
+
+        def run(statement: str) -> None:
+            cur.execute(statement)
+            executed.append(statement)
+
+        index_oid = _index_oid(cur, self.index.schema, self.index.name)
+        if index_oid is None:
+            run(self.index.definition)
+            index_oid = _index_oid(cur, self.index.schema, self.index.name)
+            assert index_oid is not None
+        _fill_partitioned_index(cur, index_oid, run)
+        return executed
+
+
+def _index_oid(cur, schema: str, name: str) -> Optional[int]:
+    cur.execute(
+        """
+        SELECT c.oid FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('i', 'I')
+        """,
+        (schema, name),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _free_index_name(cur, schema: str, base: str) -> str:
+    """`base`, or `base_N`, whichever is not yet a relation in `schema`."""
+    candidate = _truncate_identifier(base)
+    n = 0
+    while True:
+        cur.execute(
+            """
+            SELECT 1 FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s
+            """,
+            (schema, candidate),
+        )
+        if cur.fetchone() is None:
+            return candidate
+        n += 1
+        suffix = f"_{n}"
+        candidate = _truncate_identifier(base, len(suffix.encode())) + suffix
+
+
+def _fill_partitioned_index(cur, index_oid: int, run) -> None:
+    """Give every partition of `index_oid`'s table an index attached to it."""
+    cur.execute(
+        """
+        SELECT n.nspname, c.relname, t.relname, ix.indisunique, ix.indrelid,
+               pg_get_indexdef(c.oid),
+               format('CREATE %%sINDEX %%s ON ONLY %%s.%%s ',
+                      CASE WHEN ix.indisunique THEN 'UNIQUE ' ELSE '' END,
+                      quote_ident(c.relname), quote_ident(tn.nspname),
+                      quote_ident(t.relname))
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_index ix ON ix.indexrelid = c.oid
+        JOIN pg_class t ON t.oid = ix.indrelid
+        JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        WHERE c.oid = %s
+        """,
+        (index_oid,),
+    )
+    row = cur.fetchone()
+    assert row is not None
+    index_schema, index_name, _table, unique, table_oid, definition, prefix = row
+    if not definition.startswith(prefix):
+        raise ValueError(
+            f"cannot build partitioned index {quote_ident(index_schema)}."
+            f"{quote_ident(index_name)}: unexpected definition {definition!r}"
+        )
+    # Everything after the table name: "USING btree (col) INCLUDE ... WHERE ...".
+    tail = definition[len(prefix) :]
+    parent_index = f"{quote_ident(index_schema)}.{quote_ident(index_name)}"
+    create = "CREATE UNIQUE INDEX" if unique else "CREATE INDEX"
+
+    cur.execute(
+        """
+        SELECT c.oid, n.nspname, c.relname, c.relkind,
+               (SELECT x.indexrelid FROM pg_inherits ii
+                JOIN pg_index x ON x.indexrelid = ii.inhrelid
+                WHERE ii.inhparent = %s AND x.indrelid = c.oid) AS attached,
+               (SELECT x.indisvalid FROM pg_inherits ii
+                JOIN pg_index x ON x.indexrelid = ii.inhrelid
+                WHERE ii.inhparent = %s AND x.indrelid = c.oid) AS attached_valid
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE i.inhparent = %s
+        ORDER BY n.nspname, c.relname
+        """,
+        (index_oid, index_oid, table_oid),
+    )
+    partitions = cur.fetchall()
+    for _oid, schema, name, relkind, attached, attached_valid in partitions:
+        if relkind == "f":
+            continue  # Foreign tables cannot be indexed; Postgres skips them too.
+        table = f"{quote_ident(schema)}.{quote_ident(name)}"
+        if attached is not None:
+            if relkind == "p" and not attached_valid:
+                _fill_partitioned_index(cur, attached, run)
+            continue
+        child_name = _free_index_name(cur, schema, f"{name}_{index_name}")
+        child = f"{quote_ident(schema)}.{quote_ident(child_name)}"
+        if relkind == "p":
+            run(f"{create} {quote_ident(child_name)} ON ONLY {table} {tail}")
+            child_oid = _index_oid(cur, schema, child_name)
+            assert child_oid is not None
+            _fill_partitioned_index(cur, child_oid, run)
+        else:
+            try:
+                run(
+                    f"{create} CONCURRENTLY {quote_ident(child_name)} ON {table} {tail}"
+                )
+            except Exception:
+                # A failed CONCURRENTLY build leaves an invalid index behind.
+                cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {child}")
+                raise
+        run(f"ALTER INDEX {parent_index} ATTACH PARTITION {child}")
 
 
 # =============================================================================
@@ -1407,6 +1760,240 @@ class ValidateDomainConstraint(Change):
 
 
 # =============================================================================
+# Range Type Changes
+# =============================================================================
+
+
+def _create_range_sql(range_type: RangeType) -> str:
+    options = [f"SUBTYPE = {range_type.subtype}"]
+    if range_type.subtype_opclass:
+        options.append(f"SUBTYPE_OPCLASS = {range_type.subtype_opclass}")
+    if range_type.collation:
+        options.append(f"COLLATION = {range_type.collation}")
+    if range_type.canonical:
+        options.append(f"CANONICAL = {range_type.canonical}")
+    if range_type.subtype_diff:
+        options.append(f"SUBTYPE_DIFF = {range_type.subtype_diff}")
+    if range_type.multirange_type_name:
+        options.append(f"MULTIRANGE_TYPE_NAME = {range_type.multirange_type_name}")
+    target = _domain_ident(range_type.schema, range_type.name)
+    return f"CREATE TYPE {target} AS RANGE ({', '.join(options)});"
+
+
+@dataclass
+class CreateShellType(Change):
+    """Create a shell type, for a range whose canonical function takes it.
+
+    The canonical function's signature names the range type, so the type has
+    to exist (as a shell) before the function, and the function before the
+    range is defined over the shell.
+    """
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TYPE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Create shell type {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"CREATE TYPE {_domain_ident(self.schema, self.name)};"
+
+
+@dataclass
+class CreateRangeType(Change):
+    """Create a range type, with its multirange named explicitly."""
+
+    range_type: RangeType = field(
+        default_factory=lambda: RangeType(schema="public", name="", subtype="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TYPE"
+
+    def __post_init__(self):
+        self.object_name = self.range_type.qualified_name
+        if not self.description:
+            self.description = f"Create range type {self.range_type.qualified_name}"
+
+    def to_sql(self) -> str:
+        return _create_range_sql(self.range_type)
+
+
+@dataclass
+class DropRangeType(Change):
+    """Drop a range type (and its multirange) that is no longer declared.
+
+    Never a blind CASCADE: a column still typed with the range is dropped or
+    retyped by its own change, and the executor retries this drop until it
+    has been. A range with a canonical function is the exception PostgreSQL
+    forces: the function takes the type and the type names the function, so
+    neither can be dropped first. That drop checks, in the same statement,
+    that nothing but the canonical function still depends on the type, and
+    only then drops it with CASCADE.
+    """
+
+    schema: str = "public"
+    name: str = ""
+    has_canonical: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TYPE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop range type {self.object_name}"
+
+    def to_sql(self) -> str:
+        target = _domain_ident(self.schema, self.name)
+        if not self.has_canonical:
+            return f"DROP TYPE IF EXISTS {target};"
+        literal = quote_literal(target)
+        return do_block(
+            "DECLARE r regtype := to_regtype("
+            + literal
+            + "); BEGIN IF r IS NULL THEN RETURN; END IF; "
+            "IF EXISTS (SELECT 1 FROM pg_range g "
+            "JOIN pg_type t ON t.oid = g.rngtypid "
+            "JOIN pg_type m ON m.oid = g.rngmultitypid "
+            "JOIN pg_depend d ON d.refclassid = 'pg_type'::regclass "
+            "AND d.refobjid IN (t.oid, t.typarray, m.oid, m.typarray) "
+            "AND d.deptype = 'n' "
+            "WHERE g.rngtypid = r "
+            "AND NOT (d.classid = 'pg_proc'::regclass AND d.objid = g.rngcanonical) "
+            "AND NOT EXISTS (SELECT 1 FROM pg_depend o "
+            "WHERE o.classid = d.classid AND o.objid = d.objid "
+            "AND o.refclassid = 'pg_type'::regclass "
+            "AND o.refobjid IN (t.oid, m.oid) AND o.deptype = 'i')) "
+            "THEN RAISE EXCEPTION USING ERRCODE = 'dependent_objects_still_exist', "
+            "MESSAGE = format('range type %s is still in use', r); END IF; "
+            f"DROP TYPE {target} CASCADE; END"
+        )
+
+
+@dataclass
+class DropAndCreateRangeType(Change):
+    """Recreate a range type whose definition changed.
+
+    The differ emits this only when nothing in the database uses the range
+    or its multirange, so the plain DROP cannot cascade into data.
+    """
+
+    range_type: RangeType = field(
+        default_factory=lambda: RangeType(schema="public", name="", subtype="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TYPE"
+
+    def __post_init__(self):
+        self.object_name = self.range_type.qualified_name
+        if not self.description:
+            self.description = (
+                f"Drop and recreate range type {self.range_type.qualified_name}"
+            )
+
+    def to_sql(self) -> str:
+        target = _domain_ident(self.range_type.schema, self.range_type.name)
+        return f"DROP TYPE {target};\n{_create_range_sql(self.range_type)}"
+
+
+# =============================================================================
+# Collation Changes
+# =============================================================================
+
+
+def _create_collation_sql(collation: Collation) -> str:
+    options = [f"provider = {collation.provider}"]
+    if collation.provider == "libc":
+        options.append(f"lc_collate = {quote_literal(collation.lc_collate or '')}")
+        options.append(f"lc_ctype = {quote_literal(collation.lc_ctype or '')}")
+    else:
+        options.append(f"locale = {quote_literal(collation.locale or '')}")
+    if collation.rules:
+        options.append(f"rules = {quote_literal(collation.rules)}")
+    if not collation.deterministic:
+        options.append("deterministic = false")
+    target = _domain_ident(collation.schema, collation.name)
+    return f"CREATE COLLATION {target} ({', '.join(options)});"
+
+
+@dataclass
+class CreateCollation(Change):
+    """Create a collation."""
+
+    collation: Collation = field(
+        default_factory=lambda: Collation(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "COLLATION"
+
+    def __post_init__(self):
+        self.object_name = self.collation.qualified_name
+        if not self.description:
+            self.description = f"Create collation {self.collation.qualified_name}"
+
+    def to_sql(self) -> str:
+        return _create_collation_sql(self.collation)
+
+
+@dataclass
+class DropCollation(Change):
+    """Drop a collation that is no longer declared.
+
+    Never CASCADE: a column, domain or range still using it is dropped or
+    changed by its own change, and the executor retries this drop until then.
+    """
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "COLLATION"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop collation {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP COLLATION IF EXISTS {_domain_ident(self.schema, self.name)};"
+
+
+@dataclass
+class DropAndCreateCollation(Change):
+    """Recreate a collation whose definition changed.
+
+    PostgreSQL has no ALTER for a collation's locale or provider. The differ
+    emits this only when nothing uses the collation.
+    """
+
+    collation: Collation = field(
+        default_factory=lambda: Collation(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "COLLATION"
+
+    def __post_init__(self):
+        self.object_name = self.collation.qualified_name
+        if not self.description:
+            self.description = (
+                f"Drop and recreate collation {self.collation.qualified_name}"
+            )
+
+    def to_sql(self) -> str:
+        target = _domain_ident(self.collation.schema, self.collation.name)
+        return f"DROP COLLATION {target};\n{_create_collation_sql(self.collation)}"
+
+
+# =============================================================================
 # Sequence Changes
 # =============================================================================
 
@@ -1973,8 +2560,8 @@ class GrantPrivilege(Change):
             return f"GRANT {self.grant.privilege} ON SCHEMA {quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         elif self.grant.column:
             return f"GRANT {self.grant.privilege} ({quote_ident(self.grant.column)}) ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
-        elif self.grant.object_type == "FUNCTION":
-            return f"GRANT {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
+        elif self.grant.object_type in ("FUNCTION", "PROCEDURE"):
+            return f"GRANT {self.grant.privilege} ON {self.grant.object_type} {self.grant.object_sql} TO {role_ident(self.grant.grantee)};"
         elif self.grant.object_type == "SEQUENCE":
             return f"GRANT {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         else:
@@ -2008,11 +2595,14 @@ class RevokePrivilege(Change):
             return do_block(
                 f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_column THEN NULL; END"
             )
-        elif self.grant.object_type == "FUNCTION":
-            # Wrap in DO block: function may have been dropped (CASCADE removes grants too)
-            revoke_sql = f"REVOKE {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
+        elif self.grant.object_type in ("FUNCTION", "PROCEDURE"):
+            # Wrap in DO block: function may have been dropped (CASCADE removes
+            # grants too), or recreated this run as the other kind of routine
+            # (wrong_object_type), which took its old ACL with it.
+            revoke_sql = f"REVOKE {self.grant.privilege} ON {self.grant.object_type} {self.grant.object_sql} FROM {role_ident(self.grant.grantee)}"
             return do_block(
-                f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_function THEN NULL; END"
+                f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_function"
+                " OR wrong_object_type THEN NULL; END"
             )
         elif self.grant.object_type == "SEQUENCE":
             # Wrap in DO block: the sequence may have been dropped in this
@@ -2043,6 +2633,7 @@ class RevokePublicExecute(Change):
     category: ChangeCategory = ChangeCategory.ONLINE
     description: str = ""
     object_type: str = "REVOKE"
+    keyword: str = "FUNCTION"  # PROCEDURE for a SECURITY DEFINER procedure
 
     def __post_init__(self):
         self.object_name = f"{self.schema}.{self.name}({self.args})"
@@ -2050,7 +2641,10 @@ class RevokePublicExecute(Change):
             self.description = f"Revoke PUBLIC EXECUTE on {self.object_name}"
 
     def to_sql(self) -> str:
-        return f"{_revoke_public_execute_sql(self.schema, self.name, self.args)};"
+        revoke = _revoke_public_execute_sql(
+            self.schema, self.name, self.args, self.keyword
+        )
+        return f"{revoke};"
 
 
 # =============================================================================
@@ -2155,6 +2749,80 @@ class DropRole(Change):
         return f"DROP ROLE IF EXISTS {quote_ident(self.role_name)};"
 
 
+def _default_privileges_prefix(entry: DefaultPrivilege) -> str:
+    """`ALTER DEFAULT PRIVILEGES FOR ROLE r [IN SCHEMA s]`, every name quoted.
+
+    The target role is always written out, so the statement does not depend on
+    which role the migrator connects as.
+    """
+    sql = f"ALTER DEFAULT PRIVILEGES FOR ROLE {role_ident(entry.target_role)}"
+    if entry.schema is not None:
+        sql += f" IN SCHEMA {quote_ident(entry.schema)}"
+    return sql
+
+
+def _default_privileges_scope(entry: DefaultPrivilege) -> str:
+    where = f"in schema {entry.schema}" if entry.schema is not None else "everywhere"
+    return f"{entry.object_type.lower()} of {entry.target_role} {where}"
+
+
+@dataclass
+class GrantDefaultPrivilege(Change):
+    """ALTER DEFAULT PRIVILEGES ... GRANT: future objects get the privilege."""
+
+    entry: DefaultPrivilege = field(
+        default_factory=lambda: DefaultPrivilege(
+            target_role="", schema=None, object_type="TABLES", privilege="", grantee=""
+        )
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DEFAULT_PRIVILEGE"
+
+    def __post_init__(self):
+        self.object_name = self.entry.key
+        if not self.description:
+            self.description = (
+                f"Grant {self.entry.privilege} on future "
+                f"{_default_privileges_scope(self.entry)} to {self.entry.grantee}"
+            )
+
+    def to_sql(self) -> str:
+        option = " WITH GRANT OPTION" if self.entry.grantable else ""
+        return (
+            f"{_default_privileges_prefix(self.entry)} GRANT {self.entry.privilege} "
+            f"ON {self.entry.object_type} TO {role_ident(self.entry.grantee)}{option};"
+        )
+
+
+@dataclass
+class RevokeDefaultPrivilege(Change):
+    """ALTER DEFAULT PRIVILEGES ... REVOKE. Objects that exist keep their ACL."""
+
+    entry: DefaultPrivilege = field(
+        default_factory=lambda: DefaultPrivilege(
+            target_role="", schema=None, object_type="TABLES", privilege="", grantee=""
+        )
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DEFAULT_PRIVILEGE"
+
+    def __post_init__(self):
+        self.object_name = self.entry.key
+        if not self.description:
+            self.description = (
+                f"Revoke {self.entry.privilege} on future "
+                f"{_default_privileges_scope(self.entry)} from {self.entry.grantee}"
+            )
+
+    def to_sql(self) -> str:
+        return (
+            f"{_default_privileges_prefix(self.entry)} REVOKE {self.entry.privilege} "
+            f"ON {self.entry.object_type} FROM {role_ident(self.entry.grantee)};"
+        )
+
+
 @dataclass
 class GrantRoleMembership(Change):
     """Grant a role to another role (GRANT role TO member)."""
@@ -2233,3 +2901,883 @@ class SetComment(Change):
     def to_sql(self) -> str:
         text = "NULL" if self.remove else quote_literal(self.comment.text)
         return f"COMMENT ON {self.comment.target_sql} IS {text};"
+
+
+# =============================================================================
+# Rewrite Rule Changes
+# =============================================================================
+
+# ev_enabled / evtenabled -> the ENABLE/DISABLE clause that sets it.
+_ENABLED_CLAUSE = {
+    "O": "ENABLE",
+    "D": "DISABLE",
+    "R": "ENABLE REPLICA",
+    "A": "ENABLE ALWAYS",
+}
+
+
+def _rule_state_sql(rule: Rule) -> str:
+    return (
+        f"ALTER TABLE {quote_ident(rule.schema)}.{quote_ident(rule.table)} "
+        f"{_ENABLED_CLAUSE[rule.enabled]} RULE {quote_ident(rule.name)};"
+    )
+
+
+@dataclass
+class CreateRule(Change):
+    """Create or replace a rewrite rule on a table.
+
+    `CREATE OR REPLACE RULE` keeps a replaced rule's enabled state, so the
+    state is written whenever it is not the default or has to change.
+    """
+
+    rule: Rule = field(
+        default_factory=lambda: Rule(schema="public", table="", name="", definition="")
+    )
+    set_enabled: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "RULE"
+
+    def __post_init__(self):
+        self.object_name = self.rule.qualified_key
+        if not self.description:
+            self.description = f"Create rule {self.rule.name} on {self.rule.table}"
+
+    def to_sql(self) -> str:
+        definition = self.rule.definition.strip().rstrip(";")
+        if definition.upper().startswith("CREATE RULE"):
+            definition = "CREATE OR REPLACE RULE" + definition[len("CREATE RULE") :]
+        sql = definition + ";"
+        if self.set_enabled or self.rule.enabled != "O":
+            sql += "\n" + _rule_state_sql(self.rule)
+        return sql
+
+
+@dataclass
+class AlterRuleEnabled(Change):
+    """Enable or disable a rewrite rule (ENABLE / DISABLE / REPLICA / ALWAYS)."""
+
+    rule: Rule = field(
+        default_factory=lambda: Rule(schema="public", table="", name="", definition="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "RULE"
+
+    def __post_init__(self):
+        self.object_name = self.rule.qualified_key
+        if not self.description:
+            clause = _ENABLED_CLAUSE[self.rule.enabled].capitalize()
+            self.description = f"{clause} rule {self.rule.name} on {self.rule.table}"
+
+    def to_sql(self) -> str:
+        return _rule_state_sql(self.rule)
+
+
+@dataclass
+class DropRule(Change):
+    """Drop a rewrite rule."""
+
+    schema: str = "public"
+    table: str = ""
+    rule_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "RULE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table}.{self.rule_name}"
+        if not self.description:
+            self.description = f"Drop rule {self.rule_name} on {self.table}"
+
+    def to_sql(self) -> str:
+        return f"DROP RULE IF EXISTS {quote_ident(self.rule_name)} ON {quote_ident(self.schema)}.{quote_ident(self.table)};"
+
+
+# =============================================================================
+# Event Trigger Changes
+# =============================================================================
+
+
+def _event_trigger_state_sql(name: str, enabled: str) -> str:
+    return f"ALTER EVENT TRIGGER {quote_ident(name)} {_ENABLED_CLAUSE[enabled]};"
+
+
+@dataclass
+class CreateEventTrigger(Change):
+    """Create an event trigger; with `replace`, drop the old one first.
+
+    There is no `CREATE OR REPLACE EVENT TRIGGER`. Creating one needs a
+    superuser.
+    """
+
+    trigger: EventTrigger = field(
+        default_factory=lambda: EventTrigger(
+            name="", event="", function_schema="", function_name=""
+        )
+    )
+    replace: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EVENT TRIGGER"
+
+    def __post_init__(self):
+        self.object_name = self.trigger.name
+        if not self.description:
+            verb = "Drop and recreate" if self.replace else "Create"
+            self.description = f"{verb} event trigger {self.trigger.name}"
+
+    def to_sql(self) -> str:
+        t = self.trigger
+        sql = ""
+        if self.replace:
+            sql += f"DROP EVENT TRIGGER IF EXISTS {quote_ident(t.name)};\n"
+        sql += f"CREATE EVENT TRIGGER {quote_ident(t.name)} ON {quote_ident(t.event)}"
+        if t.tags:
+            sql += f" WHEN TAG IN ({', '.join(quote_literal(tag) for tag in t.tags)})"
+        sql += f" EXECUTE FUNCTION {quote_ident(t.function_schema)}.{quote_ident(t.function_name)}();"
+        if t.enabled != "O":
+            sql += "\n" + _event_trigger_state_sql(t.name, t.enabled)
+        return sql
+
+
+@dataclass
+class AlterEventTriggerEnabled(Change):
+    """Enable or disable an event trigger."""
+
+    name: str = ""
+    enabled: str = "O"
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EVENT TRIGGER"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            clause = _ENABLED_CLAUSE[self.enabled].capitalize()
+            self.description = f"{clause} event trigger {self.name}"
+
+    def to_sql(self) -> str:
+        return _event_trigger_state_sql(self.name, self.enabled)
+
+
+@dataclass
+class DropEventTrigger(Change):
+    """Drop an event trigger."""
+
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EVENT TRIGGER"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = f"Drop event trigger {self.name}"
+
+    def to_sql(self) -> str:
+        return f"DROP EVENT TRIGGER IF EXISTS {quote_ident(self.name)};"
+
+
+# =============================================================================
+# Publication Changes
+# =============================================================================
+
+
+def _publication_table_sql(table: PublicationTable) -> str:
+    """One published table: name, column list and row filter."""
+    sql = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    if table.columns:
+        sql += f" ({', '.join(quote_ident(c) for c in table.columns)})"
+    if table.row_filter is not None:
+        sql += f" WHERE ({table.row_filter})"
+    return sql
+
+
+def _publication_objects_sql(
+    tables: list[PublicationTable], schemas: tuple[str, ...] | list[str] = ()
+) -> str:
+    """`TABLE a, b (c) WHERE (...), TABLES IN SCHEMA s, t`.
+
+    One TABLE keyword for the whole list, which PostgreSQL 14 also parses.
+    """
+    parts: list[str] = []
+    if tables:
+        parts.append("TABLE " + ", ".join(_publication_table_sql(t) for t in tables))
+    if schemas:
+        parts.append("TABLES IN SCHEMA " + ", ".join(quote_ident(s) for s in schemas))
+    return ", ".join(parts)
+
+
+def _publication_options_sql(publication: Publication) -> str:
+    options = [
+        f"publish = {quote_literal(', '.join(publication.publish))}",
+        f"publish_via_partition_root = {'true' if publication.via_root else 'false'}",
+    ]
+    if publication.generated_columns is not None:
+        options.append(f"publish_generated_columns = {publication.generated_columns}")
+    return f"({', '.join(options)})"
+
+
+def _create_publication_sql(publication: Publication) -> str:
+    sql = f"CREATE PUBLICATION {quote_ident(publication.name)}"
+    if publication.all_tables:
+        sql += " FOR ALL TABLES"
+    else:
+        objects = _publication_objects_sql(
+            list(publication.tables.values()), publication.schemas
+        )
+        if objects:
+            sql += f" FOR {objects}"
+    return sql + f" WITH {_publication_options_sql(publication)};"
+
+
+def _drop_publication_table_body(publication: str, table: PublicationTable) -> str:
+    """PL/pgSQL that drops `table` from `publication` if it is still a member.
+
+    A column drop with CASCADE or a table drop earlier in the same run may
+    already have removed it, and ALTER PUBLICATION ... DROP TABLE has no
+    IF EXISTS.
+    """
+    relation = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    statement = f"ALTER PUBLICATION {quote_ident(publication)} DROP TABLE {relation}"
+    return (
+        "IF EXISTS (SELECT 1 FROM pg_catalog.pg_publication_rel pr "
+        "JOIN pg_catalog.pg_publication p ON p.oid = pr.prpubid "
+        f"WHERE p.pubname = {quote_literal(publication)} "
+        f"AND pr.prrelid = pg_catalog.to_regclass({quote_literal(relation)})) "
+        f"THEN EXECUTE {quote_literal(statement)}; END IF;"
+    )
+
+
+@dataclass
+class CreatePublication(Change):
+    """Create a publication with its tables, schemas and options."""
+
+    publication: Publication = field(default_factory=lambda: Publication(name=""))
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.publication.name
+        if not self.description:
+            self.description = f"Create publication {self.publication.name}"
+
+    def to_sql(self) -> str:
+        return _create_publication_sql(self.publication)
+
+
+@dataclass
+class DropAndCreatePublication(Change):
+    """Drop and recreate a publication: FOR ALL TABLES cannot be altered."""
+
+    publication: Publication = field(default_factory=lambda: Publication(name=""))
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.publication.name
+        if not self.description:
+            self.description = f"Drop and recreate publication {self.publication.name}"
+
+    def to_sql(self) -> str:
+        return (
+            f"DROP PUBLICATION IF EXISTS {quote_ident(self.publication.name)};\n"
+            + _create_publication_sql(self.publication)
+        )
+
+
+@dataclass
+class DropPublication(Change):
+    """Drop a publication."""
+
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = f"Drop publication {self.name}"
+
+    def to_sql(self) -> str:
+        return f"DROP PUBLICATION IF EXISTS {quote_ident(self.name)};"
+
+
+@dataclass
+class AlterPublicationOptions(Change):
+    """`ALTER PUBLICATION ... SET (publish = ..., ...)`."""
+
+    publication: Publication = field(default_factory=lambda: Publication(name=""))
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.publication.name
+        if not self.description:
+            self.description = f"Set options of publication {self.publication.name}"
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER PUBLICATION {quote_ident(self.publication.name)} "
+            f"SET {_publication_options_sql(self.publication)};"
+        )
+
+
+@dataclass
+class AddPublicationObjects(Change):
+    """`ALTER PUBLICATION ... ADD TABLE ..., TABLES IN SCHEMA ...`."""
+
+    name: str = ""
+    tables: list[PublicationTable] = field(default_factory=list)
+    schemas: list[str] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            added = [t.qualified_name for t in self.tables] + [
+                f"schema {s}" for s in self.schemas
+            ]
+            self.description = f"Add {', '.join(added)} to publication {self.name}"
+
+    def to_sql(self) -> str:
+        objects = _publication_objects_sql(self.tables, self.schemas)
+        return f"ALTER PUBLICATION {quote_ident(self.name)} ADD {objects};"
+
+
+@dataclass
+class DropPublicationObjects(Change):
+    """Remove tables and schemas from a publication.
+
+    Each table is dropped only while it is still a member (see
+    `_drop_publication_table_body`).
+    """
+
+    name: str = ""
+    tables: list[PublicationTable] = field(default_factory=list)
+    schemas: list[str] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            removed = [t.qualified_name for t in self.tables] + [
+                f"schema {s}" for s in self.schemas
+            ]
+            self.description = (
+                f"Remove {', '.join(removed)} from publication {self.name}"
+            )
+
+    def to_sql(self) -> str:
+        statements: list[str] = []
+        if self.tables:
+            body = " ".join(
+                _drop_publication_table_body(self.name, t) for t in self.tables
+            )
+            statements.append(do_block(f"BEGIN {body} END"))
+        if self.schemas:
+            schemas = ", ".join(quote_ident(s) for s in self.schemas)
+            statements.append(
+                f"ALTER PUBLICATION {quote_ident(self.name)} DROP TABLES IN SCHEMA {schemas};"
+            )
+        return "\n".join(statements)
+
+
+@dataclass
+class ReplacePublicationTable(Change):
+    """Re-add a published table with a new column list or row filter.
+
+    There is no ALTER for a member's column list or filter, so the table is
+    dropped from the publication and added back in one statement.
+    """
+
+    name: str = ""
+    table: PublicationTable = field(
+        default_factory=lambda: PublicationTable(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = (
+                f"Change columns or row filter of {self.table.qualified_name} "
+                f"in publication {self.name}"
+            )
+
+    def to_sql(self) -> str:
+        add = (
+            f"ALTER PUBLICATION {quote_ident(self.name)} ADD "
+            f"{_publication_objects_sql([self.table])}"
+        )
+        body = _drop_publication_table_body(self.name, self.table)
+        return do_block(f"BEGIN {body} EXECUTE {quote_literal(add)}; END")
+
+
+# =============================================================================
+# Extension Changes
+# =============================================================================
+
+
+@dataclass
+class CreateExtension(Change):
+    """`CREATE EXTENSION`, with the schema and version the declaration names."""
+
+    extension: Extension = field(default_factory=lambda: Extension(name=""))
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EXTENSION"
+
+    def __post_init__(self):
+        self.object_name = self.extension.name
+        if not self.description:
+            self.description = f"Create extension {self.extension.name}"
+
+    def to_sql(self) -> str:
+        ext = self.extension
+        sql = f"CREATE EXTENSION IF NOT EXISTS {quote_ident(ext.name)}"
+        if ext.schema is not None:
+            sql += f" WITH SCHEMA {quote_ident(ext.schema)}"
+        if ext.version is not None:
+            sql += f" VERSION {quote_literal(ext.version)}"
+        if ext.cascade:
+            sql += " CASCADE"
+        return sql + ";"
+
+
+@dataclass
+class AlterExtensionUpdate(Change):
+    """`ALTER EXTENSION ... UPDATE TO` the declared version."""
+
+    name: str = ""
+    version: str = ""
+    current_version: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EXTENSION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = (
+                f"Update extension {self.name} from {self.current_version} "
+                f"to {self.version}"
+            )
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER EXTENSION {quote_ident(self.name)} "
+            f"UPDATE TO {quote_literal(self.version)};"
+        )
+
+
+@dataclass
+class AlterExtensionSchema(Change):
+    """`ALTER EXTENSION ... SET SCHEMA` (relocatable extensions only)."""
+
+    name: str = ""
+    schema: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EXTENSION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = f"Move extension {self.name} to schema {self.schema}"
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER EXTENSION {quote_ident(self.name)} "
+            f"SET SCHEMA {quote_ident(self.schema)};"
+        )
+
+
+@dataclass
+class DropExtension(Change):
+    """Drop an extension a `-- @drop extension:NAME` directive consents to.
+
+    Never CASCADE: while a column, function or view still uses one of the
+    extension's objects, PostgreSQL refuses, and the run fails rather than
+    dropping data along with it.
+    """
+
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EXTENSION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = (
+                f"Drop extension {self.name} (@drop extension:{self.name})"
+            )
+
+    def to_sql(self) -> str:
+        return f"DROP EXTENSION IF EXISTS {quote_ident(self.name)};"
+
+
+# =============================================================================
+# Foreign Data Changes
+# =============================================================================
+
+
+def _server_ident(name: str) -> str:
+    return quote_ident(name)
+
+
+@dataclass
+class CreateForeignServer(Change):
+    """`CREATE SERVER ... FOREIGN DATA WRAPPER ... OPTIONS (...)`."""
+
+    server: ForeignServer = field(
+        default_factory=lambda: ForeignServer(name="", fdw="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SERVER"
+
+    def __post_init__(self):
+        self.object_name = self.server.name
+        if not self.description:
+            self.description = (
+                f"Create server {self.server.name} (foreign data wrapper "
+                f"{self.server.fdw})"
+            )
+
+    def to_sql(self) -> str:
+        srv = self.server
+        sql = f"CREATE SERVER {_server_ident(srv.name)}"
+        if srv.type is not None:
+            sql += f" TYPE {quote_literal(srv.type)}"
+        if srv.version is not None:
+            sql += f" VERSION {quote_literal(srv.version)}"
+        sql += f" FOREIGN DATA WRAPPER {quote_ident(srv.fdw)}"
+        options = fdw_options_sql(srv.options)
+        if options:
+            sql += f" {options}"
+        return sql + ";"
+
+
+@dataclass
+class AlterForeignServer(Change):
+    """`ALTER SERVER ... [VERSION ...] OPTIONS (ADD/SET/DROP ...)`."""
+
+    server: ForeignServer = field(
+        default_factory=lambda: ForeignServer(name="", fdw="")
+    )
+    current_options: dict[str, str] = field(default_factory=dict)
+    # Write VERSION: the declaration names one the server does not have.
+    set_version: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SERVER"
+
+    def __post_init__(self):
+        self.object_name = self.server.name
+        if not self.description:
+            what: list[str] = []
+            if self.set_version:
+                what.append("version")
+            if alter_fdw_options_sql(self.server.options, self.current_options):
+                what.append("options")
+            self.description = (
+                f"Alter {' and '.join(what) or 'nothing'} of server {self.server.name}"
+            )
+
+    def to_sql(self) -> str:
+        sql = f"ALTER SERVER {_server_ident(self.server.name)}"
+        if self.set_version and self.server.version is not None:
+            sql += f" VERSION {quote_literal(self.server.version)}"
+        options = alter_fdw_options_sql(self.server.options, self.current_options)
+        if options:
+            sql += f" {options}"
+        return sql + ";"
+
+
+@dataclass
+class CreateUserMapping(Change):
+    """`CREATE USER MAPPING FOR ... SERVER ... OPTIONS (...)`.
+
+    Options may hold a password, so the display SQL masks every value but
+    the ones listed in USER_MAPPING_PUBLIC_OPTIONS.
+    """
+
+    mapping: UserMapping = field(
+        default_factory=lambda: UserMapping(server="", user="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "USER MAPPING"
+
+    def __post_init__(self):
+        self.object_name = f"{self.mapping.user}@{self.mapping.server}"
+        if not self.description:
+            self.description = f"Create user mapping for {self.mapping.label}"
+
+    def to_sql(self) -> str:
+        return self._sql(mask=False)
+
+    def to_display_sql(self) -> str:
+        return self._sql(mask=True)
+
+    def _sql(self, mask: bool) -> str:
+        m = self.mapping
+        sql = f"CREATE USER MAPPING FOR {m.user_sql} SERVER {_server_ident(m.server)}"
+        masked = m.secret_options if mask else frozenset()
+        options = fdw_options_sql(m.options or {}, masked)
+        if options:
+            sql += f" {options}"
+        return sql + ";"
+
+
+@dataclass
+class AlterUserMapping(Change):
+    """`ALTER USER MAPPING ... OPTIONS (ADD/SET/DROP ...)`, values masked for display."""
+
+    mapping: UserMapping = field(
+        default_factory=lambda: UserMapping(server="", user="")
+    )
+    current_options: dict[str, str] = field(default_factory=dict)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "USER MAPPING"
+
+    def __post_init__(self):
+        self.object_name = f"{self.mapping.user}@{self.mapping.server}"
+        if not self.description:
+            names = option_names_changed(
+                self.mapping.options or {}, self.current_options
+            )
+            self.description = (
+                f"Alter options ({', '.join(names)}) of user mapping for "
+                f"{self.mapping.label}"
+            )
+
+    def to_sql(self) -> str:
+        return self._sql(mask=False)
+
+    def to_display_sql(self) -> str:
+        return self._sql(mask=True)
+
+    def _sql(self, mask: bool) -> str:
+        m = self.mapping
+        masked = m.secret_options if mask else frozenset()
+        options = alter_fdw_options_sql(m.options or {}, self.current_options, masked)
+        return (
+            f"ALTER USER MAPPING FOR {m.user_sql} SERVER {_server_ident(m.server)} "
+            f"{options};"
+        )
+
+
+@dataclass
+class DropUserMapping(Change):
+    """Drop a managed role's user mapping that is no longer declared."""
+
+    mapping: UserMapping = field(
+        default_factory=lambda: UserMapping(server="", user="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "USER MAPPING"
+
+    def __post_init__(self):
+        self.object_name = f"{self.mapping.user}@{self.mapping.server}"
+        if not self.description:
+            self.description = f"Drop user mapping for {self.mapping.label}"
+
+    def to_sql(self) -> str:
+        m = self.mapping
+        return f"DROP USER MAPPING IF EXISTS FOR {m.user_sql} SERVER {_server_ident(m.server)};"
+
+
+def _foreign_table_ident(schema: str, name: str) -> str:
+    return f"{quote_ident(schema)}.{quote_ident(name)}"
+
+
+def foreign_column_sql(column: Column, options: Optional[dict[str, str]]) -> str:
+    """One column of a CREATE FOREIGN TABLE or an ADD COLUMN."""
+    sql = f"{quote_ident(column.name)} {column.type}"
+    rendered = fdw_options_sql(options or {})
+    if rendered:
+        sql += f" {rendered}"
+    if not column.nullable:
+        sql += " NOT NULL"
+    if column.generated:
+        sql += f" GENERATED ALWAYS AS ({column.generated}) STORED"
+    elif column.default:
+        sql += f" DEFAULT {column.default}"
+    return sql
+
+
+def _create_foreign_table_sql(table: ForeignTable) -> str:
+    """`CREATE FOREIGN TABLE ... SERVER ... OPTIONS (...)` (no trailing `;`)."""
+    columns = ",\n".join(
+        f"    {foreign_column_sql(col, table.column_options.get(col.name))}"
+        for col in table.columns.values()
+    )
+    sql = (
+        f"CREATE FOREIGN TABLE {_foreign_table_ident(table.schema, table.name)} "
+        f"(\n{columns}\n) SERVER {_server_ident(table.server)}"
+    )
+    options = fdw_options_sql(table.options)
+    if options:
+        sql += f" {options}"
+    return sql
+
+
+@dataclass
+class CreateForeignTable(Change):
+    """Create a foreign table with its columns, server and options."""
+
+    table: ForeignTable = field(
+        default_factory=lambda: ForeignTable(schema="public", name="", server="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "FOREIGN TABLE"
+
+    def __post_init__(self):
+        self.object_name = self.table.qualified_name
+        if not self.description:
+            self.description = (
+                f"Create foreign table {self.table.qualified_name} "
+                f"on server {self.table.server}"
+            )
+
+    def to_sql(self) -> str:
+        return _create_foreign_table_sql(self.table) + ";"
+
+
+@dataclass
+class AlterForeignTable(Change):
+    """One `ALTER FOREIGN TABLE` carrying every column and option action.
+
+    A foreign table holds no rows locally, so adding, dropping and retyping
+    columns only changes the catalog; none of it needs `--offline` or `@drop`.
+    `actions` are rendered, quoted SQL fragments built by the differ.
+    """
+
+    schema: str = "public"
+    table_name: str = ""
+    actions: list[str] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "FOREIGN TABLE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table_name}"
+        if not self.description:
+            self.description = f"Alter foreign table {self.object_name}"
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER FOREIGN TABLE {_foreign_table_ident(self.schema, self.table_name)} "
+            + ", ".join(self.actions)
+            + ";"
+        )
+
+
+@dataclass
+class DropForeignTable(Change):
+    """Drop an undeclared foreign table. No rows live locally, so no `@drop`.
+
+    No CASCADE: a view still reading from it makes PostgreSQL refuse, which
+    the executor retries while that view is dropped in the same run.
+    """
+
+    schema: str = "public"
+    table_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "FOREIGN TABLE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table_name}"
+        if not self.description:
+            self.description = f"Drop foreign table {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP FOREIGN TABLE IF EXISTS {_foreign_table_ident(self.schema, self.table_name)};"
+
+
+@dataclass
+class DropAndCreateForeignTable(Change):
+    """Recreate a foreign table whose server changed (there is no ALTER for it).
+
+    The drop, the create and the replayed grants are one DO block, for the
+    reason DropAndCreateView gives.
+    """
+
+    table: ForeignTable = field(
+        default_factory=lambda: ForeignTable(schema="public", name="", server="")
+    )
+    grants: list[Grant] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "FOREIGN TABLE"
+
+    def __post_init__(self):
+        self.object_name = self.table.qualified_name
+        if not self.description:
+            self.description = (
+                f"Drop and recreate foreign table {self.table.qualified_name} "
+                f"on server {self.table.server}"
+            )
+
+    def to_sql(self) -> str:
+        t = self.table
+        inner = (
+            f"DROP FOREIGN TABLE IF EXISTS {_foreign_table_ident(t.schema, t.name)};"
+        )
+        inner += _execute_sql(_create_foreign_table_sql(t))
+        inner += _replay_grants_sql(self.grants)
+        return do_block(f"BEGIN {inner} END")
+
+
+# =============================================================================
+# Ownership Changes
+# =============================================================================
+
+
+@dataclass
+class AlterOwner(Change):
+    """`ALTER <kind> ... OWNER TO role`, for an owner the schema files state.
+
+    The executor runs these after the DDL and index phases, with the comments,
+    so an object created or recreated in this run already exists in its final
+    form (a recreate resets the owner to the migrating role).
+    """
+
+    owner: ObjectOwner = field(
+        default_factory=lambda: ObjectOwner(kind="TABLE", schema="", name="", owner="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "OWNER"
+
+    def __post_init__(self):
+        self.object_name = self.owner.key
+        if not self.description:
+            kind, _, target = self.owner.key.partition(":")
+            self.description = (
+                f"Set owner of {kind.lower()} {target} to {self.owner.owner}"
+            )
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER {self.owner.target_sql} OWNER TO {quote_ident(self.owner.owner)};"
+        )

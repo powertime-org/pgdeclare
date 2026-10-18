@@ -5,9 +5,100 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
-## [Unreleased]
+## [0.1.1] - 2026-10-18
 
 ### Added
+
+- `--prove` (`diff --prove`, `apply --dry-run --prove`): rehearse the real
+  run, pending `@migrate` blocks included, on a throwaway clone of the
+  target; it fails if a second diff still finds work or a table lost rows
+  without a `@drop` directive.
+- Standalone sequences (`CREATE SEQUENCE`) in the managed schemas: created
+  with every option spelled out, options converged with `ALTER SEQUENCE`
+  (never `RESTART`, so the current value is kept), `OWNED BY` a column, and
+  dropped when undeclared (without `CASCADE`, so a default still using one
+  refuses the drop). Sequences are created before tables, so a `nextval()`
+  column default resolves; identity-column sequences stay with their column.
+- Grants to managed roles on sequences (`USAGE`, `SELECT`, `UPDATE`).
+- Domains (`CREATE DOMAIN`): created; default, NOT NULL and CHECK
+  constraints altered in place; a base type or collation change drops and
+  re-creates the domain while nothing uses it, and is refused naming the
+  dependents otherwise; dropped when undeclared.
+- Materialized views: created `WITH DATA` or `WITH NO DATA` as declared,
+  storage options converged in place, a changed query dropped and re-created
+  (offline) with its indexes and grants in the same statement; grants on
+  them are managed.
+- Comments (`COMMENT ON`) on the managed objects: created, updated and
+  removed, in a phase after the DDL and index builds, and written again for
+  an object the run recreates.
+- Procedures, aggregates and window functions are managed like functions:
+  created, replaced with `CREATE OR REPLACE` when the signature, return type
+  and kind are unchanged, otherwise dropped and re-created, and dropped when
+  undeclared. Aggregates are rendered from `pg_aggregate`, built after the
+  functions they call, and re-created when one of those is dropped. Grants to
+  managed roles use `ON PROCEDURE` for procedures, and `COMMENT ON PROCEDURE`
+  and `COMMENT ON AGGREGATE` are managed.
+- Default privileges (`ALTER DEFAULT PRIVILEGES [FOR ROLE] [IN SCHEMA] GRANT
+  ... ON TABLES | SEQUENCES | FUNCTIONS | ROUTINES | TYPES | SCHEMAS`) granted
+  to managed roles, schema-less or in a managed schema: declaring grants,
+  removing revokes, a change converges. The plan database runs them before
+  the other statements, so every declared object they cover gets the grant.
+- Range types (`CREATE TYPE ... AS RANGE`) in the managed schemas, with
+  their multirange: created with every option (subtype, operator class,
+  collation, canonical and subtype_diff functions, multirange name); dropped
+  and recreated on a change while nothing uses them, otherwise refused naming
+  the dependents; dropped when undeclared, after the columns using them.
+  Comments on them are managed.
+- Collations (`CREATE COLLATION`, libc, ICU and builtin providers) in the
+  managed schemas: created, recreated on a change while nothing uses them
+  (refused naming the dependents otherwise), dropped when undeclared after
+  everything using them. Comments on them are managed.
+- Column collations are compared and converged (`ALTER COLUMN ... TYPE ...
+  COLLATE`), and a new table or column is created with its declared
+  `COLLATE`, which used to be dropped.
+- Publications: created, converged in place (`ALTER PUBLICATION ... ADD` /
+  `DROP` tables and `TABLES IN SCHEMA`, column lists and row filters on
+  PostgreSQL 15+, `SET (...)` publish options) and dropped when undeclared,
+  but only when every table they publish is managed. `FOR ALL TABLES` and
+  empty publications are never dropped unless declared. Subscriptions are not
+  managed.
+- Rewrite rules on tables (`CREATE OR REPLACE RULE`, enabled state), never a
+  view's `_RETURN` rule.
+- Event triggers (event, `WHEN TAG` filter, function, enabled state); an
+  undeclared one is dropped only when its function is in a managed schema.
+  Creating one needs a superuser.
+- Declarative partitioning: partitioned tables (`PARTITION BY RANGE`, `LIST`,
+  `HASH`) and their partitions (`PARTITION OF ... FOR VALUES` or `DEFAULT`,
+  sub-partitioned ones included). Columns, defaults, NOT NULL, constraints,
+  indexes and triggers a partition inherits are not diffed on the partition.
+  A changed bound is a `DETACH` and `ATTACH` (offline). A partition the schema
+  files do not declare, such as one pg_partman created, is never dropped; the
+  output notes it. An index on a partitioned table is built `CONCURRENTLY` on
+  each partition and attached to an `ON ONLY` parent index. Converting a table
+  to or from partitioned, or changing its partition key, is refused with an
+  error pointing to `@migrate-before`.
+- Foreign data: foreign tables in the managed schemas (created, altered with
+  one `ALTER FOREIGN TABLE`, recreated on a new server, dropped when
+  undeclared), foreign servers and user mappings (created and their options
+  converged; servers are never dropped, a managed role's undeclared mapping on
+  a declared server is). User-mapping option values other than `user` and
+  `password_required` are masked in `diff`, JSON, dry-run, prove output and
+  logs, and a secret option the declaration omits is left alone.
+- Extensions are modelled: declared ones are created with their schema,
+  version and `CASCADE`, a declared version is reached with `ALTER EXTENSION
+  ... UPDATE TO`, and an undeclared extension is reported as a note rather
+  than dropped, unless a `-- @drop extension:NAME` directive consents. The CLI
+  no longer installs declared extensions in the target before the run; the
+  diff does, so `diff` shows them.
+- Opt-in ownership (`manage_ownership`, `--manage-ownership`): an owner the
+  schema files state with `ALTER ... OWNER TO`, when it is a managed role, is
+  converged on tables (partitioned ones too), foreign tables, views,
+  materialized views, sequences, functions, procedures, aggregates, enum,
+  composite and range types, domains, collations and the managed schemas,
+  including after a recreate. The owner's implicit privileges are left out of
+  the grant diff on that exact object only (kind and, for a routine,
+  signature), so a grant to the owner on a same-named object or another
+  overload is still converged.
 
 ### Changed
 
@@ -17,9 +108,16 @@ may change in minor releases.
 
 ### Fixed
 
-- A `DROP` that fails because another object still depends on it
-  (`2BP01`) is retried after the rest, like a missing dependency, so dropping
-  a stack of views no longer depends on the order they were listed in.
+- `CREATE TABLE` quotes inline constraint names, so a name with a quote in it
+  stays a name instead of breaking (or injecting into) the statement.
+- A `DROP` written without `CASCADE` that fails because another object
+  still depends on it (`2BP01`) is retried after the rest, like a missing
+  dependency: views, materialized views, domains, range types, collations,
+  extensions and foreign tables. Dropping a stack of views no longer depends
+  on the order they were listed in.
+- Grants on functions, procedures and aggregates name the overload, so a
+  grant on one of several functions sharing a name is diffed and applied on
+  that one instead of failing as ambiguous.
 - No `REVOKE` is planned on a table, view or materialized view the same run
   drops; it used to fail on the missing relation and leave the run stuck.
 - `serial` and `bigserial` columns on a fresh database: the table's
@@ -94,5 +192,6 @@ First real release: a schema engine proven in production, extracted and made gen
 
 Placeholder release to reserve the name on PyPI. No functionality.
 
+[0.1.1]: https://github.com/powertime-org/pgdeclare/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/powertime-org/pgdeclare/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/powertime-org/pgdeclare/releases/tag/v0.0.1

@@ -211,7 +211,7 @@ class TestChanges:
         sql = change.to_sql()
 
         # PK constraint should be included inline
-        assert "CONSTRAINT post_pkey PRIMARY KEY (id)" in sql
+        assert 'CONSTRAINT "post_pkey" PRIMARY KEY (id)' in sql
 
         # FK constraint should NOT be included inline
         assert "post_last_comment_fkey" not in sql
@@ -250,7 +250,7 @@ class TestChanges:
         )
         sql = CreateTable(table=table).to_sql()
 
-        assert "CONSTRAINT enrollment_pkey PRIMARY KEY (course_id, student_id)" in sql
+        assert 'CONSTRAINT "enrollment_pkey" PRIMARY KEY (course_id, student_id)' in sql
         assert "enrollment_course_id_student_id_key" not in sql
 
     def test_differ_adds_unique_constraints_for_new_tables(self):
@@ -2037,6 +2037,33 @@ class TestFunctionPublicExecute:
         changes = compute_diff(desired, actual, locked_functions={"sec_thing"})
 
         assert not [c for c in changes if isinstance(c, RevokePublicExecute)]
+
+    def test_a_new_overload_does_not_absorb_the_lockdown(self):
+        """A same-name overload created this run must not take the locked one's flag."""
+        locked = self._secdef("sec_thing", args="integer")
+        overload = Function(
+            schema="public",
+            name="sec_thing",
+            args="text",
+            full_definition="CREATE FUNCTION sec_thing(text) ...",
+            definition_hash="h2",
+            security_definer=False,
+            public_execute=True,
+        )
+        desired = Schema(
+            functions={locked.signature: locked, overload.signature: overload}
+        )
+        actual = Schema(
+            functions={locked.signature: self._secdef("sec_thing", "integer")}
+        )
+
+        changes = compute_diff(desired, actual, locked_functions={"sec_thing"})
+
+        revokes = [c for c in changes if isinstance(c, RevokePublicExecute)]
+        assert [r.args for r in revokes] == ["integer"]
+        creates = [c for c in changes if isinstance(c, CreateFunction)]
+        assert [c.function.args for c in creates] == ["text"]
+        assert not creates[0].revoke_public_execute
 
     def test_fresh_create_sets_atomic_flag(self):
         """A locked function being created flags the CreateFunction, no standalone."""

@@ -12,6 +12,7 @@ from typing import Any, Optional, Sequence
 
 from pglast import split as pglast_split, parse_sql
 from pglast import ast
+from pglast.enums import ObjectType
 
 from .config import logger
 
@@ -44,6 +45,8 @@ class ParsedStatement:
 TRACKED_OBJECT_TYPES = {
     "TABLE",
     "FUNCTION",
+    "PROCEDURE",
+    "AGGREGATE",
     "VIEW",
     "MATERIALIZED VIEW",
     "INDEX",
@@ -53,6 +56,7 @@ TRACKED_OBJECT_TYPES = {
     "SCHEMA",
     "TYPE",
     "SEQUENCE",
+    "COLLATION",
 }
 
 # Statement types that are additive/anonymous (not tracked for duplicates)
@@ -68,6 +72,10 @@ UNTRACKED_STATEMENT_TYPES = {
     "UPDATE",
     "DELETE",
 }
+
+
+ALTER_DEFAULT_PRIVILEGES = "ALTER DEFAULT PRIVILEGES"
+_ALTER_DEFAULT_PRIVILEGES = re.compile(r"ALTER\s+DEFAULT\s+PRIVILEGES\b")
 
 
 def parse_sql_file(
@@ -243,10 +251,19 @@ def _parse_statement_metadata(
         return _parse_create_table(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
         )
-    elif stmt_upper.startswith("CREATE OR REPLACE FUNCTION") or stmt_upper.startswith(
-        "CREATE FUNCTION"
+    elif stmt_upper.startswith(
+        (
+            "CREATE OR REPLACE FUNCTION",
+            "CREATE FUNCTION",
+            "CREATE OR REPLACE PROCEDURE",
+            "CREATE PROCEDURE",
+        )
     ):
         return _parse_create_function(
+            raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
+    elif stmt_upper.startswith(("CREATE OR REPLACE AGGREGATE", "CREATE AGGREGATE")):
+        return _parse_create_aggregate(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
         )
     elif stmt_upper.startswith("CREATE OR REPLACE VIEW") or stmt_upper.startswith(
@@ -281,6 +298,10 @@ def _parse_statement_metadata(
         return _parse_create_domain(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
         )
+    elif stmt_upper.startswith("CREATE COLLATION"):
+        return _parse_create_collation(
+            raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
     elif stmt_upper.startswith("CREATE EXTENSION"):
         return _parse_create_extension(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
@@ -296,6 +317,15 @@ def _parse_statement_metadata(
     elif stmt_upper.startswith("CREATE ROLE"):
         return _parse_create_role(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
+    elif _ALTER_DEFAULT_PRIVILEGES.match(stmt_upper):
+        # Named in full: the plan build runs these before the other statements.
+        return ParsedStatement(
+            raw_sql=raw_sql,
+            statement_type=ALTER_DEFAULT_PRIVILEGES,
+            source_file=source_file,
+            line_number=line_number,
+            is_idempotent=True,
         )
     else:
         # Generic statement (GRANT, REVOKE, ALTER, DO, etc.)
@@ -320,14 +350,18 @@ def _extract_statement_type(stmt_upper: str) -> str:
     return "UNKNOWN"
 
 
-def _extract_function_arg_types(parameters: Sequence[Any] | None) -> list[str]:
+def _extract_function_arg_types(
+    parameters: Sequence[Any] | None, include_out: bool = False
+) -> list[str]:
     """
     Extract normalized argument types from pglast function parameters.
 
     pglast hands back a tuple, or None for a no-argument function; the falsy
     check below already covered both, the annotation just said otherwise.
 
-    Handles IN, INOUT, VARIADIC parameters (excludes OUT and TABLE parameters).
+    Handles IN, INOUT, VARIADIC parameters (excludes OUT and TABLE parameters,
+    unless `include_out`: a procedure's OUT parameters are part of its
+    signature).
     Normalizes type names to canonical PostgreSQL forms.
     """
     if not parameters:
@@ -340,7 +374,9 @@ def _extract_function_arg_types(parameters: Sequence[Any] | None) -> list[str]:
 
         # Skip output parameters (mode 'o' for OUT, 't' for TABLE)
         # pglast uses character codes: 'i'=IN, 'o'=OUT, 'b'=INOUT, 'v'=VARIADIC, 't'=TABLE
-        if hasattr(param, "mode") and param.mode in ("t", "o", ord("t"), ord("o")):
+        if hasattr(param, "mode") and param.mode in ("t", ord("t")):
+            continue
+        if not include_out and hasattr(param, "mode") and param.mode in ("o", ord("o")):
             continue
 
         if param.argType and param.argType.names:
@@ -426,9 +462,10 @@ def _parse_create_function(
     line_number: int,
     is_idempotent: bool,
 ) -> ParsedStatement:
-    """Parse CREATE FUNCTION statement using pglast AST."""
+    """Parse a CREATE FUNCTION or CREATE PROCEDURE statement using pglast AST."""
     object_name = None
     signature = None
+    is_procedure = False
 
     try:
         tree = parse_sql(sql_for_parsing)
@@ -446,8 +483,11 @@ def _parse_create_function(
                 elif len(funcname_parts) >= 2:
                     object_name = f"{funcname_parts[-2]}.{funcname_parts[-1]}"
 
+                is_procedure = bool(stmt.is_procedure)
                 # Extract and normalize argument types
-                arg_types = _extract_function_arg_types(stmt.parameters)
+                arg_types = _extract_function_arg_types(
+                    stmt.parameters, include_out=is_procedure
+                )
                 signature = f"{object_name}({', '.join(arg_types)})"
 
                 # Check replace from AST
@@ -458,10 +498,64 @@ def _parse_create_function(
         # Log warning - if pglast can't parse it, PostgreSQL likely can't either
         logger.warning(f"pglast failed to parse function: {e}")
 
+    kind = "PROCEDURE" if is_procedure else "FUNCTION"
     return ParsedStatement(
         raw_sql=raw_sql,
-        statement_type="CREATE FUNCTION",
-        object_type="FUNCTION",
+        statement_type=f"CREATE {kind}",
+        object_type=kind,
+        object_name=object_name,
+        signature=signature,
+        source_file=source_file,
+        line_number=line_number,
+        is_idempotent=is_idempotent,
+    )
+
+
+def _parse_create_aggregate(
+    raw_sql: str,
+    sql_for_parsing: str,
+    source_file: Optional[str],
+    line_number: int,
+    is_idempotent: bool,
+) -> ParsedStatement:
+    """Parse CREATE AGGREGATE using pglast AST.
+
+    The signature lists the direct and aggregated argument types alike, so an
+    ordered-set aggregate `pct(float8 ORDER BY anyelement)` is
+    `pct(float8, anyelement)`; `agg(*)` has none.
+    """
+    object_name = None
+    signature = None
+
+    try:
+        tree = parse_sql(sql_for_parsing)
+        for raw_stmt in tree:
+            stmt = raw_stmt.stmt
+            if (
+                isinstance(stmt, ast.DefineStmt)
+                and stmt.kind == ObjectType.OBJECT_AGGREGATE
+            ):
+                parts = [n.sval for n in stmt.defnames or () if hasattr(n, "sval")]
+                if len(parts) == 1:
+                    object_name = f"public.{parts[0]}"
+                elif len(parts) >= 2:
+                    object_name = f"{parts[-2]}.{parts[-1]}"
+                # args is (parameters, number of direct arguments). The old
+                # BASETYPE syntax has none, and its type is not worth digging
+                # out of the options: the name alone keys it.
+                if not stmt.oldstyle and stmt.args:
+                    arg_types = _extract_function_arg_types(stmt.args[0])
+                    signature = f"{object_name}({', '.join(arg_types)})"
+                if stmt.replace:
+                    is_idempotent = True
+                break
+    except Exception as e:
+        logger.warning(f"pglast failed to parse aggregate: {e}")
+
+    return ParsedStatement(
+        raw_sql=raw_sql,
+        statement_type="CREATE AGGREGATE",
+        object_type="AGGREGATE",
         object_name=object_name,
         signature=signature,
         source_file=source_file,
@@ -672,8 +766,10 @@ def _parse_create_type(
                 name = stmt.typevar.relname
                 object_name = f"{schema}.{name}"
                 break
-            elif isinstance(stmt, ast.CreateEnumStmt):
-                # Enum type: CREATE TYPE name AS ENUM (...)
+            elif isinstance(stmt, (ast.CreateEnumStmt, ast.CreateRangeStmt)):
+                # Enum or range type: CREATE TYPE name AS ENUM | RANGE (...).
+                # A shell type (CREATE TYPE name;) stays unnamed, so declaring
+                # one before a range with a canonical function is no duplicate.
                 type_parts = []
                 for name_node in stmt.typeName or []:
                     if hasattr(name_node, "sval"):
@@ -729,6 +825,41 @@ def _parse_create_domain(
         raw_sql=raw_sql,
         statement_type="CREATE DOMAIN",
         object_type="TYPE",
+        object_name=object_name,
+        source_file=source_file,
+        line_number=line_number,
+        is_idempotent=is_idempotent,
+    )
+
+
+def _parse_create_collation(
+    raw_sql: str,
+    sql_for_parsing: str,
+    source_file: Optional[str],
+    line_number: int,
+    is_idempotent: bool,
+) -> ParsedStatement:
+    """Parse CREATE COLLATION statement using pglast AST."""
+    object_name = None
+
+    try:
+        tree = parse_sql(sql_for_parsing)
+        for raw_stmt in tree:
+            stmt = raw_stmt.stmt
+            if isinstance(stmt, ast.DefineStmt):
+                parts = [n.sval for n in stmt.defnames or () if hasattr(n, "sval")]
+                if len(parts) == 1:
+                    object_name = f"public.{parts[0]}"
+                elif len(parts) >= 2:
+                    object_name = f"{parts[-2]}.{parts[-1]}"
+                break
+    except Exception:
+        pass  # If pglast fails, PostgreSQL would fail too
+
+    return ParsedStatement(
+        raw_sql=raw_sql,
+        statement_type="CREATE COLLATION",
+        object_type="COLLATION",
         object_name=object_name,
         source_file=source_file,
         line_number=line_number,
