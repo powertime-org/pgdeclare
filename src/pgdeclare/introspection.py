@@ -1734,7 +1734,7 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                     AS object_type,
                 g.privilege_type,
                 g.grantee,
-                NULL AS column_name
+                pg_get_function_identity_arguments(p.oid) AS args
             FROM information_schema.role_routine_grants g
             LEFT JOIN pg_proc p
               ON p.oid = substring(g.specific_name::text from '_([0-9]+)$')::oid
@@ -1753,6 +1753,7 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                     privilege=row["privilege_type"],
                     grantee=row["grantee"],
                     column=None,
+                    args=row["args"],
                 )
             )
 
@@ -2319,13 +2320,17 @@ def _query_owners(conn, schemas: list[str]) -> list[ObjectOwner]:
                     AND d.deptype IN ('a', 'i')
               ))
             UNION ALL
-            SELECT 'FUNCTION', n.nspname, p.proname,
+            SELECT CASE p.prokind
+                       WHEN 'p' THEN 'PROCEDURE'
+                       WHEN 'a' THEN 'AGGREGATE'
+                       ELSE 'FUNCTION'
+                   END,
+                   n.nspname, p.proname,
                    pg_get_function_identity_arguments(p.oid),
                    pg_get_userbyid(p.proowner)
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = ANY(%(schemas)s)
-              AND p.prokind = 'f'
               AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_proc", oid="p.oid")}
             UNION ALL
             SELECT CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
@@ -2334,8 +2339,15 @@ def _query_owners(conn, schemas: list[str]) -> list[ObjectOwner]:
             JOIN pg_namespace n ON n.oid = t.typnamespace
             LEFT JOIN pg_class c ON c.oid = t.typrelid
             WHERE n.nspname = ANY(%(schemas)s)
-              AND (t.typtype IN ('e', 'd') OR (t.typtype = 'c' AND c.relkind = 'c'))
+              AND (t.typtype IN ('e', 'd', 'r') OR (t.typtype = 'c' AND c.relkind = 'c'))
               AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_type", oid="t.oid")}
+            UNION ALL
+            SELECT 'COLLATION', n.nspname, co.collname, '',
+                   pg_get_userbyid(co.collowner)
+            FROM pg_collation co
+            JOIN pg_namespace n ON n.oid = co.collnamespace
+            WHERE n.nspname = ANY(%(schemas)s)
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_collation", oid="co.oid")}
             UNION ALL
             SELECT 'SCHEMA', '', n.nspname, '', pg_get_userbyid(n.nspowner)
             FROM pg_namespace n

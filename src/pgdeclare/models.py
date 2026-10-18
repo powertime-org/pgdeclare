@@ -768,13 +768,36 @@ class Grant:
     privilege: str  # SELECT, INSERT, UPDATE, DELETE, EXECUTE, USAGE, etc.
     grantee: str  # Role receiving the grant
     column: Optional[str] = None  # For column-level grants
+    # Routines only: the identity signature (pg_get_function_identity_arguments),
+    # so each overload is its own object. None when unknown (a grant built by
+    # hand), which names the routine without arguments.
+    args: Optional[str] = None
+
+    @property
+    def object_sql(self) -> str:
+        """The routine as GRANT names it: with its signature when that is known.
+
+        An ordered-set aggregate's identity arguments (`... ORDER BY ...`) are
+        not valid in GRANT, so such a routine is named without them.
+        """
+        name = f"{quote_ident(self.schema)}.{quote_ident(self.object_name)}"
+        if self.args is None or "ORDER BY" in self.args:
+            return name
+        return f"{name}({self.args})"
+
+    @property
+    def target(self) -> str:
+        """The object this grant is on, without privilege or grantee."""
+        if self.column:
+            return f"{self.object_type}:{self.schema}.{self.object_name}:{self.column}"
+        if self.args is not None:
+            return f"{self.object_type}:{self.schema}.{self.object_name}({self.args})"
+        return f"{self.object_type}:{self.schema}.{self.object_name}"
 
     @property
     def key(self) -> str:
         """Unique key for grant lookup."""
-        if self.column:
-            return f"{self.object_type}:{self.schema}.{self.object_name}:{self.column}:{self.privilege}:{self.grantee}"
-        return f"{self.object_type}:{self.schema}.{self.object_name}:{self.privilege}:{self.grantee}"
+        return f"{self.target}:{self.privilege}:{self.grantee}"
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Grant):
@@ -1121,11 +1144,16 @@ OWNER_KINDS = frozenset(
         "MATERIALIZED VIEW",
         "SEQUENCE",
         "FUNCTION",
+        "PROCEDURE",
+        "AGGREGATE",
         "TYPE",
         "DOMAIN",
+        "COLLATION",
         "SCHEMA",
     }
 )
+# Owner kinds that name a routine, with its identity arguments.
+ROUTINE_OWNER_KINDS = frozenset({"FUNCTION", "PROCEDURE", "AGGREGATE"})
 
 
 @dataclass
@@ -1133,7 +1161,8 @@ class ObjectOwner:
     """The owner of a managed object (`pg_class.relowner` and friends).
 
     `kind` is one of OWNER_KINDS. A schema has its name in `name` and an
-    empty `schema`; a function carries its identity arguments in `args`.
+    empty `schema`; a function, procedure or aggregate (a window function is a
+    FUNCTION) carries its identity arguments in `args`.
     """
 
     kind: str
@@ -1146,8 +1175,8 @@ class ObjectOwner:
     def key(self) -> str:
         if self.kind == "SCHEMA":
             return f"SCHEMA:{self.name}"
-        if self.kind == "FUNCTION":
-            return f"FUNCTION:{self.schema}.{self.name}({self.args})"
+        if self.kind in ROUTINE_OWNER_KINDS:
+            return f"{self.kind}:{self.schema}.{self.name}({self.args})"
         return f"{self.kind}:{self.schema}.{self.name}"
 
     @property
@@ -1158,8 +1187,10 @@ class ObjectOwner:
         if self.kind == "SCHEMA":
             return f"SCHEMA {quote_ident(self.name)}"
         qualified = f"{quote_ident(self.schema)}.{quote_ident(self.name)}"
-        if self.kind == "FUNCTION":
-            return f"FUNCTION {qualified}({self.args})"
+        if self.kind in ROUTINE_OWNER_KINDS:
+            # A zero-argument aggregate is spelled `(*)`.
+            args = "*" if self.kind == "AGGREGATE" and not self.args else self.args
+            return f"{self.kind} {qualified}({args})"
         return f"{self.kind} {qualified}"
 
 
@@ -1313,12 +1344,19 @@ class Schema:
             return relation in self.materialized_views
         if kind == "SEQUENCE":
             return relation in self.sequences
-        if kind == "FUNCTION":
-            return f"{relation}({owner.args})" in self.functions
+        if kind in ROUTINE_OWNER_KINDS:
+            func = self.functions.get(f"{relation}({owner.args})")
+            return func is not None and func.keyword == kind
         if kind == "TYPE":
-            return relation in self.enums or relation in self.composite_types
+            return (
+                relation in self.enums
+                or relation in self.composite_types
+                or relation in self.ranges
+            )
         if kind == "DOMAIN":
             return relation in self.domains
+        if kind == "COLLATION":
+            return relation in self.collations
         # Schemas: the caller only asks about managed ones.
         return kind == "SCHEMA"
 

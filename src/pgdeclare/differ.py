@@ -125,6 +125,7 @@ from .changes import (
 from .config import PgDeclareConfig, resolve
 from .quoting import quote_ident
 from .models import (
+    ROUTINE_OWNER_KINDS,
     ChangeCategory,
     Column,
     Comment,
@@ -189,13 +190,13 @@ def compute_diff(
         desired = dataclass_replace(
             desired,
             grants=[
-                g for g in desired.grants if _grant_owner_key(g) not in owner_grants
+                g for g in desired.grants if not _is_stated_owner_grant(g, owner_grants)
             ],
         )
         actual = dataclass_replace(
             actual,
             grants=[
-                g for g in actual.grants if _grant_owner_key(g) not in owner_grants
+                g for g in actual.grants if not _is_stated_owner_grant(g, owner_grants)
             ],
         )
 
@@ -321,6 +322,12 @@ def compute_diff(
                     recreate, (DropAndCreateMaterializedView, DropAndCreateForeignTable)
                 ) and not _is_relation_grant(grant):
                     continue
+                if (
+                    isinstance(recreate, DropAndCreateFunction)
+                    and grant.args is not None
+                    and grant.args != recreate.function.args
+                ):
+                    continue  # another overload of the same name
                 recreate.grants.append(grant)
         # Say so in the plan, so a recreate's ACL work is visible.
         for recreated in recreations.values():
@@ -2476,8 +2483,8 @@ def _owner_keys_rebuilt(changes: list[Change]) -> set[str]:
     keys: set[str] = set()
 
     def mark(kind: str, schema: str, name: str, args: str = "") -> None:
-        if kind == "FUNCTION":
-            keys.add(f"FUNCTION:{schema}.{name}({args})")
+        if kind in ROUTINE_OWNER_KINDS:
+            keys.add(f"{kind}:{schema}.{name}({args})")
         else:
             keys.add(f"{kind}:{schema}.{name}")
 
@@ -2494,13 +2501,17 @@ def _owner_keys_rebuilt(changes: list[Change]) -> set[str]:
             mark("SEQUENCE", c.sequence.schema, c.sequence.name)
         elif isinstance(c, (CreateFunction, DropAndCreateFunction)):
             f = c.function
-            mark("FUNCTION", f.schema, f.name, f.args)
+            mark(f.keyword, f.schema, f.name, f.args)
         elif isinstance(c, CreateEnum):
             mark("TYPE", c.enum.schema, c.enum.name)
         elif isinstance(c, CreateCompositeType):
             mark("TYPE", c.composite_type.schema, c.composite_type.name)
         elif isinstance(c, (CreateDomain, DropAndCreateDomain)):
             mark("DOMAIN", c.domain.schema, c.domain.name)
+        elif isinstance(c, (CreateRangeType, DropAndCreateRangeType)):
+            mark("TYPE", c.range_type.schema, c.range_type.name)
+        elif isinstance(c, (CreateCollation, DropAndCreateCollation)):
+            mark("COLLATION", c.collation.schema, c.collation.name)
         if isinstance(c, (DropAndCreateView, DropAndCreateMaterializedView)):
             for dep in c.dependents:
                 if dep.relation is not None:
@@ -2528,13 +2539,47 @@ def _diff_owners(
     return result
 
 
-def _stated_owner_grants(desired: Schema) -> set[tuple[str, str, str]]:
-    """`(schema, object name, owner)` for every owner the schema files state."""
-    return {
-        (o.name, o.name, o.owner) if o.kind == "SCHEMA" else (o.schema, o.name, o.owner)
-        for o in desired.owners.values()
-    }
+# Owner kind -> the grant object types its implicit privileges read back as.
+# Relations of every kind read back as TABLE (and their columns as COLUMN), an
+# aggregate or window function as FUNCTION. Types, domains and collations have
+# no modelled grants.
+_OWNER_GRANT_TYPES: dict[str, tuple[str, ...]] = {
+    "SCHEMA": ("SCHEMA",),
+    "TABLE": ("TABLE", "COLUMN"),
+    "VIEW": ("TABLE", "COLUMN"),
+    "MATERIALIZED VIEW": ("TABLE", "COLUMN"),
+    "FOREIGN TABLE": ("TABLE", "COLUMN"),
+    "SEQUENCE": ("SEQUENCE",),
+    "FUNCTION": ("FUNCTION",),
+    "PROCEDURE": ("PROCEDURE",),
+    "AGGREGATE": ("FUNCTION",),
+}
+
+# (grant object type, schema, object name, routine signature or None, owner)
+_OwnerGrantKey = tuple[str, str, str, Optional[str], str]
 
 
-def _grant_owner_key(grant: Grant) -> tuple[str, str, str]:
-    return (grant.schema, grant.object_name, grant.grantee)
+def _stated_owner_grants(desired: Schema) -> set[_OwnerGrantKey]:
+    """The exact objects whose stated owner's privileges are not grants.
+
+    Keyed by grant object type and, for a routine, its signature, so a grant
+    to the same role on another object of that name (a function named like
+    the owned table, another overload) is still diffed.
+    """
+    keys: set[_OwnerGrantKey] = set()
+    for o in desired.owners.values():
+        schema = o.name if o.kind == "SCHEMA" else o.schema
+        args = o.args if o.kind in ROUTINE_OWNER_KINDS else None
+        for grant_type in _OWNER_GRANT_TYPES.get(o.kind, ()):
+            keys.add((grant_type, schema, o.name, args, o.owner))
+    return keys
+
+
+def _is_stated_owner_grant(grant: Grant, owner_grants: set[_OwnerGrantKey]) -> bool:
+    args = grant.args
+    if grant.object_type in ("FUNCTION", "PROCEDURE") and args is None:
+        # A routine grant without a signature cannot be pinned to one
+        # overload, so it is never taken for an owner's privilege.
+        return False
+    key = (grant.object_type, grant.schema, grant.object_name, args, grant.grantee)
+    return key in owner_grants

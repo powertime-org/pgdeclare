@@ -38,6 +38,7 @@ from pgdeclare.changes import (
     DropExtension,
     DropForeignTable,
     DropUserMapping,
+    GrantPrivilege,
 )
 from pgdeclare.cli import main
 from pgdeclare.differ import undeclared_extensions
@@ -411,6 +412,66 @@ class TestOwnerDiff:
             Schema(owners={owner.key: owner}),
         )
         assert changes == []
+
+    def test_only_the_exact_owned_object_loses_its_owner_grants(self):
+        """A same-named routine or sequence, or another overload, keeps its diff."""
+        table = ObjectOwner(kind="TABLE", schema="public", name="note", owner="app")
+        func = ObjectOwner(
+            kind="FUNCTION", schema="public", name="f", args="integer", owner="app"
+        )
+
+        def grant(object_type: str, name: str, privilege: str, args=None) -> Grant:
+            return Grant(
+                object_type=object_type,
+                object_name=name,
+                schema="public",
+                privilege=privilege,
+                grantee="app",
+                args=args,
+            )
+
+        owned = [
+            grant("TABLE", "note", "SELECT"),
+            grant("FUNCTION", "f", "EXECUTE", args="integer"),
+        ]
+        others = [
+            grant("FUNCTION", "note", "EXECUTE", args="integer"),
+            grant("SEQUENCE", "note", "USAGE"),
+            grant("FUNCTION", "f", "EXECUTE", args="text"),
+        ]
+        owners = {table.key: table, func.key: func}
+        changes = compute_diff(
+            Schema(owners=owners, grants=owned + others), Schema(owners=owners)
+        )
+        assert all(isinstance(c, GrantPrivilege) for c in changes)
+        assert sorted(c.to_sql() for c in changes) == [
+            'GRANT EXECUTE ON FUNCTION "public"."f"(text) TO app;',
+            'GRANT EXECUTE ON FUNCTION "public"."note"(integer) TO app;',
+            'GRANT USAGE ON SEQUENCE "public"."note" TO app;',
+        ]
+
+        # And a grant on one of them that is no longer declared is revoked.
+        changes = compute_diff(
+            Schema(owners=owners, grants=owned), Schema(owners=owners, grants=others)
+        )
+        assert sorted(type(c).__name__ for c in changes) == ["RevokePrivilege"] * 3
+
+    def test_routine_owner_kinds(self):
+        sql = {
+            kind: AlterOwner(
+                owner=ObjectOwner(kind=kind, schema="s", name="r", args=args, owner="o")
+            ).to_sql()
+            for kind, args in (
+                ("PROCEDURE", "integer"),
+                ("AGGREGATE", ""),
+                ("COLLATION", ""),
+            )
+        }
+        assert sql == {
+            "PROCEDURE": 'ALTER PROCEDURE "s"."r"(integer) OWNER TO "o";',
+            "AGGREGATE": 'ALTER AGGREGATE "s"."r"(*) OWNER TO "o";',
+            "COLLATION": 'ALTER COLLATION "s"."r" OWNER TO "o";',
+        }
 
     def test_owner_sql_quotes_every_name(self):
         assert (
@@ -808,6 +869,18 @@ ALTER MATERIALIZED VIEW note_count OWNER TO {role};
 
 CREATE FUNCTION answer(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$;
 ALTER FUNCTION answer(integer) OWNER TO {role};
+
+CREATE PROCEDURE tidy(n integer) LANGUAGE sql AS $$ SELECT n $$;
+ALTER PROCEDURE tidy(integer) OWNER TO {role};
+
+CREATE AGGREGATE total(integer) (SFUNC = int4pl, STYPE = integer);
+ALTER AGGREGATE total(integer) OWNER TO {role};
+
+CREATE TYPE span AS RANGE (subtype = integer);
+ALTER TYPE span OWNER TO {role};
+
+CREATE COLLATION plain_c (locale = 'C');
+ALTER COLLATION plain_c OWNER TO {role};
 """
 
 OWNERS_SQL = """
@@ -815,10 +888,12 @@ SELECT c.relname, pg_get_userbyid(c.relowner) FROM pg_class c
 WHERE c.relnamespace = 'public'::regnamespace
   AND c.relname IN ('note', 'note_id_seq', 'ticket_no', 'unowned', 'note_view',
                     'note_count')
-UNION ALL SELECT 'answer', pg_get_userbyid(proowner) FROM pg_proc
-WHERE proname = 'answer'
+UNION ALL SELECT proname, pg_get_userbyid(proowner) FROM pg_proc
+WHERE proname IN ('answer', 'tidy', 'total')
 UNION ALL SELECT typname, pg_get_userbyid(typowner) FROM pg_type
-WHERE typname IN ('mood', 'short_text')
+WHERE typname IN ('mood', 'short_text', 'span')
+UNION ALL SELECT collname, pg_get_userbyid(collowner) FROM pg_collation
+WHERE collname = 'plain_c'
 UNION ALL SELECT 'schema', pg_get_userbyid(nspowner) FROM pg_namespace
 WHERE nspname = 'public'
 ORDER BY 1

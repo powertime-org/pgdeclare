@@ -2561,7 +2561,7 @@ class GrantPrivilege(Change):
         elif self.grant.column:
             return f"GRANT {self.grant.privilege} ({quote_ident(self.grant.column)}) ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         elif self.grant.object_type in ("FUNCTION", "PROCEDURE"):
-            return f"GRANT {self.grant.privilege} ON {self.grant.object_type} {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
+            return f"GRANT {self.grant.privilege} ON {self.grant.object_type} {self.grant.object_sql} TO {role_ident(self.grant.grantee)};"
         elif self.grant.object_type == "SEQUENCE":
             return f"GRANT {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         else:
@@ -2599,7 +2599,7 @@ class RevokePrivilege(Change):
             # Wrap in DO block: function may have been dropped (CASCADE removes
             # grants too), or recreated this run as the other kind of routine
             # (wrong_object_type), which took its old ACL with it.
-            revoke_sql = f"REVOKE {self.grant.privilege} ON {self.grant.object_type} {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
+            revoke_sql = f"REVOKE {self.grant.privilege} ON {self.grant.object_type} {self.grant.object_sql} FROM {role_ident(self.grant.grantee)}"
             return do_block(
                 f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_function"
                 " OR wrong_object_type THEN NULL; END"
