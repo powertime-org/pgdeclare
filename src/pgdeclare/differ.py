@@ -17,6 +17,7 @@ from .changes import (
     AlterColumnDropExpression,
     AlterColumnSetExpression,
     AlterColumnType,
+    AlterMaterializedViewOptions,
     AlterDomainDropDefault,
     AlterDomainDropNotNull,
     AlterDomainSetDefault,
@@ -30,6 +31,7 @@ from .changes import (
     CreateEnum,
     CreateFunction,
     CreateIndex,
+    CreateMaterializedView,
     CreatePolicy,
     CreateRole,
     CreateSequence,
@@ -39,9 +41,11 @@ from .changes import (
     DEFERRED_CONSTRAINT_TYPES,
     DisableRLS,
     DropAndCreateConstraint,
+    DependentRelation,
     DropAndCreateDomain,
     DropAndCreateDomainConstraint,
     DropAndCreateFunction,
+    DropAndCreateMaterializedView,
     DropAndCreatePolicy,
     DropAndCreateView,
     DropColumn,
@@ -52,6 +56,7 @@ from .changes import (
     DropFunction,
     DropIdentity,
     DropIndex,
+    DropMaterializedView,
     DropNotNull,
     DropPolicy,
     DropSequence,
@@ -71,8 +76,10 @@ from .changes import (
     SetSequenceOwner,
     SetNotNull,
     ValidateConstraint,
+    dependents_note,
     ValidateDomainConstraint,
     grant_replay_note,
+    index_rebuild_note,
 )
 from .config import PgDeclareConfig, resolve
 from .models import (
@@ -80,8 +87,12 @@ from .models import (
     Column,
     Domain,
     Function,
+    Grant,
+    Index,
+    MaterializedView,
     Schema,
     Table,
+    View,
 )
 
 
@@ -140,6 +151,7 @@ def compute_diff(
         _diff_tables(desired, actual, check_data_fn, managed_schemas=schemas)
     )
     changes.extend(_diff_views(desired, actual))
+    changes.extend(_diff_materialized_views(desired, actual))
     changes.extend(sequences_after)
     changes.extend(_diff_functions(desired, actual))
     changes.extend(_drop_domains(desired, actual))
@@ -147,6 +159,7 @@ def compute_diff(
     changes.extend(_diff_policies(desired, actual))
     changes.extend(_diff_triggers(desired, actual))
     changes.extend(_diff_grants(desired, actual))
+    changes = _skip_revokes_on_dropped_relations(changes)
 
     # Re-apply grants for objects being dropped and recreated.
     #
@@ -162,17 +175,32 @@ def compute_diff(
     # The grants are therefore carried inside the recreate's own DO block, the
     # same way the SECDEF REVOKE is atomic with the function recreate. Object
     # and ACL are one unit, so no execution order can separate them.
+    #
+    # A recreated view or materialized view also takes its dependents down with
+    # it; those ride inside the same statement too (_carry_recreate_dependents).
+    changes = _carry_recreate_dependents(changes, desired, actual)
     recreations: dict[
-        tuple[str, str], list[Union[DropAndCreateView, DropAndCreateFunction]]
+        tuple[str, str],
+        list[
+            Union[
+                DropAndCreateView, DropAndCreateFunction, DropAndCreateMaterializedView
+            ]
+        ],
     ] = {}
     for c in changes:
         if isinstance(c, DropAndCreateView):
             recreations.setdefault((c.view.schema, c.view.name), []).append(c)
         elif isinstance(c, DropAndCreateFunction):
             recreations.setdefault((c.function.schema, c.function.name), []).append(c)
+        elif isinstance(c, DropAndCreateMaterializedView):
+            recreations.setdefault((c.matview.schema, c.matview.name), []).append(c)
     if recreations:
         for grant in desired.grants:
             for recreate in recreations.get((grant.schema, grant.object_name), []):
+                if isinstance(
+                    recreate, DropAndCreateMaterializedView
+                ) and not _is_relation_grant(grant):
+                    continue
                 recreate.grants.append(grant)
         # Say so in the plan, so a recreate's ACL work is visible.
         for recreated in recreations.values():
@@ -234,6 +262,189 @@ def compute_diff(
     changes.extend(validation_changes)
 
     return changes
+
+
+def _skip_revokes_on_dropped_relations(changes: list[Change]) -> list[Change]:
+    """Leave out revokes on a table, view or materialized view this run drops.
+
+    The DROP takes the ACL with it. A REVOKE ordered after it would fail on the
+    missing relation and stay deferred until the run reported itself stuck.
+    """
+    dropped: set[tuple[str, str]] = set()
+    for c in changes:
+        if isinstance(c, DropMaterializedView):
+            dropped.add((c.schema, c.matview_name))
+        elif isinstance(c, DropView):
+            dropped.add((c.schema, c.view_name))
+        elif isinstance(c, DropTable):
+            dropped.add((c.schema, c.table_name))
+    if not dropped:
+        return changes
+    return [
+        c
+        for c in changes
+        if not (
+            isinstance(c, RevokePrivilege)
+            and _is_relation_grant(c.grant)
+            and (c.grant.schema, c.grant.object_name) in dropped
+        )
+    ]
+
+
+def _is_relation_grant(grant: Grant) -> bool:
+    """A grant on a table-like object (table, view, materialized view)."""
+    return grant.object_type in ("TABLE", "COLUMN")
+
+
+def _relation_dependent_order(root: str, dependents: dict[str, list[str]]) -> list[str]:
+    """Every view or materialized view reading from `root`, directly or not.
+
+    Returned in creation order: each one after everything it reads from, so
+    dropping in reverse and creating in order never trips over a dependency.
+    """
+    order: list[str] = []
+    seen: set[str] = set()
+
+    def visit(name: str) -> None:
+        for dependent in dependents.get(name, []):
+            if dependent not in seen:
+                seen.add(dependent)
+                visit(dependent)
+                order.append(dependent)
+
+    visit(root)
+    # Post-order puts the deepest dependents first; reversed, each relation
+    # precedes everything that reads from it.
+    order.reverse()
+    return order
+
+
+def _carry_recreate_dependents(
+    changes: list[Change], desired: Schema, actual: Schema
+) -> list[Change]:
+    """Fold a recreated relation's dependents, and a matview's indexes, into it.
+
+    DROP VIEW / DROP MATERIALIZED VIEW refuse while another view reads from the
+    object, and a materialized view's DROP takes its indexes along. The diff is
+    computed against the snapshot taken before the run, so it never sees
+    either loss. Each recreate therefore drops its dependents first and builds
+    them, their grants and their indexes back, inside its own statement.
+
+    A dependent folded into a recreate no longer needs its own recreate,
+    options change or index changes: the recreate builds it from its
+    declaration, so those changes are removed.
+    """
+    roots = [
+        c
+        for c in changes
+        if isinstance(c, (DropAndCreateView, DropAndCreateMaterializedView))
+    ]
+    if not roots:
+        return changes
+
+    def root_name(c: Union[DropAndCreateView, DropAndCreateMaterializedView]) -> str:
+        return (
+            c.view.qualified_name
+            if isinstance(c, DropAndCreateView)
+            else c.matview.qualified_name
+        )
+
+    def relation_grants(schema: str, name: str) -> list[Grant]:
+        return [
+            g
+            for g in desired.grants
+            if g.schema == schema and g.object_name == name and _is_relation_grant(g)
+        ]
+
+    def relation_indexes(schema: str, name: str) -> list[Index]:
+        return [
+            i
+            for i in desired.indexes.values()
+            if i.schema == schema and i.table == name
+        ]
+
+    plans: dict[str, list[str]] = {
+        root_name(c): _relation_dependent_order(
+            root_name(c), actual.relation_dependents
+        )
+        for c in roots
+    }
+    folded: set[str] = {name for order in plans.values() for name in order}
+
+    # Relations whose indexes a recreate rebuilds: a recreated matview, and
+    # every still-declared matview dependent.
+    rebuilt_indexes: set[str] = set()
+
+    kept: list[Change] = []
+    for c in changes:
+        if isinstance(c, (DropAndCreateView, DropAndCreateMaterializedView)):
+            name = root_name(c)
+            if name in folded:
+                continue  # Another recreate rebuilds it.
+            dependents: list[DependentRelation] = []
+            for dep_name in plans[name]:
+                matview = actual.materialized_views.get(dep_name)
+                view = actual.views.get(dep_name)
+                existing = matview if matview is not None else view
+                if existing is None:
+                    # Outside the managed schemas: it cannot be rebuilt, so
+                    # leave it in place and let the DROP report it.
+                    continue
+                relation: Optional[Union[View, MaterializedView]] = (
+                    desired.materialized_views.get(dep_name)
+                    or desired.views.get(dep_name)
+                )
+                dependent = DependentRelation(
+                    schema=existing.schema,
+                    name=existing.name,
+                    kind="m" if matview is not None else "v",
+                    relation=relation,
+                )
+                if relation is not None:
+                    dependent.grants = relation_grants(relation.schema, relation.name)
+                    if isinstance(relation, MaterializedView):
+                        dependent.indexes = relation_indexes(
+                            relation.schema, relation.name
+                        )
+                        rebuilt_indexes.add(relation.qualified_name)
+                dependents.append(dependent)
+            c.dependents = dependents
+            if isinstance(c, DropAndCreateMaterializedView):
+                c.indexes = relation_indexes(c.matview.schema, c.matview.name)
+                rebuilt_indexes.add(name)
+                c.description += index_rebuild_note(len(c.indexes))
+            if any(d.rebuilds_data for d in dependents):
+                # A view recreate that rebuilds a materialized view's data holds
+                # that lock too.
+                c.category = ChangeCategory.OFFLINE
+            c.description += dependents_note(dependents)
+            kept.append(c)
+        elif (
+            isinstance(
+                c,
+                (
+                    AlterViewOptions,
+                    AlterMaterializedViewOptions,
+                ),
+            )
+            and c.object_name in folded
+        ):
+            continue
+        else:
+            kept.append(c)
+
+    if not rebuilt_indexes:
+        return kept
+
+    def index_relation(c: Change) -> Optional[str]:
+        if isinstance(c, CreateIndex):
+            return f"{c.index.schema}.{c.index.table}"
+        if isinstance(c, DropIndex):
+            index = actual.indexes.get(f"{c.schema}.{c.index_name}")
+            return f"{index.schema}.{index.table}" if index is not None else None
+        return None
+
+    return [c for c in kept if index_relation(c) not in rebuilt_indexes]
 
 
 def _diff_function_public_execute(
@@ -940,6 +1151,38 @@ def _diff_views(desired: Schema, actual: Schema) -> list[Change]:
     for key, view in actual.views.items():
         if key not in desired.views:
             changes.append(DropView(schema=view.schema, view_name=view.name))
+
+    return changes
+
+
+def _diff_materialized_views(desired: Schema, actual: Schema) -> list[Change]:
+    """Diff materialized views between desired and actual schemas.
+
+    Only the query and the storage options are compared. Whether a live
+    materialized view is populated is runtime state (an application refreshes
+    it); `WITH [NO] DATA` from the declaration decides how a create or recreate
+    populates it.
+    """
+    changes: list[Change] = []
+
+    for key, matview in desired.materialized_views.items():
+        current = actual.materialized_views.get(key)
+        if current is None:
+            changes.append(CreateMaterializedView(matview=matview))
+        elif matview.definition.strip() != current.definition.strip():
+            changes.append(DropAndCreateMaterializedView(matview=matview))
+        elif matview.reloptions != current.reloptions:
+            changes.append(
+                AlterMaterializedViewOptions(
+                    matview=matview, current_reloptions=list(current.reloptions)
+                )
+            )
+
+    for key, matview in actual.materialized_views.items():
+        if key not in desired.materialized_views:
+            changes.append(
+                DropMaterializedView(schema=matview.schema, matview_name=matview.name)
+            )
 
     return changes
 

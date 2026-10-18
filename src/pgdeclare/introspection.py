@@ -23,6 +23,7 @@ from .models import (
     Function,
     Grant,
     Index,
+    MaterializedView,
     Policy,
     Role,
     RoleMembership,
@@ -101,6 +102,8 @@ def introspect_schema(
             views = _query_views(conn, schema)
             result.views.update(views)
 
+            result.materialized_views.update(_query_materialized_views(conn, schema))
+
             sequences = _query_sequences(conn, schema)
             result.sequences.update(sequences)
 
@@ -110,6 +113,7 @@ def introspect_schema(
 
         # Query dependencies (cross-schema)
         result.dependencies = _query_dependencies(conn, schemas)
+        result.relation_dependents = _query_relation_dependents(conn, schemas)
 
         # Query schema-level grants for all managed roles
         for role in existing_roles:
@@ -711,6 +715,94 @@ def _query_views(conn, schema: str) -> dict[str, View]:
     return views
 
 
+def _query_materialized_views(conn, schema: str) -> dict[str, MaterializedView]:
+    """Query materialized views from pg_matviews, plus storage options from pg_class."""
+    matviews: dict[str, MaterializedView] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                c.relname AS matview_name,
+                mv.definition AS matview_definition,
+                c.reloptions AS reloptions,
+                c.relispopulated AS is_populated
+            FROM pg_matviews AS mv
+            JOIN pg_namespace AS n ON n.nspname = mv.schemaname
+            JOIN pg_class AS c
+              ON c.relname = mv.matviewname
+             AND c.relnamespace = n.oid
+             AND c.relkind = 'm'
+            WHERE mv.schemaname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_class'::regclass AND ext.objid = c.oid
+                    AND ext.deptype = 'e'
+              )
+            ORDER BY c.relname
+            """,
+            (schema,),
+        )
+
+        for row in cur.fetchall():
+            matview = MaterializedView(
+                schema=schema,
+                name=row["matview_name"],
+                definition=row["matview_definition"] or "",
+                reloptions=list(row["reloptions"] or []),
+                with_data=bool(row["is_populated"]),
+            )
+            matviews[matview.qualified_name] = matview
+
+    return matviews
+
+
+def _query_relation_dependents(conn, schemas: list[str]) -> dict[str, list[str]]:
+    """Views and materialized views that read from another one, within `schemas`.
+
+    A view's query is stored as a rewrite rule, and the rule depends on every
+    relation the query reads. Only edges between views and materialized views
+    are kept: those are the ones a drop-and-recreate has to carry along.
+    """
+    dependents: dict[str, list[str]] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT
+                ref_ns.nspname AS ref_schema,
+                ref.relname AS ref_name,
+                dep_ns.nspname AS dep_schema,
+                dep.relname AS dep_name
+            FROM pg_depend AS d
+            JOIN pg_rewrite AS r ON r.oid = d.objid
+            JOIN pg_class AS dep ON dep.oid = r.ev_class
+            JOIN pg_namespace AS dep_ns ON dep_ns.oid = dep.relnamespace
+            JOIN pg_class AS ref ON ref.oid = d.refobjid
+            JOIN pg_namespace AS ref_ns ON ref_ns.oid = ref.relnamespace
+            WHERE d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_class'::regclass
+              AND d.deptype = 'n'
+              AND dep.oid <> ref.oid
+              AND dep.relkind IN ('v', 'm')
+              AND ref.relkind IN ('v', 'm')
+              AND dep_ns.nspname = ANY(%s)
+              AND ref_ns.nspname = ANY(%s)
+            ORDER BY 1, 2, 3, 4
+            """,
+            (list(schemas), list(schemas)),
+        )
+
+        for row in cur.fetchall():
+            key = f"{row['ref_schema']}.{row['ref_name']}"
+            dependents.setdefault(key, []).append(
+                f"{row['dep_schema']}.{row['dep_name']}"
+            )
+
+    return dependents
+
+
 # The sequences of a schema that the engine manages: every sequence except the
 # ones an identity column owns (pg_depend 'i'; the column manages those), the
 # ones an extension owns, and the ones whose name, or whose owning table's
@@ -876,6 +968,64 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                     schema=schema,
                     privilege=row["privilege_type"],
                     grantee=row["grantee"],
+                    column=row["column_name"],
+                )
+            )
+
+        # Materialized view grants. information_schema.role_table_grants and
+        # role_column_grants only cover tables, views and foreign tables, so
+        # read the ACLs directly. acldefault() stands in for a NULL ACL, the
+        # way information_schema does it, so an owning role reads the same.
+        cur.execute(
+            """
+            SELECT c.relname AS object_name, a.privilege_type
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a
+            JOIN pg_roles g ON g.oid = a.grantee
+            WHERE c.relkind = 'm' AND n.nspname = %s AND g.rolname = %s
+            """,
+            (schema, grantee),
+        )
+        matview_rows = cur.fetchall()
+        for row in matview_rows:
+            grants.append(
+                Grant(
+                    object_type="TABLE",
+                    object_name=row["object_name"],
+                    schema=schema,
+                    privilege=row["privilege_type"],
+                    grantee=grantee,
+                    column=None,
+                )
+            )
+        matview_grant_keys = {
+            (row["object_name"], row["privilege_type"]) for row in matview_rows
+        }
+        cur.execute(
+            """
+            SELECT c.relname AS object_name, att.attname AS column_name,
+                   a.privilege_type
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_attribute att
+              ON att.attrelid = c.oid AND att.attnum > 0 AND NOT att.attisdropped
+            CROSS JOIN LATERAL aclexplode(att.attacl) a
+            JOIN pg_roles g ON g.oid = a.grantee
+            WHERE c.relkind = 'm' AND n.nspname = %s AND g.rolname = %s
+            """,
+            (schema, grantee),
+        )
+        for row in cur.fetchall():
+            if (row["object_name"], row["privilege_type"]) in matview_grant_keys:
+                continue
+            grants.append(
+                Grant(
+                    object_type="COLUMN",
+                    object_name=row["object_name"],
+                    schema=schema,
+                    privilege=row["privilege_type"],
+                    grantee=grantee,
                     column=row["column_name"],
                 )
             )

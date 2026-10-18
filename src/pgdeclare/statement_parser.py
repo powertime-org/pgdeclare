@@ -45,6 +45,7 @@ TRACKED_OBJECT_TYPES = {
     "TABLE",
     "FUNCTION",
     "VIEW",
+    "MATERIALIZED VIEW",
     "INDEX",
     "TRIGGER",
     "POLICY",
@@ -252,6 +253,10 @@ def _parse_statement_metadata(
         "CREATE VIEW"
     ):
         return _parse_create_view(
+            raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
+    elif stmt_upper.startswith("CREATE MATERIALIZED VIEW"):
+        return _parse_create_materialized_view(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
         )
     elif stmt_upper.startswith("CREATE INDEX"):
@@ -494,6 +499,44 @@ def _parse_create_view(
         raw_sql=raw_sql,
         statement_type="CREATE VIEW",
         object_type="VIEW",
+        object_name=object_name,
+        source_file=source_file,
+        line_number=line_number,
+        is_idempotent=is_idempotent,
+    )
+
+
+def _parse_create_materialized_view(
+    raw_sql: str,
+    sql_for_parsing: str,
+    source_file: Optional[str],
+    line_number: int,
+    is_idempotent: bool,
+) -> ParsedStatement:
+    """Parse CREATE MATERIALIZED VIEW (a CREATE TABLE AS node) using pglast AST."""
+    object_name = None
+
+    try:
+        tree = parse_sql(sql_for_parsing)
+        for raw_stmt in tree:
+            stmt = raw_stmt.stmt
+            if (
+                isinstance(stmt, ast.CreateTableAsStmt)
+                and stmt.into is not None
+                and stmt.into.rel is not None
+            ):
+                schema = stmt.into.rel.schemaname or "public"
+                object_name = f"{schema}.{stmt.into.rel.relname}"
+                if stmt.if_not_exists:
+                    is_idempotent = True
+                break
+    except Exception:
+        pass  # If pglast fails, PostgreSQL would fail too
+
+    return ParsedStatement(
+        raw_sql=raw_sql,
+        statement_type="CREATE MATERIALIZED VIEW",
+        object_type="MATERIALIZED VIEW",
         object_name=object_name,
         source_file=source_file,
         line_number=line_number,

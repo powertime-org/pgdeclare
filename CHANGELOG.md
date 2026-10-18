@@ -17,6 +17,11 @@ may change in minor releases.
 
 ### Fixed
 
+- A `DROP` that fails because another object still depends on it
+  (`2BP01`) is retried after the rest, like a missing dependency, so dropping
+  a stack of views no longer depends on the order they were listed in.
+- No `REVOKE` is planned on a table, view or materialized view the same run
+  drops; it used to fail on the missing relation and leave the run stuck.
 - `serial` and `bigserial` columns on a fresh database: the table's
   `nextval()` default used to name a sequence that was never created.
 - A managed role that exists nowhere is a clear error naming the role, not a
