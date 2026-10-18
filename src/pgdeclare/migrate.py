@@ -7,8 +7,9 @@ caller provisions what the engine does not own (the plan database, extensions,
 schemas the bootstrap SQL expects) before calling `apply_declared_schema`.
 """
 
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .changes import Change
 from .config import PgDeclareConfig, logger, resolve
@@ -27,6 +28,27 @@ from .ledger import (
 from .models import Schema
 from .schema_parser import build_desired_schema, execute_do_blocks, parse_do_blocks
 
+# Roles and role memberships are cluster-wide: applying them in one database
+# changes them for every database on the server.
+CLUSTER_OBJECT_TYPES = frozenset({"ROLE", "ROLE_MEMBERSHIP"})
+
+
+def is_cluster_change(change: Change) -> bool:
+    """True for a change that acts on the whole server, not one database."""
+    return change.object_type in CLUSTER_OBJECT_TYPES
+
+
+@dataclass
+class SchemaRunResult:
+    """What one run of the pipeline did (or, on a dry run, planned)."""
+
+    desired: Schema
+    changes: list[Change] = field(default_factory=list)
+    executed_sql: list[str] = field(default_factory=list)
+    skipped_cluster_changes: list[Change] = field(default_factory=list)
+    migration_blocks: list[MigrationBlock] = field(default_factory=list)
+    fresh_install: bool = False
+
 
 class SchemaConvergenceError(Exception):
     """A schema run applied its changes and still did not reach the declared schema."""
@@ -37,11 +59,15 @@ def compute_residual_changes(
     connection_string: str,
     locked_functions: Optional[set[str]] = None,
     config: Optional[PgDeclareConfig] = None,
+    *,
+    skip_cluster_changes: bool = False,
 ) -> list[Change]:
     """Re-diff `desired` against the database, after changes have been applied.
 
     The list is empty when the run converged. Anything in it is a declaration
     the run failed to reach, which only the *next* diff would otherwise report.
+    With `skip_cluster_changes`, role-level changes are left out (a rehearsal
+    on a clone does not apply them).
     """
     cfg = resolve(config)
     residual_actual = introspect_schema(
@@ -49,7 +75,7 @@ def compute_residual_changes(
         schemas=list(cfg.schemas),
         config=cfg,
     )
-    return compute_diff(
+    residual = compute_diff(
         desired,
         residual_actual,
         None,
@@ -57,6 +83,9 @@ def compute_residual_changes(
         locked_functions=locked_functions,
         config=cfg,
     )
+    if skip_cluster_changes:
+        residual = [c for c in residual if not is_cluster_change(c)]
+    return residual
 
 
 def assert_schema_converged(
@@ -65,12 +94,18 @@ def assert_schema_converged(
     force: bool = False,
     locked_functions: Optional[set[str]] = None,
     config: Optional[PgDeclareConfig] = None,
+    *,
+    skip_cluster_changes: bool = False,
 ) -> None:
     """Fail the run if a second diff would still find work to do."""
     cfg = resolve(config)
     logger.info("Verifying the schema converged...")
     residual = compute_residual_changes(
-        desired, connection_string, locked_functions, cfg
+        desired,
+        connection_string,
+        locked_functions,
+        cfg,
+        skip_cluster_changes=skip_cluster_changes,
     )
 
     if not residual:
@@ -129,6 +164,8 @@ def apply_declared_schema(
     force: bool = False,
     dry_run: bool = False,
     expect_converged: bool = False,
+    prove: bool = False,
+    prepare_clone: Optional[Callable[[str], None]] = None,
     locked_functions: Optional[set[str]] = None,
     config: Optional[PgDeclareConfig] = None,
 ) -> None:
@@ -155,13 +192,67 @@ def apply_declared_schema(
             inline block, no ledger row, no DDL, no DO block. Only the plan
             database is rebuilt.
         expect_converged: Any difference fails the run before anything is applied
+        prove: With `dry_run`, rehearse the real run on a throwaway clone of
+            the database instead of previewing it (see
+            `pgdeclare.prove.prove_declared_schema`). Needs `dry_run=True`.
+        prepare_clone: With `prove`, called with the clone's connection
+            string before the run (create schemas, extensions)
         locked_functions: Passed to `compute_diff` (SECDEF PUBLIC EXECUTE revoke)
         config: Engine configuration
 
     Raises:
         SchemaConvergenceError: expect_converged and the database differs, or
             the run did not converge.
+        ProveFailedError: `prove` and the rehearsal failed.
         Exception: Any other failure, with the reason in the message.
+    """
+    if prove:
+        if not dry_run:
+            raise ValueError("prove=True rehearses on a clone; pass dry_run=True")
+        from .prove import prove_declared_schema
+
+        prove_declared_schema(
+            connection_string,
+            sql_dir,
+            plan_db_name,
+            offline=offline,
+            force=force,
+            prepare=prepare_clone,
+            locked_functions=locked_functions,
+            config=config,
+        )
+        return
+    run_declared_schema(
+        connection_string,
+        sql_dir,
+        plan_db_name,
+        offline=offline,
+        force=force,
+        dry_run=dry_run,
+        expect_converged=expect_converged,
+        locked_functions=locked_functions,
+        config=config,
+    )
+
+
+def run_declared_schema(
+    connection_string: str,
+    sql_dir: Path,
+    plan_db_name: str,
+    *,
+    offline: bool = False,
+    force: bool = False,
+    dry_run: bool = False,
+    expect_converged: bool = False,
+    skip_cluster_changes: bool = False,
+    locked_functions: Optional[set[str]] = None,
+    config: Optional[PgDeclareConfig] = None,
+) -> SchemaRunResult:
+    """`apply_declared_schema`'s pipeline, returning what it did.
+
+    `skip_cluster_changes` leaves role and role-membership changes out of the
+    plan and the convergence check: they act on the whole server, so a
+    rehearsal on a clone must not apply them.
     """
     cfg = resolve(config)
     say, style = cfg.report, cfg.decorate
@@ -245,6 +336,15 @@ def apply_declared_schema(
         locked_functions=locked_functions,
         config=cfg,
     )
+    result = SchemaRunResult(
+        desired=desired,
+        migration_blocks=migration_blocks,
+        fresh_install=is_fresh_install,
+    )
+    if skip_cluster_changes:
+        result.skipped_cluster_changes = [c for c in changes if is_cluster_change(c)]
+        changes = [c for c in changes if not is_cluster_change(c)]
+    result.changes = changes
 
     if not changes:
         say(style("green", "✓ No schema changes needed"))
@@ -300,7 +400,7 @@ def apply_declared_schema(
             for change in changes:
                 logger.info(change.to_display_sql())
         else:
-            success, _executed_sql = execute_migration(
+            success, executed_sql = execute_migration(
                 connection_string=connection_string,
                 changes=changes,
                 offline_mode=offline,
@@ -309,6 +409,7 @@ def apply_declared_schema(
                 drop_directives=drop_directives,
                 config=cfg,
             )
+            result.executed_sql = executed_sql
 
             if success:
                 say(style("green", "✓ Schema changes applied successfully"))
@@ -356,4 +457,6 @@ def apply_declared_schema(
             force=force,
             locked_functions=locked_functions,
             config=cfg,
+            skip_cluster_changes=skip_cluster_changes,
         )
+    return result

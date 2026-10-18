@@ -31,6 +31,9 @@ may change in minor releases.
   failing with a `@drop` error the real run would not raise.
 - A role without `CREATEDB` is told to create a plan database and pass
   `--plan-database`, instead of a bare permission error.
+- A key=value connection string passed to the library no longer builds the
+  plan in the target database: the plan database name is now substituted into
+  it, as it already was for `postgresql://` URLs.
 
 ## [0.1.0] - 2026-10-16
 

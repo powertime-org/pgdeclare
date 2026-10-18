@@ -92,6 +92,14 @@ from .migrate import (
     compute_residual_changes,
     report_pending_migration_blocks,
 )
+from .prove import (
+    LedgerEntry,
+    ProveError,
+    ProveFailedError,
+    ProveResult,
+    TableRows,
+    prove_declared_schema,
+)
 
 __all__ = [
     "__version__",
@@ -162,4 +170,11 @@ __all__ = [
     "assert_schema_converged",
     "compute_residual_changes",
     "report_pending_migration_blocks",
+    # Prove: rehearse a run on a throwaway clone
+    "LedgerEntry",
+    "ProveError",
+    "ProveFailedError",
+    "ProveResult",
+    "TableRows",
+    "prove_declared_schema",
 ]

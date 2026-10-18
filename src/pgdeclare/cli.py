@@ -1,11 +1,12 @@
 """The `pgdeclare` command line: a thin convenience over the library.
 
-    pgdeclare diff  [--json] [--exit-code]
-    pgdeclare apply [--dry-run] [--offline] [--force]
+    pgdeclare diff  [--json] [--exit-code] [--prove]
+    pgdeclare apply [--dry-run [--prove]] [--offline] [--force]
 
 Both build the declared schema in a scratch "plan" database on the same server
 (created on demand and dropped afterwards, unless `--plan-database` names one
-you manage), introspect the target database, and compare the two. Everything
+you manage), introspect the target database, and compare the two. `--prove`
+also rehearses the real run on a throwaway clone of the target. Everything
 here goes through the public API; anything the flags do not cover is a
 `PgDeclareConfig` field away in Python.
 
@@ -41,6 +42,7 @@ from .executor import format_changes_summary
 from .introspection import check_table_has_data, introspect_schema
 from .ledger import get_applied_migrations, parse_migration_blocks
 from .migrate import SchemaConvergenceError, apply_declared_schema
+from .prove import ProveResult, prove_declared_schema
 from .schema_parser import build_desired_schema, ensure_schemas
 from .statement_parser import collect_sql_files_recursive, parse_sql_content
 
@@ -208,18 +210,63 @@ def change_to_dict(change: Change) -> dict[str, Any]:
     }
 
 
+def prove_result_to_dict(result: ProveResult) -> dict[str, Any]:
+    """The JSON shape of a successful rehearsal."""
+    return {
+        "ledger_entries": [
+            {"id": e.id, "phase": e.phase, "executed": e.executed}
+            for e in result.ledger_entries
+        ],
+        "executed_sql": result.executed_sql,
+        "not_rehearsed": [change_to_dict(c) for c in result.skipped_cluster_changes],
+        "row_changes": [
+            {
+                "table": r.table,
+                "before": r.before,
+                "after": r.after,
+                "renamed_to": r.renamed_to,
+                "covered_by_drop": r.covered_by_drop,
+            }
+            for r in result.row_changes
+        ],
+    }
+
+
 def _stderr(text: str) -> None:
     print(text, file=sys.stderr)
+
+
+def _clone_preparer(
+    cfg: PgDeclareConfig, extensions: list[str]
+) -> Callable[[str], None]:
+    """What `apply` provisions in the target, done in the prove clone instead."""
+
+    def prepare(clone_url: str) -> None:
+        ensure_schemas(clone_url, cfg.schemas, cfg)
+        for statement in extensions:
+            _autocommit(clone_url, statement)
+
+    return prepare
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
     url = args.database_url
     sql_dir = Path(args.sql_dir)
     probe = _build_config(args, _stderr, ())
-    with _bootstrap_file(declared_extensions(sql_dir, probe)) as bootstrap:
+    extensions = declared_extensions(sql_dir, probe)
+    proof: ProveResult | None = None
+    with _bootstrap_file(extensions) as bootstrap:
         cfg = _build_config(args, _stderr, bootstrap)
         with plan_database(url, args.plan_database) as plan_db:
             desired = build_desired_schema(sql_dir, url, plan_db, config=cfg)
+            if args.prove:
+                proof = prove_declared_schema(
+                    url,
+                    sql_dir,
+                    plan_db,
+                    prepare=_clone_preparer(cfg, extensions),
+                    config=cfg,
+                )
         actual = introspect_schema(url, config=cfg)
 
     def has_data(schema: str, table: str, column: str | None = None) -> bool:
@@ -245,6 +292,8 @@ def cmd_diff(args: argparse.Namespace) -> int:
                 for b in pending
             ],
         }
+        if proof is not None:
+            payload["prove"] = prove_result_to_dict(proof)
         print(json.dumps(payload, indent=2))
     else:
         if changes:
@@ -263,6 +312,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
             print(
                 "Note: the diff above does not include the effect of the pending "
                 "@migrate-before blocks."
+                + (
+                    " The prove summary (stderr) shows the DDL the real run executes."
+                    if proof is not None
+                    else ""
+                )
             )
 
     if args.exit_code and (changes or pending):
@@ -273,6 +327,11 @@ def cmd_diff(args: argparse.Namespace) -> int:
 def cmd_apply(args: argparse.Namespace) -> int:
     url = args.database_url
     sql_dir = Path(args.sql_dir)
+    if args.prove and not args.dry_run:
+        raise CliError(
+            "--prove rehearses the run on a clone and applies nothing; "
+            "use it with --dry-run"
+        )
     probe = _build_config(args, print, ())
     extensions = declared_extensions(sql_dir, probe)
     with _bootstrap_file(extensions) as bootstrap:
@@ -289,6 +348,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
                 offline=args.offline,
                 force=args.force,
                 dry_run=args.dry_run,
+                prove=args.prove,
+                prepare_clone=_clone_preparer(cfg, extensions),
                 config=cfg,
             )
     return EXIT_OK
@@ -354,6 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit 2 when there are changes or pending inline migrations",
     )
+    diff.add_argument(
+        "--prove",
+        action="store_true",
+        help="also rehearse the real run on a throwaway clone of the target "
+        "(needs CREATEDB, ownership of the target and exclusive access to it)",
+    )
     diff.set_defaults(func=cmd_diff)
 
     apply = sub.add_parser(
@@ -375,6 +442,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="bypass @drop checks, re-run edited blocks, ignore non-convergence",
+    )
+    apply.add_argument(
+        "--prove",
+        action="store_true",
+        help="with --dry-run: rehearse the real run, inline migrations included, "
+        "on a throwaway clone of the target and check it converges and keeps "
+        "every row",
     )
     apply.set_defaults(func=cmd_apply)
     return parser
