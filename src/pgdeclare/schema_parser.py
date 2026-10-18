@@ -24,6 +24,7 @@ from .introspection import introspect_schema
 from .models import Schema
 from .statement_parser import (
     ParsedStatement,
+    _strip_leading_comments,
     parse_sql_content,
     collect_sql_files_recursive,
     parse_role_from_sql,
@@ -402,6 +403,12 @@ def _apply_to_plan_database(
     with psycopg2.connect(plan_url) as conn:
         conn.autocommit = True  # Schema operations need autocommit
         with conn.cursor() as cur:
+            # Publications and event triggers belong to the database, not to a
+            # schema, so a reused plan database still holds the previous
+            # build's. Clear them, or one removed from the files would still
+            # look declared.
+            _clear_database_level_objects(cur)
+
             # Drop and recreate schemas
             for name in cfg.plan_recreate_schemas:
                 cur.execute(f"DROP SCHEMA IF EXISTS {quote_ident(name)} CASCADE")
@@ -420,6 +427,7 @@ def _apply_to_plan_database(
                     cur.execute(f"GRANT {stock} ON SCHEMA public TO PUBLIC")
 
     if use_retry and statements:
+        statements = _event_triggers_last(statements)
         # Use retry-until-stable execution
         logger.info(
             f"Executing {len(statements)} statements with retry-until-stable..."
@@ -443,6 +451,33 @@ def _apply_to_plan_database(
                     conn.rollback()
                     logger.error(f"Failed to apply schema to plan database: {e}")
                     raise
+
+
+def _clear_database_level_objects(cur) -> None:
+    """Drop every publication and event trigger in the plan database."""
+    cur.execute("SELECT pubname FROM pg_catalog.pg_publication")
+    for (name,) in cur.fetchall():
+        cur.execute(f"DROP PUBLICATION {quote_ident(name)}")
+    cur.execute("SELECT evtname FROM pg_catalog.pg_event_trigger")
+    for (name,) in cur.fetchall():
+        cur.execute(f"DROP EVENT TRIGGER {quote_ident(name)}")
+
+
+_EVENT_TRIGGER_DDL = re.compile(r"(?:CREATE|ALTER)\s+EVENT\s+TRIGGER\b", re.IGNORECASE)
+
+
+def _event_triggers_last(statements: list[ParsedStatement]) -> list[ParsedStatement]:
+    """Move CREATE / ALTER EVENT TRIGGER to the end of the plan build.
+
+    An event trigger fires on every DDL statement after it, so building it
+    last keeps it from running (and perhaps failing) on the rest of the plan.
+    """
+    first: list[ParsedStatement] = []
+    last: list[ParsedStatement] = []
+    for stmt in statements:
+        sql = _strip_leading_comments(stmt.raw_sql).lstrip()
+        (last if _EVENT_TRIGGER_DDL.match(sql) else first).append(stmt)
+    return first + last
 
 
 def _replace_db_in_url(connection_string: str, new_db: str) -> str:

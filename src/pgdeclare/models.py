@@ -313,6 +313,78 @@ class Trigger:
 
 
 @dataclass
+class Rule:
+    """A rewrite rule on a table (never a view's `_RETURN` rule)."""
+
+    schema: str
+    table: str
+    name: str
+    definition: str  # pg_get_ruledef(), trailing semicolon included
+    # pg_rewrite.ev_enabled: 'O' (origin, the default), 'D' (disabled),
+    # 'R' (replica) or 'A' (always).
+    enabled: str = "O"
+
+    @property
+    def qualified_key(self) -> str:
+        return f"{self.schema}.{self.table}.{self.name}"
+
+
+@dataclass
+class EventTrigger:
+    """A database-level event trigger."""
+
+    name: str
+    event: str  # ddl_command_start, ddl_command_end, sql_drop, ...
+    function_schema: str
+    function_name: str
+    # WHEN TAG IN (...) filter, sorted; empty for no filter.
+    tags: tuple[str, ...] = ()
+    # pg_event_trigger.evtenabled: 'O', 'D', 'R' or 'A', as for rules.
+    enabled: str = "O"
+
+
+@dataclass
+class PublicationTable:
+    """One table published by a publication."""
+
+    schema: str
+    name: str
+    # Column list (PostgreSQL 15+), in column order; empty for all columns.
+    columns: tuple[str, ...] = ()
+    # Row filter (PostgreSQL 15+) as pg_get_expr() prints it, or None.
+    row_filter: Optional[str] = None
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+PUBLISH_ACTIONS = ("insert", "update", "delete", "truncate")
+
+
+@dataclass
+class Publication:
+    """A logical replication publication (database-level)."""
+
+    name: str
+    all_tables: bool = False  # FOR ALL TABLES
+    tables: dict[str, PublicationTable] = field(
+        default_factory=dict
+    )  # key = schema.table
+    # TABLES IN SCHEMA (PostgreSQL 15+), sorted.
+    schemas: tuple[str, ...] = ()
+    publish: tuple[str, ...] = PUBLISH_ACTIONS
+    via_root: bool = False  # publish_via_partition_root
+    # publish_generated_columns (PostgreSQL 18+): 'none' or 'stored'; None on
+    # servers that do not have the option.
+    generated_columns: Optional[str] = None
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.all_tables and not self.tables and not self.schemas
+
+
+@dataclass
 class EnumType:
     """PostgreSQL enum type definition."""
 
@@ -763,6 +835,11 @@ class Schema:
     roles: dict[str, Role] = field(default_factory=dict)  # key = role name
     role_memberships: list[RoleMembership] = field(default_factory=list)
     comments: dict[str, Comment] = field(default_factory=dict)  # key = Comment.key
+    rules: dict[str, Rule] = field(default_factory=dict)  # key = schema.table.rule
+    # Database-level objects: every one in the database is introspected, and
+    # the differ decides which of them it may touch.
+    publications: dict[str, Publication] = field(default_factory=dict)  # key = name
+    event_triggers: dict[str, EventTrigger] = field(default_factory=dict)  # key = name
 
     def get_table(self, schema: str, name: str) -> Optional[Table]:
         """Get table by schema and name."""

@@ -20,13 +20,17 @@ from .models import (
     Constraint,
     Domain,
     EnumType,
+    EventTrigger,
     Function,
     Grant,
     Index,
     MaterializedView,
     Policy,
+    Publication,
+    PublicationTable,
     Role,
     RoleMembership,
+    Rule,
     Sequence,
     Table,
     Trigger,
@@ -2233,3 +2237,426 @@ class SetComment(Change):
     def to_sql(self) -> str:
         text = "NULL" if self.remove else quote_literal(self.comment.text)
         return f"COMMENT ON {self.comment.target_sql} IS {text};"
+
+
+# =============================================================================
+# Rewrite Rule Changes
+# =============================================================================
+
+# ev_enabled / evtenabled -> the ENABLE/DISABLE clause that sets it.
+_ENABLED_CLAUSE = {
+    "O": "ENABLE",
+    "D": "DISABLE",
+    "R": "ENABLE REPLICA",
+    "A": "ENABLE ALWAYS",
+}
+
+
+def _rule_state_sql(rule: Rule) -> str:
+    return (
+        f"ALTER TABLE {quote_ident(rule.schema)}.{quote_ident(rule.table)} "
+        f"{_ENABLED_CLAUSE[rule.enabled]} RULE {quote_ident(rule.name)};"
+    )
+
+
+@dataclass
+class CreateRule(Change):
+    """Create or replace a rewrite rule on a table.
+
+    `CREATE OR REPLACE RULE` keeps a replaced rule's enabled state, so the
+    state is written whenever it is not the default or has to change.
+    """
+
+    rule: Rule = field(
+        default_factory=lambda: Rule(schema="public", table="", name="", definition="")
+    )
+    set_enabled: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "RULE"
+
+    def __post_init__(self):
+        self.object_name = self.rule.qualified_key
+        if not self.description:
+            self.description = f"Create rule {self.rule.name} on {self.rule.table}"
+
+    def to_sql(self) -> str:
+        definition = self.rule.definition.strip().rstrip(";")
+        if definition.upper().startswith("CREATE RULE"):
+            definition = "CREATE OR REPLACE RULE" + definition[len("CREATE RULE") :]
+        sql = definition + ";"
+        if self.set_enabled or self.rule.enabled != "O":
+            sql += "\n" + _rule_state_sql(self.rule)
+        return sql
+
+
+@dataclass
+class AlterRuleEnabled(Change):
+    """Enable or disable a rewrite rule (ENABLE / DISABLE / REPLICA / ALWAYS)."""
+
+    rule: Rule = field(
+        default_factory=lambda: Rule(schema="public", table="", name="", definition="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "RULE"
+
+    def __post_init__(self):
+        self.object_name = self.rule.qualified_key
+        if not self.description:
+            clause = _ENABLED_CLAUSE[self.rule.enabled].capitalize()
+            self.description = f"{clause} rule {self.rule.name} on {self.rule.table}"
+
+    def to_sql(self) -> str:
+        return _rule_state_sql(self.rule)
+
+
+@dataclass
+class DropRule(Change):
+    """Drop a rewrite rule."""
+
+    schema: str = "public"
+    table: str = ""
+    rule_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "RULE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table}.{self.rule_name}"
+        if not self.description:
+            self.description = f"Drop rule {self.rule_name} on {self.table}"
+
+    def to_sql(self) -> str:
+        return f"DROP RULE IF EXISTS {quote_ident(self.rule_name)} ON {quote_ident(self.schema)}.{quote_ident(self.table)};"
+
+
+# =============================================================================
+# Event Trigger Changes
+# =============================================================================
+
+
+def _event_trigger_state_sql(name: str, enabled: str) -> str:
+    return f"ALTER EVENT TRIGGER {quote_ident(name)} {_ENABLED_CLAUSE[enabled]};"
+
+
+@dataclass
+class CreateEventTrigger(Change):
+    """Create an event trigger; with `replace`, drop the old one first.
+
+    There is no `CREATE OR REPLACE EVENT TRIGGER`. Creating one needs a
+    superuser.
+    """
+
+    trigger: EventTrigger = field(
+        default_factory=lambda: EventTrigger(
+            name="", event="", function_schema="", function_name=""
+        )
+    )
+    replace: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EVENT TRIGGER"
+
+    def __post_init__(self):
+        self.object_name = self.trigger.name
+        if not self.description:
+            verb = "Drop and recreate" if self.replace else "Create"
+            self.description = f"{verb} event trigger {self.trigger.name}"
+
+    def to_sql(self) -> str:
+        t = self.trigger
+        sql = ""
+        if self.replace:
+            sql += f"DROP EVENT TRIGGER IF EXISTS {quote_ident(t.name)};\n"
+        sql += f"CREATE EVENT TRIGGER {quote_ident(t.name)} ON {quote_ident(t.event)}"
+        if t.tags:
+            sql += f" WHEN TAG IN ({', '.join(quote_literal(tag) for tag in t.tags)})"
+        sql += f" EXECUTE FUNCTION {quote_ident(t.function_schema)}.{quote_ident(t.function_name)}();"
+        if t.enabled != "O":
+            sql += "\n" + _event_trigger_state_sql(t.name, t.enabled)
+        return sql
+
+
+@dataclass
+class AlterEventTriggerEnabled(Change):
+    """Enable or disable an event trigger."""
+
+    name: str = ""
+    enabled: str = "O"
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EVENT TRIGGER"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            clause = _ENABLED_CLAUSE[self.enabled].capitalize()
+            self.description = f"{clause} event trigger {self.name}"
+
+    def to_sql(self) -> str:
+        return _event_trigger_state_sql(self.name, self.enabled)
+
+
+@dataclass
+class DropEventTrigger(Change):
+    """Drop an event trigger."""
+
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EVENT TRIGGER"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = f"Drop event trigger {self.name}"
+
+    def to_sql(self) -> str:
+        return f"DROP EVENT TRIGGER IF EXISTS {quote_ident(self.name)};"
+
+
+# =============================================================================
+# Publication Changes
+# =============================================================================
+
+
+def _publication_table_sql(table: PublicationTable) -> str:
+    """One published table: name, column list and row filter."""
+    sql = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    if table.columns:
+        sql += f" ({', '.join(quote_ident(c) for c in table.columns)})"
+    if table.row_filter is not None:
+        sql += f" WHERE ({table.row_filter})"
+    return sql
+
+
+def _publication_objects_sql(
+    tables: list[PublicationTable], schemas: tuple[str, ...] | list[str] = ()
+) -> str:
+    """`TABLE a, b (c) WHERE (...), TABLES IN SCHEMA s, t`.
+
+    One TABLE keyword for the whole list, which PostgreSQL 14 also parses.
+    """
+    parts: list[str] = []
+    if tables:
+        parts.append("TABLE " + ", ".join(_publication_table_sql(t) for t in tables))
+    if schemas:
+        parts.append("TABLES IN SCHEMA " + ", ".join(quote_ident(s) for s in schemas))
+    return ", ".join(parts)
+
+
+def _publication_options_sql(publication: Publication) -> str:
+    options = [
+        f"publish = {quote_literal(', '.join(publication.publish))}",
+        f"publish_via_partition_root = {'true' if publication.via_root else 'false'}",
+    ]
+    if publication.generated_columns is not None:
+        options.append(f"publish_generated_columns = {publication.generated_columns}")
+    return f"({', '.join(options)})"
+
+
+def _create_publication_sql(publication: Publication) -> str:
+    sql = f"CREATE PUBLICATION {quote_ident(publication.name)}"
+    if publication.all_tables:
+        sql += " FOR ALL TABLES"
+    else:
+        objects = _publication_objects_sql(
+            list(publication.tables.values()), publication.schemas
+        )
+        if objects:
+            sql += f" FOR {objects}"
+    return sql + f" WITH {_publication_options_sql(publication)};"
+
+
+def _drop_publication_table_body(publication: str, table: PublicationTable) -> str:
+    """PL/pgSQL that drops `table` from `publication` if it is still a member.
+
+    A column drop with CASCADE or a table drop earlier in the same run may
+    already have removed it, and ALTER PUBLICATION ... DROP TABLE has no
+    IF EXISTS.
+    """
+    relation = f"{quote_ident(table.schema)}.{quote_ident(table.name)}"
+    statement = f"ALTER PUBLICATION {quote_ident(publication)} DROP TABLE {relation}"
+    return (
+        "IF EXISTS (SELECT 1 FROM pg_catalog.pg_publication_rel pr "
+        "JOIN pg_catalog.pg_publication p ON p.oid = pr.prpubid "
+        f"WHERE p.pubname = {quote_literal(publication)} "
+        f"AND pr.prrelid = pg_catalog.to_regclass({quote_literal(relation)})) "
+        f"THEN EXECUTE {quote_literal(statement)}; END IF;"
+    )
+
+
+@dataclass
+class CreatePublication(Change):
+    """Create a publication with its tables, schemas and options."""
+
+    publication: Publication = field(default_factory=lambda: Publication(name=""))
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.publication.name
+        if not self.description:
+            self.description = f"Create publication {self.publication.name}"
+
+    def to_sql(self) -> str:
+        return _create_publication_sql(self.publication)
+
+
+@dataclass
+class DropAndCreatePublication(Change):
+    """Drop and recreate a publication: FOR ALL TABLES cannot be altered."""
+
+    publication: Publication = field(default_factory=lambda: Publication(name=""))
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.publication.name
+        if not self.description:
+            self.description = f"Drop and recreate publication {self.publication.name}"
+
+    def to_sql(self) -> str:
+        return (
+            f"DROP PUBLICATION IF EXISTS {quote_ident(self.publication.name)};\n"
+            + _create_publication_sql(self.publication)
+        )
+
+
+@dataclass
+class DropPublication(Change):
+    """Drop a publication."""
+
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = f"Drop publication {self.name}"
+
+    def to_sql(self) -> str:
+        return f"DROP PUBLICATION IF EXISTS {quote_ident(self.name)};"
+
+
+@dataclass
+class AlterPublicationOptions(Change):
+    """`ALTER PUBLICATION ... SET (publish = ..., ...)`."""
+
+    publication: Publication = field(default_factory=lambda: Publication(name=""))
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.publication.name
+        if not self.description:
+            self.description = f"Set options of publication {self.publication.name}"
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER PUBLICATION {quote_ident(self.publication.name)} "
+            f"SET {_publication_options_sql(self.publication)};"
+        )
+
+
+@dataclass
+class AddPublicationObjects(Change):
+    """`ALTER PUBLICATION ... ADD TABLE ..., TABLES IN SCHEMA ...`."""
+
+    name: str = ""
+    tables: list[PublicationTable] = field(default_factory=list)
+    schemas: list[str] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            added = [t.qualified_name for t in self.tables] + [
+                f"schema {s}" for s in self.schemas
+            ]
+            self.description = f"Add {', '.join(added)} to publication {self.name}"
+
+    def to_sql(self) -> str:
+        objects = _publication_objects_sql(self.tables, self.schemas)
+        return f"ALTER PUBLICATION {quote_ident(self.name)} ADD {objects};"
+
+
+@dataclass
+class DropPublicationObjects(Change):
+    """Remove tables and schemas from a publication.
+
+    Each table is dropped only while it is still a member (see
+    `_drop_publication_table_body`).
+    """
+
+    name: str = ""
+    tables: list[PublicationTable] = field(default_factory=list)
+    schemas: list[str] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            removed = [t.qualified_name for t in self.tables] + [
+                f"schema {s}" for s in self.schemas
+            ]
+            self.description = (
+                f"Remove {', '.join(removed)} from publication {self.name}"
+            )
+
+    def to_sql(self) -> str:
+        statements: list[str] = []
+        if self.tables:
+            body = " ".join(
+                _drop_publication_table_body(self.name, t) for t in self.tables
+            )
+            statements.append(do_block(f"BEGIN {body} END"))
+        if self.schemas:
+            schemas = ", ".join(quote_ident(s) for s in self.schemas)
+            statements.append(
+                f"ALTER PUBLICATION {quote_ident(self.name)} DROP TABLES IN SCHEMA {schemas};"
+            )
+        return "\n".join(statements)
+
+
+@dataclass
+class ReplacePublicationTable(Change):
+    """Re-add a published table with a new column list or row filter.
+
+    There is no ALTER for a member's column list or filter, so the table is
+    dropped from the publication and added back in one statement.
+    """
+
+    name: str = ""
+    table: PublicationTable = field(
+        default_factory=lambda: PublicationTable(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "PUBLICATION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = (
+                f"Change columns or row filter of {self.table.qualified_name} "
+                f"in publication {self.name}"
+            )
+
+    def to_sql(self) -> str:
+        add = (
+            f"ALTER PUBLICATION {quote_ident(self.name)} ADD "
+            f"{_publication_objects_sql([self.table])}"
+        )
+        body = _drop_publication_table_body(self.name, self.table)
+        return do_block(f"BEGIN {body} EXECUTE {quote_literal(add)}; END")

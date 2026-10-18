@@ -214,11 +214,16 @@ Within the managed schemas:
 | Grants to managed roles | tables, views, materialized views, columns, functions, sequences, schemas | revokes before grants | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
+| Rewrite rules (`CREATE RULE`, on tables; never a view's `_RETURN` rule) | yes | `CREATE OR REPLACE RULE`; enabled state | yes |
+| Publications (database-level) | yes: tables, column lists and row filters (15+), `TABLES IN SCHEMA` (15+), `FOR ALL TABLES`, options | `ALTER PUBLICATION ... ADD` / `DROP` members and `SET (...)` options; a member with a new column list or row filter is dropped and added back; drop and re-create to switch `FOR ALL TABLES` | yes, when every table it publishes is managed (see below) |
+| Event triggers (database-level; superuser) | yes, with `WHEN TAG IN` | drop and re-create; enabled state with `ALTER EVENT TRIGGER` | yes, when its function is in a managed schema |
 | Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, indexes, constraints, triggers, policies, enum and composite types | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
 
-Not managed: extensions, comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, subscriptions (they hold connection strings and secrets, and creating one starts replication), comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
 A comment the schema files do not declare is removed, including one added by hand. Comments are written in a phase of their own after the DDL and index builds, so an object dropped and recreated in the same run gets its comment back.
+
+Publications and event triggers belong to the database rather than a schema, so pgdeclare decides which live ones are its own. A declared one is always converged. An undeclared publication is dropped only when it publishes at least one table, every table it publishes is a table pgdeclare manages (in a managed schema, not `_`-prefixed, not owned by an extension) and every `TABLES IN SCHEMA` schema is a managed one. `FOR ALL TABLES` publications, empty ones and any that reach further are left alone unless declared. An undeclared event trigger is dropped only when its function is in a managed schema. Creating an event trigger needs a superuser, both on the target and in the plan database. Event triggers are built last, in the plan and in the run, so they do not fire on the rest of the DDL; a function recreated with `DROP ... CASCADE` gets its event triggers back in the same run.
 
 Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. A recreated materialized view rebuilds its indexes the same way, and a recreated view or materialized view drops the views and materialized views that read from it and builds them back, from their declarations, in that statement too. Whether a materialized view is populated is not compared: a `REFRESH` is runtime state, not drift. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
 
@@ -273,6 +278,7 @@ The suite runs against PostgreSQL 14, 15, 16, 17 and 18 in CI.
 - `security_invoker` views need PostgreSQL 15 or later.
 - On 14, `public` in a new database belongs to the bootstrap superuser, so a non-superuser needs `ALTER SCHEMA public OWNER TO <role>` in its plan database.
 - Changing the expression of a generated column uses `ALTER COLUMN ... SET EXPRESSION`, which needs PostgreSQL 17 or later. On 14 to 16, do that change by hand in a `@migrate-before` block.
+- Publication column lists, row filters and `TABLES IN SCHEMA` need PostgreSQL 15 or later; `publish_generated_columns` needs 18.
 - PostgreSQL 18 records `NOT NULL` as a constraint; pgdeclare models it on the column on every version, so plans are identical.
 
 ## How it compares

@@ -14,6 +14,7 @@ from .changes import (
     AddDomainConstraint,
     AddEnumValue,
     AddIdentity,
+    AddPublicationObjects,
     AlterColumnDropExpression,
     AlterColumnSetExpression,
     AlterColumnType,
@@ -22,6 +23,9 @@ from .changes import (
     AlterDomainDropNotNull,
     AlterDomainSetDefault,
     AlterDomainSetNotNull,
+    AlterEventTriggerEnabled,
+    AlterPublicationOptions,
+    AlterRuleEnabled,
     AlterRole,
     AlterSequence,
     AlterViewOptions,
@@ -29,11 +33,14 @@ from .changes import (
     CreateCompositeType,
     CreateDomain,
     CreateEnum,
+    CreateEventTrigger,
     CreateFunction,
     CreateIndex,
     CreateMaterializedView,
     CreatePolicy,
+    CreatePublication,
     CreateRole,
+    CreateRule,
     CreateSequence,
     CreateTable,
     CreateTrigger,
@@ -47,18 +54,23 @@ from .changes import (
     DropAndCreateFunction,
     DropAndCreateMaterializedView,
     DropAndCreatePolicy,
+    DropAndCreatePublication,
     DropAndCreateView,
     DropColumn,
     DropConstraint,
     DropDefault,
     DropDomain,
     DropDomainConstraint,
+    DropEventTrigger,
     DropFunction,
     DropIdentity,
     DropIndex,
     DropMaterializedView,
     DropNotNull,
     DropPolicy,
+    DropPublication,
+    DropPublicationObjects,
+    DropRule,
     DropSequence,
     DropTable,
     DropTrigger,
@@ -71,6 +83,7 @@ from .changes import (
     ReplaceFunction,
     RevokePrivilege,
     RevokePublicExecute,
+    ReplacePublicationTable,
     RevokeRoleMembership,
     SetComment,
     SetDefault,
@@ -92,6 +105,7 @@ from .models import (
     Grant,
     Index,
     MaterializedView,
+    Publication,
     Schema,
     Table,
     View,
@@ -160,6 +174,12 @@ def compute_diff(
     changes.extend(_diff_indexes(desired, actual))
     changes.extend(_diff_policies(desired, actual))
     changes.extend(_diff_triggers(desired, actual))
+    changes.extend(_diff_rules(desired, actual))
+    managed = list(schemas) if schemas is not None else list(resolve(config).schemas)
+    changes.extend(_diff_publications(desired, actual, managed))
+    # Event triggers last among the DDL: one created here fires on every DDL
+    # statement after it.
+    changes.extend(_diff_event_triggers(desired, actual, managed, changes))
     changes.extend(_diff_grants(desired, actual))
     changes = _skip_revokes_on_dropped_relations(changes)
 
@@ -991,6 +1011,156 @@ def _diff_indexes(desired: Schema, actual: Schema) -> list[Change]:
             )
 
     return changes
+
+
+def _diff_rules(desired: Schema, actual: Schema) -> list[Change]:
+    """Diff rewrite rules on tables.
+
+    `CREATE OR REPLACE RULE` changes a rule in place, event included. A rule on
+    a table this run drops goes with the table.
+    """
+    changes: list[Change] = []
+    for key, rule in desired.rules.items():
+        current = actual.rules.get(key)
+        if current is None:
+            changes.append(CreateRule(rule=rule))
+        elif rule.definition != current.definition:
+            changes.append(
+                CreateRule(rule=rule, set_enabled=rule.enabled != current.enabled)
+            )
+        elif rule.enabled != current.enabled:
+            changes.append(AlterRuleEnabled(rule=rule))
+
+    for key, rule in actual.rules.items():
+        if key in desired.rules:
+            continue
+        table = f"{rule.schema}.{rule.table}"
+        if table in actual.tables and table not in desired.tables:
+            continue  # DROP TABLE takes the rule with it.
+        changes.append(
+            DropRule(schema=rule.schema, table=rule.table, rule_name=rule.name)
+        )
+    return changes
+
+
+def publication_is_droppable(
+    publication: Publication, actual: Schema, managed_schemas: list[str]
+) -> bool:
+    """Whether an undeclared live publication may be dropped.
+
+    Only when everything it publishes is something pgdeclare manages: at least
+    one table or schema, every table one introspected in a managed schema, and
+    every TABLES IN SCHEMA schema a managed one. FOR ALL TABLES publications,
+    empty ones, and any that reach a table or schema outside that set belong
+    to someone else (a replication tool, another application) and are left
+    alone.
+    """
+    if publication.all_tables or publication.is_empty:
+        return False
+    if any(key not in actual.tables for key in publication.tables):
+        return False
+    return all(schema in managed_schemas for schema in publication.schemas)
+
+
+def _diff_publications(
+    desired: Schema, actual: Schema, managed_schemas: list[str]
+) -> list[Change]:
+    """Diff publications.
+
+    Declared publications converge in place: options with SET (...), tables
+    and schemas with ADD and DROP, a member whose column list or row filter
+    changed is dropped and added back. Switching to or from FOR ALL TABLES
+    needs a drop and re-create. Undeclared ones are dropped only when
+    `publication_is_droppable` says so.
+    """
+    changes: list[Change] = []
+    for name, pub in desired.publications.items():
+        current = actual.publications.get(name)
+        if current is None:
+            changes.append(CreatePublication(publication=pub))
+            continue
+        if pub.all_tables != current.all_tables:
+            changes.append(DropAndCreatePublication(publication=pub))
+            continue
+        if (pub.publish, pub.via_root, pub.generated_columns) != (
+            current.publish,
+            current.via_root,
+            current.generated_columns,
+        ):
+            changes.append(AlterPublicationOptions(publication=pub))
+        if pub.all_tables:
+            continue
+
+        removed_tables = [
+            t for key, t in current.tables.items() if key not in pub.tables
+        ]
+        removed_schemas = [s for s in current.schemas if s not in pub.schemas]
+        if removed_tables or removed_schemas:
+            changes.append(
+                DropPublicationObjects(
+                    name=name, tables=removed_tables, schemas=removed_schemas
+                )
+            )
+        for key, table in pub.tables.items():
+            old = current.tables.get(key)
+            if old is not None and old != table:
+                changes.append(ReplacePublicationTable(name=name, table=table))
+        added_tables = [t for key, t in pub.tables.items() if key not in current.tables]
+        added_schemas = [s for s in pub.schemas if s not in current.schemas]
+        if added_tables or added_schemas:
+            changes.append(
+                AddPublicationObjects(
+                    name=name, tables=added_tables, schemas=added_schemas
+                )
+            )
+
+    for name, current in actual.publications.items():
+        if name not in desired.publications and publication_is_droppable(
+            current, actual, managed_schemas
+        ):
+            changes.append(DropPublication(name=name))
+    return changes
+
+
+def _diff_event_triggers(
+    desired: Schema,
+    actual: Schema,
+    managed_schemas: list[str],
+    changes: list[Change],
+) -> list[Change]:
+    """Diff event triggers.
+
+    There is no ALTER for an event trigger's event, filter or function, so a
+    change to any of them drops and re-creates it; the enabled state has its
+    own ALTER. A function recreated this run (DROP ... CASCADE) takes its
+    event triggers with it, so those are re-created too. An undeclared event
+    trigger is dropped only when its function lives in a managed schema.
+    """
+    recreated = {
+        (c.function.schema, c.function.name)
+        for c in changes
+        if isinstance(c, DropAndCreateFunction)
+    }
+    result: list[Change] = []
+    for name, trigger in desired.event_triggers.items():
+        current = actual.event_triggers.get(name)
+        if current is None:
+            result.append(CreateEventTrigger(trigger=trigger))
+        elif (
+            dataclass_replace(current, enabled=trigger.enabled) != trigger
+            or (trigger.function_schema, trigger.function_name) in recreated
+        ):
+            result.append(CreateEventTrigger(trigger=trigger, replace=True))
+        elif current.enabled != trigger.enabled:
+            result.append(AlterEventTriggerEnabled(name=name, enabled=trigger.enabled))
+
+    for name, current in actual.event_triggers.items():
+        if (
+            name not in desired.event_triggers
+            and current.function_schema in managed_schemas
+        ):
+            result.append(DropEventTrigger(name=name))
+    return result
 
 
 def _diff_policies(desired: Schema, actual: Schema) -> list[Change]:
