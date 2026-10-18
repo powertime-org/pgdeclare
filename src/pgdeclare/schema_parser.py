@@ -545,6 +545,8 @@ def _reset_default_privileges(plan_url: str) -> None:
                         f"Leaving default privileges for role {role} in the plan "
                         f"database: {exc}"
                     )
+
+
 def _clear_database_level_objects(cur) -> None:
     """Drop every publication and event trigger in the plan database."""
     cur.execute("SELECT pubname FROM pg_catalog.pg_publication")
