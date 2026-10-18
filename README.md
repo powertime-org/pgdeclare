@@ -201,20 +201,26 @@ Within the managed schemas:
 | Tables | yes | via columns and constraints | yes (`@drop` if it holds data) |
 | Columns | yes | type, NOT NULL, default, identity, generated expression | yes (`@drop` if it holds data) |
 | Constraints (PK, FK, UNIQUE, CHECK, EXCLUDE) | yes | drop and re-add | yes |
-| Indexes | yes, `CONCURRENTLY` | drop and re-create | yes |
+| Indexes (on tables and materialized views) | yes, `CONCURRENTLY` | drop and re-create | yes |
 | Enum types | yes | add values (in position) | no (values are never removed) |
 | Composite types | yes | no | no |
+| Domains | yes | default, NOT NULL, CHECK constraints; drop and re-create on a base type or collation change while nothing uses it | yes, after the columns that use it |
+| Sequences (standalone and serial; not identity) | yes, with every option | `ALTER SEQUENCE` options (never `RESTART`; the current value is kept); `OWNED BY` | yes, without `CASCADE` (refused while a default still uses it) |
 | Views | yes | drop and re-create; `WITH (...)` options such as `security_invoker` | yes |
+| Materialized views | yes, `WITH DATA` or `WITH NO DATA` as declared | query: drop and re-create (offline, rebuilds the data); storage options in place | yes |
 | Functions | yes | replace, or drop and re-create when the signature changes | yes |
 | Triggers | yes | drop and re-create | yes |
 | Row level security | enable, force, and policies | policies drop and re-create | yes |
-| Grants to managed roles | tables, columns, functions, schemas | revokes before grants | yes |
+| Grants to managed roles | tables, views, materialized views, columns, functions, sequences, schemas | revokes before grants | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
+| Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, indexes, constraints, triggers, policies, enum and composite types | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
 
-Not managed: extensions, sequences outside identity columns, domains, comments, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
-Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
+A comment the schema files do not declare is removed, including one added by hand. Comments are written in a phase of their own after the DDL and index builds, so an object dropped and recreated in the same run gets its comment back.
+
+Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. A recreated materialized view rebuilds its indexes the same way, and a recreated view or materialized view drops the views and materialized views that read from it and builds them back, from their declarations, in that statement too. Whether a materialized view is populated is not compared: a `REFRESH` is runtime state, not drift. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
 
 ## Configuration
 
@@ -253,7 +259,7 @@ The plan database must be on the same server as the target and must already exis
   - **Disk and time.** The clone is a full copy of the target, so it needs as much free disk, takes time proportional to its size, and the row check counts every managed table exactly.
   - **Privileges.** The role needs `CREATEDB` and must own the target database (or be a superuser).
   - **Cluster-wide changes are not rehearsed.** Role and role-membership changes would apply to the whole server, so they are listed, not run.
-- **Online, offline, blocked.** Every change is classified. Online changes apply directly. Offline changes (SET NOT NULL, column type changes, a new generation expression) lock or rewrite tables and need `--offline` (`offline=True`). Blocked changes (drops of data) need `@drop`.
+- **Online, offline, blocked.** Every change is classified. Online changes apply directly. Offline changes (SET NOT NULL on a column or a domain, column type changes, a new generation expression) lock or rewrite tables and need `--offline` (`offline=True`). Blocked changes (drops of data) need `@drop`.
 - **One migration at a time.** The DDL phase takes a session advisory lock on the target database and fails fast if another run holds it.
 - **Transactions.** Enum changes commit first (Postgres requires it); the rest of the DDL runs in one transaction with savepoints, so a stuck run changes nothing. Index builds run `CONCURRENTLY` afterwards; an invalid index left by a failed build is dropped and retried.
 - **Names are data.** Every identifier written into SQL is quoted with its embedded quotes doubled, every literal escaped, and `DO` blocks use a dollar tag their body cannot contain, so an object name chosen by a less privileged role cannot inject SQL into the migrator's session.

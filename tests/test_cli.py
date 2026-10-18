@@ -437,3 +437,49 @@ def test_a_role_without_createdb_is_told_what_to_do(tmp_path, target, capsys):
         assert "lacks CREATEDB" in err and "--plan-database" in err
     finally:
         _admin(target, f'DROP ROLE IF EXISTS "{role}"')
+
+
+COMBINED = """
+CREATE DOMAIN email AS text CONSTRAINT email_has_at CHECK (VALUE LIKE '%@%');
+CREATE SEQUENCE ticket_no AS integer START WITH 1000;
+
+CREATE TABLE IF NOT EXISTS person (
+    id     serial PRIMARY KEY,
+    email  email NOT NULL,
+    ticket integer NOT NULL DEFAULT nextval('ticket_no')
+);
+COMMENT ON TABLE person IS 'People';
+COMMENT ON COLUMN person.email IS 'Contact address';
+
+CREATE VIEW person_emails AS SELECT id, email FROM person;
+COMMENT ON VIEW person_emails IS 'Emails only';
+
+CREATE MATERIALIZED VIEW person_count AS SELECT count(*) AS n FROM person_emails;
+CREATE INDEX IF NOT EXISTS person_count_n_idx ON person_count (n);
+"""
+
+
+@pytest.mark.integration
+def test_new_object_kinds_converge_together(tmp_path, target):
+    sql_dir = tmp_path / "sql"
+    base = ["--database-url", target, "--sql-dir", str(sql_dir)]
+    _write(sql_dir, COMBINED)
+    assert main(["apply", *base]) == EXIT_OK
+    assert main(["diff", "--exit-code", *base]) == EXIT_OK
+    _admin(target, "INSERT INTO person (email) VALUES ('a@b.c')")
+
+    # Change the view under the matview, a comment, and the sequence options.
+    changed = (
+        COMBINED.replace(
+            "SELECT id, email FROM person;", "SELECT id, email, ticket FROM person;"
+        )
+        .replace("'Emails only'", "'Emails and tickets'")
+        .replace("START WITH 1000", "START WITH 1000 CACHE 5")
+    )
+    _write(sql_dir, changed)
+    assert main(["apply", "--offline", *base]) == EXIT_OK
+    assert main(["diff", "--exit-code", *base]) == EXIT_OK
+    assert _rows(target, "SELECT id, ticket FROM person") == [(1, 1000)]
+    assert _rows(
+        target, "SELECT obj_description('public.person_emails'::regclass)"
+    ) == [("Emails and tickets",)]

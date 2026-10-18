@@ -15,17 +15,21 @@ from .quoting import quote_ident
 from .config import PgDeclareConfig, logger, resolve
 from .models import (
     Column,
+    Comment,
     CompositeType,
     Constraint,
     Dependency,
+    Domain,
     EnumType,
     Function,
     Grant,
     Index,
+    MaterializedView,
     Policy,
     Role,
     RoleMembership,
     Schema,
+    Sequence,
     Table,
     Trigger,
     View,
@@ -93,15 +97,32 @@ def introspect_schema(
             composite_types = _query_composite_types(conn, schema)
             result.composite_types.update(composite_types)
 
+            domains = _query_domains(conn, schema, cfg.search_path_sql)
+            result.domains.update(domains)
+
             views = _query_views(conn, schema)
             result.views.update(views)
+
+            result.materialized_views.update(_query_materialized_views(conn, schema))
+
+            sequences = _query_sequences(conn, schema)
+            result.sequences.update(sequences)
 
             for role in existing_roles:
                 grants = _query_grants(conn, schema, role)
                 result.grants.extend(grants)
 
+        # Comments last: only those on an object introspected above are kept,
+        # so every filter on those objects (extension-owned, `_`-prefixed
+        # tables, constraint-backing indexes) applies to their comments too.
+        for schema in schemas:
+            for comment in _query_comments(conn, schema):
+                if result.has_comment_target(comment):
+                    result.comments[comment.key] = comment
+
         # Query dependencies (cross-schema)
         result.dependencies = _query_dependencies(conn, schemas)
+        result.relation_dependents = _query_relation_dependents(conn, schemas)
 
         # Query schema-level grants for all managed roles
         for role in existing_roles:
@@ -515,7 +536,7 @@ def _query_composite_types(conn, schema: str) -> dict[str, CompositeType]:
     This excludes:
     - Table row types (have a corresponding pg_class entry with reltype = type OID)
     - View row types
-    - Domain types
+    - Domain types (typtype = 'd', see _query_domains)
     - Enum types (typtype = 'e')
     """
     composite_types: dict[str, CompositeType] = {}
@@ -566,6 +587,95 @@ def _query_composite_types(conn, schema: str) -> dict[str, CompositeType]:
     return composite_types
 
 
+def _query_domains(conn, schema: str, search_path: str = "public") -> dict[str, Domain]:
+    """Query domain types (typtype = 'd') and their CHECK constraints.
+
+    `search_path` is set first, as for columns, so the base type, the default
+    and the constraint expressions are named the way the SQL files wrote them.
+    NOT NULL comes from `typnotnull` on every version; PostgreSQL 18 also
+    records it as a contype 'n' constraint row, which is left out.
+    """
+    domains: dict[str, Domain] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SET search_path TO {search_path}")
+        cur.execute(
+            """
+            SELECT
+                t.oid AS type_oid,
+                t.typname AS domain_name,
+                format_type(t.typbasetype, t.typtypmod) AS base_type,
+                NOT t.typnotnull AS is_nullable,
+                pg_get_expr(t.typdefaultbin, 0) AS domain_default,
+                CASE
+                    WHEN t.typcollation <> 0 AND t.typcollation <> b.typcollation
+                    THEN quote_ident(cn.nspname) || '.' || quote_ident(co.collname)
+                END AS collation,
+                ARRAY(
+                    SELECT pg_describe_object(d.classid, d.objid, d.objsubid)
+                    FROM pg_depend d
+                    WHERE d.refclassid = 'pg_type'::regclass
+                      AND d.refobjid IN (t.oid, t.typarray)
+                      AND d.deptype = 'n'
+                    ORDER BY 1
+                ) AS dependents
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            JOIN pg_type b ON b.oid = t.typbasetype
+            LEFT JOIN pg_collation co ON co.oid = t.typcollation
+            LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
+            WHERE t.typtype = 'd'
+              AND n.nspname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_type'::regclass AND ext.objid = t.oid
+                    AND ext.deptype = 'e'
+              )
+            ORDER BY t.typname
+            """,
+            (schema,),
+        )
+        rows = cur.fetchall()
+
+        for row in rows:
+            cur.execute(
+                """
+                SELECT
+                    con.conname AS constraint_name,
+                    con.contype AS constraint_type,
+                    pg_get_constraintdef(con.oid) AS constraint_def
+                FROM pg_constraint con
+                WHERE con.contypid = %s
+                  AND con.contype = 'c'
+                ORDER BY con.conname
+                """,
+                (row["type_oid"],),
+            )
+            constraints = [
+                Constraint(
+                    name=c["constraint_name"],
+                    type=c["constraint_type"],
+                    definition=c["constraint_def"],
+                    table=row["domain_name"],
+                )
+                for c in cur.fetchall()
+            ]
+            domain = Domain(
+                schema=schema,
+                name=row["domain_name"],
+                base_type=row["base_type"],
+                nullable=row["is_nullable"],
+                default=row["domain_default"],
+                collation=row["collation"],
+                constraints=constraints,
+                dependents=list(row["dependents"] or []),
+            )
+            domains[domain.qualified_name] = domain
+
+    return domains
+
+
 def _query_views(conn, schema: str) -> dict[str, View]:
     """Query views from pg_views, plus their reloptions from pg_class.
 
@@ -612,6 +722,272 @@ def _query_views(conn, schema: str) -> dict[str, View]:
             views[view.qualified_name] = view
 
     return views
+
+
+# One row per comment: (object_type, name, member, args, text). Each branch
+# reads pg_description for one catalog; `%(schema)s` is the managed schema.
+_COMMENTS_SQL = """
+SELECT
+    CASE
+        WHEN d.objsubid <> 0 THEN 'COLUMN'
+        WHEN c.relkind IN ('r', 'p') THEN 'TABLE'
+        WHEN c.relkind = 'v' THEN 'VIEW'
+        ELSE 'INDEX'
+    END AS object_type,
+    c.relname AS name,
+    COALESCE(a.attname, '') AS member,
+    '' AS args,
+    d.description AS text
+FROM pg_description d
+JOIN pg_class c ON d.classoid = 'pg_class'::regclass AND d.objoid = c.oid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_attribute a
+  ON d.objsubid <> 0 AND a.attrelid = c.oid AND a.attnum = d.objsubid
+WHERE n.nspname = %(schema)s
+  AND c.relkind IN ('r', 'p', 'v', 'i')
+  AND (d.objsubid = 0 OR (a.attname IS NOT NULL AND NOT a.attisdropped))
+
+UNION ALL
+SELECT 'CONSTRAINT', c.relname, con.conname, '', d.description
+FROM pg_description d
+JOIN pg_constraint con
+  ON d.classoid = 'pg_constraint'::regclass AND d.objoid = con.oid
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %(schema)s
+
+UNION ALL
+SELECT 'TRIGGER', c.relname, t.tgname, '', d.description
+FROM pg_description d
+JOIN pg_trigger t ON d.classoid = 'pg_trigger'::regclass AND d.objoid = t.oid
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %(schema)s
+
+UNION ALL
+SELECT 'POLICY', c.relname, pol.polname, '', d.description
+FROM pg_description d
+JOIN pg_policy pol ON d.classoid = 'pg_policy'::regclass AND d.objoid = pol.oid
+JOIN pg_class c ON c.oid = pol.polrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %(schema)s
+
+UNION ALL
+SELECT 'FUNCTION', p.proname, '', pg_get_function_identity_arguments(p.oid),
+       d.description
+FROM pg_description d
+JOIN pg_proc p ON d.classoid = 'pg_proc'::regclass AND d.objoid = p.oid
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = %(schema)s
+
+UNION ALL
+SELECT 'TYPE', t.typname, '', '', d.description
+FROM pg_description d
+JOIN pg_type t ON d.classoid = 'pg_type'::regclass AND d.objoid = t.oid
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = %(schema)s
+  AND t.typtype IN ('e', 'c')
+"""
+
+
+def _query_comments(conn, schema: str) -> list[Comment]:
+    """Query `COMMENT ON` text for objects in `schema` from pg_description.
+
+    The caller keeps only the comments whose object it introspected.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(_COMMENTS_SQL, {"schema": schema})
+        return [
+            Comment(
+                object_type=row["object_type"],
+                schema=schema,
+                name=row["name"],
+                member=row["member"],
+                args=row["args"] or "",
+                text=row["text"],
+            )
+            for row in cur.fetchall()
+        ]
+
+
+def _query_materialized_views(conn, schema: str) -> dict[str, MaterializedView]:
+    """Query materialized views from pg_matviews, plus storage options from pg_class."""
+    matviews: dict[str, MaterializedView] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                c.relname AS matview_name,
+                mv.definition AS matview_definition,
+                c.reloptions AS reloptions,
+                c.relispopulated AS is_populated
+            FROM pg_matviews AS mv
+            JOIN pg_namespace AS n ON n.nspname = mv.schemaname
+            JOIN pg_class AS c
+              ON c.relname = mv.matviewname
+             AND c.relnamespace = n.oid
+             AND c.relkind = 'm'
+            WHERE mv.schemaname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_class'::regclass AND ext.objid = c.oid
+                    AND ext.deptype = 'e'
+              )
+            ORDER BY c.relname
+            """,
+            (schema,),
+        )
+
+        for row in cur.fetchall():
+            matview = MaterializedView(
+                schema=schema,
+                name=row["matview_name"],
+                definition=row["matview_definition"] or "",
+                reloptions=list(row["reloptions"] or []),
+                with_data=bool(row["is_populated"]),
+            )
+            matviews[matview.qualified_name] = matview
+
+    return matviews
+
+
+def _query_relation_dependents(conn, schemas: list[str]) -> dict[str, list[str]]:
+    """Views and materialized views that read from another one, within `schemas`.
+
+    A view's query is stored as a rewrite rule, and the rule depends on every
+    relation the query reads. Only edges between views and materialized views
+    are kept: those are the ones a drop-and-recreate has to carry along.
+    """
+    dependents: dict[str, list[str]] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT
+                ref_ns.nspname AS ref_schema,
+                ref.relname AS ref_name,
+                dep_ns.nspname AS dep_schema,
+                dep.relname AS dep_name
+            FROM pg_depend AS d
+            JOIN pg_rewrite AS r ON r.oid = d.objid
+            JOIN pg_class AS dep ON dep.oid = r.ev_class
+            JOIN pg_namespace AS dep_ns ON dep_ns.oid = dep.relnamespace
+            JOIN pg_class AS ref ON ref.oid = d.refobjid
+            JOIN pg_namespace AS ref_ns ON ref_ns.oid = ref.relnamespace
+            WHERE d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_class'::regclass
+              AND d.deptype = 'n'
+              AND dep.oid <> ref.oid
+              AND dep.relkind IN ('v', 'm')
+              AND ref.relkind IN ('v', 'm')
+              AND dep_ns.nspname = ANY(%s)
+              AND ref_ns.nspname = ANY(%s)
+            ORDER BY 1, 2, 3, 4
+            """,
+            (list(schemas), list(schemas)),
+        )
+
+        for row in cur.fetchall():
+            key = f"{row['ref_schema']}.{row['ref_name']}"
+            dependents.setdefault(key, []).append(
+                f"{row['dep_schema']}.{row['dep_name']}"
+            )
+
+    return dependents
+
+
+# The sequences of a schema that the engine manages: every sequence except the
+# ones an identity column owns (pg_depend 'i'; the column manages those), the
+# ones an extension owns, and the ones whose name, or whose owning table's
+# name, starts with `_` (ignored like such tables). A serial column's sequence
+# is included: it is catalog-identical to a declared sequence OWNED BY the
+# column, so the two are modelled alike and the table's nextval() default has
+# something to point at on a fresh database.
+_MANAGED_SEQUENCES_SQL = """
+    SELECT c.oid, c.relname
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'S'
+      AND n.nspname = %s
+      AND NOT c.relname ~ '^_'
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_depend d
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+            AND (
+                d.deptype IN ('i', 'e')
+                OR (
+                    d.deptype = 'a'
+                    AND d.refclassid = 'pg_class'::regclass
+                    AND EXISTS (
+                        SELECT 1 FROM pg_class t
+                        WHERE t.oid = d.refobjid AND t.relname ~ '^_'
+                    )
+                )
+            )
+      )
+"""
+
+
+def _query_sequences(conn, schema: str) -> dict[str, Sequence]:
+    """Query the managed sequences of a schema (see _MANAGED_SEQUENCES_SQL)."""
+    sequences: dict[str, Sequence] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            WITH managed AS ({_MANAGED_SEQUENCES_SQL})
+            SELECT
+                m.relname AS sequence_name,
+                format_type(s.seqtypid, NULL) AS data_type,
+                s.seqincrement AS increment,
+                s.seqmin AS min_value,
+                s.seqmax AS max_value,
+                s.seqstart AS start,
+                s.seqcache AS cache,
+                s.seqcycle AS cycle,
+                owner_ns.nspname AS owner_schema,
+                owner_tbl.relname AS owner_table,
+                owner_col.attname AS owner_column
+            FROM managed m
+            JOIN pg_sequence s ON s.seqrelid = m.oid
+            LEFT JOIN pg_depend od
+              ON od.classid = 'pg_class'::regclass AND od.objid = m.oid
+             AND od.refclassid = 'pg_class'::regclass
+             AND od.deptype = 'a' AND od.refobjsubid > 0
+            LEFT JOIN pg_class owner_tbl ON owner_tbl.oid = od.refobjid
+            LEFT JOIN pg_namespace owner_ns ON owner_ns.oid = owner_tbl.relnamespace
+            LEFT JOIN pg_attribute owner_col
+              ON owner_col.attrelid = od.refobjid AND owner_col.attnum = od.refobjsubid
+            ORDER BY m.relname
+            """,
+            (schema,),
+        )
+
+        for row in cur.fetchall():
+            owned_by = None
+            if row["owner_table"] is not None:
+                owned_by = (
+                    row["owner_schema"],
+                    row["owner_table"],
+                    row["owner_column"],
+                )
+            seq = Sequence(
+                schema=schema,
+                name=row["sequence_name"],
+                data_type=row["data_type"],
+                increment=row["increment"],
+                min_value=row["min_value"],
+                max_value=row["max_value"],
+                start=row["start"],
+                cache=row["cache"],
+                cycle=row["cycle"],
+                owned_by=owned_by,
+            )
+            sequences[seq.qualified_name] = seq
+
+    return sequences
 
 
 def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
@@ -691,6 +1067,64 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                 )
             )
 
+        # Materialized view grants. information_schema.role_table_grants and
+        # role_column_grants only cover tables, views and foreign tables, so
+        # read the ACLs directly. acldefault() stands in for a NULL ACL, the
+        # way information_schema does it, so an owning role reads the same.
+        cur.execute(
+            """
+            SELECT c.relname AS object_name, a.privilege_type
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a
+            JOIN pg_roles g ON g.oid = a.grantee
+            WHERE c.relkind = 'm' AND n.nspname = %s AND g.rolname = %s
+            """,
+            (schema, grantee),
+        )
+        matview_rows = cur.fetchall()
+        for row in matview_rows:
+            grants.append(
+                Grant(
+                    object_type="TABLE",
+                    object_name=row["object_name"],
+                    schema=schema,
+                    privilege=row["privilege_type"],
+                    grantee=grantee,
+                    column=None,
+                )
+            )
+        matview_grant_keys = {
+            (row["object_name"], row["privilege_type"]) for row in matview_rows
+        }
+        cur.execute(
+            """
+            SELECT c.relname AS object_name, att.attname AS column_name,
+                   a.privilege_type
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_attribute att
+              ON att.attrelid = c.oid AND att.attnum > 0 AND NOT att.attisdropped
+            CROSS JOIN LATERAL aclexplode(att.attacl) a
+            JOIN pg_roles g ON g.oid = a.grantee
+            WHERE c.relkind = 'm' AND n.nspname = %s AND g.rolname = %s
+            """,
+            (schema, grantee),
+        )
+        for row in cur.fetchall():
+            if (row["object_name"], row["privilege_type"]) in matview_grant_keys:
+                continue
+            grants.append(
+                Grant(
+                    object_type="COLUMN",
+                    object_name=row["object_name"],
+                    schema=schema,
+                    privilege=row["privilege_type"],
+                    grantee=grantee,
+                    column=row["column_name"],
+                )
+            )
+
         # Function grants
         cur.execute(
             """
@@ -715,6 +1149,35 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                     schema=schema,
                     privilege=row["privilege_type"],
                     grantee=row["grantee"],
+                    column=None,
+                )
+            )
+
+        # Sequence grants (USAGE, SELECT, UPDATE). information_schema's
+        # table_privileges leaves sequences out, so read the ACL directly, and
+        # only for the sequences the engine manages.
+        cur.execute(
+            f"""
+            WITH managed AS ({_MANAGED_SEQUENCES_SQL})
+            SELECT m.relname AS object_name, a.privilege_type
+            FROM managed m
+            JOIN pg_class c ON c.oid = m.oid
+            CROSS JOIN LATERAL aclexplode(c.relacl) a
+            JOIN pg_roles r ON r.oid = a.grantee
+            WHERE r.rolname = %s
+            ORDER BY m.relname, a.privilege_type
+            """,
+            (schema, grantee),
+        )
+
+        for row in cur.fetchall():
+            grants.append(
+                Grant(
+                    object_type="SEQUENCE",
+                    object_name=row["object_name"],
+                    schema=schema,
+                    privilege=row["privilege_type"],
+                    grantee=grantee,
                     column=None,
                 )
             )

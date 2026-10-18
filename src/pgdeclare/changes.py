@@ -9,21 +9,25 @@ Each Change subclass represents a specific database modification with:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 from .quoting import do_block, dollar_tag, quote_ident, quote_literal, role_ident
 from .models import (
     ChangeCategory,
     Column,
+    Comment,
     CompositeType,
     Constraint,
+    Domain,
     EnumType,
     Function,
     Grant,
     Index,
+    MaterializedView,
     Policy,
     Role,
     RoleMembership,
+    Sequence,
     Table,
     Trigger,
     View,
@@ -1135,11 +1139,418 @@ class CreateCompositeType(Change):
 
 
 # =============================================================================
+# Domain Changes
+# =============================================================================
+
+_NOT_VALID_SUFFIX = " NOT VALID"
+
+
+def _domain_ident(schema: str, name: str) -> str:
+    return f"{quote_ident(schema)}.{quote_ident(name)}"
+
+
+def _valid_check(definition: str) -> str:
+    """A CHECK definition without pg_get_constraintdef's NOT VALID marker."""
+    if definition.endswith(_NOT_VALID_SUFFIX):
+        return definition[: -len(_NOT_VALID_SUFFIX)]
+    return definition
+
+
+def _create_domain_sql(domain: Domain) -> str:
+    sql = f"CREATE DOMAIN {_domain_ident(domain.schema, domain.name)} AS {domain.base_type}"
+    if domain.collation:
+        sql += f" COLLATE {domain.collation}"
+    if domain.default is not None:
+        sql += f" DEFAULT {domain.default}"
+    if not domain.nullable:
+        sql += " NOT NULL"
+    for constraint in sorted(domain.constraints, key=lambda c: c.name):
+        sql += f" CONSTRAINT {quote_ident(constraint.name)} {_valid_check(constraint.definition)}"
+    return sql + ";"
+
+
+@dataclass
+class CreateDomain(Change):
+    """Create a domain with its default, NOT NULL and CHECK constraints."""
+
+    domain: Domain = field(
+        default_factory=lambda: Domain(schema="public", name="", base_type="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = self.domain.qualified_name
+        if not self.description:
+            self.description = f"Create domain {self.domain.qualified_name}"
+
+    def to_sql(self) -> str:
+        return _create_domain_sql(self.domain)
+
+
+@dataclass
+class DropDomain(Change):
+    """Drop a domain that is no longer declared.
+
+    Never CASCADE: a column still typed with the domain is dropped or retyped
+    by its own change, and the executor retries this drop until it has been.
+    """
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP DOMAIN IF EXISTS {_domain_ident(self.schema, self.name)};"
+
+
+@dataclass
+class DropAndCreateDomain(Change):
+    """Recreate a domain whose base type or collation changed.
+
+    The differ emits this only when nothing in the database uses the domain,
+    so the plain DROP cannot cascade into data.
+    """
+
+    domain: Domain = field(
+        default_factory=lambda: Domain(schema="public", name="", base_type="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = self.domain.qualified_name
+        if not self.description:
+            self.description = f"Drop and recreate domain {self.domain.qualified_name}"
+
+    def to_sql(self) -> str:
+        drop = f"DROP DOMAIN {_domain_ident(self.domain.schema, self.domain.name)};"
+        return f"{drop}\n{_create_domain_sql(self.domain)}"
+
+
+@dataclass
+class AlterDomainSetDefault(Change):
+    """Set a domain's default."""
+
+    schema: str = "public"
+    name: str = ""
+    default_value: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Set default on domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.name)} SET DEFAULT {self.default_value};"
+
+
+@dataclass
+class AlterDomainDropDefault(Change):
+    """Remove a domain's default."""
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop default on domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.name)} DROP DEFAULT;"
+
+
+@dataclass
+class AlterDomainSetNotNull(Change):
+    """Make a domain NOT NULL (offline: scans every column typed with it)."""
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.OFFLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Set NOT NULL on domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.name)} SET NOT NULL;"
+
+
+@dataclass
+class AlterDomainDropNotNull(Change):
+    """Allow NULL in a domain."""
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop NOT NULL on domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.name)} DROP NOT NULL;"
+
+
+@dataclass
+class AddDomainConstraint(Change):
+    """Add a CHECK constraint to a domain, NOT VALID until validated."""
+
+    schema: str = "public"
+    domain: str = ""
+    constraint: Constraint = field(
+        default_factory=lambda: Constraint(name="", type="c", definition="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.domain}.{self.constraint.name}"
+        if not self.description:
+            self.description = f"Add constraint {self.constraint.name} to domain {self.schema}.{self.domain}"
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER DOMAIN {_domain_ident(self.schema, self.domain)} "
+            f"ADD CONSTRAINT {quote_ident(self.constraint.name)} "
+            f"{_valid_check(self.constraint.definition)}{_NOT_VALID_SUFFIX};"
+        )
+
+
+@dataclass
+class DropDomainConstraint(Change):
+    """Drop a CHECK constraint from a domain."""
+
+    schema: str = "public"
+    domain: str = ""
+    constraint_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.domain}.{self.constraint_name}"
+        if not self.description:
+            self.description = f"Drop constraint {self.constraint_name} from domain {self.schema}.{self.domain}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.domain)} DROP CONSTRAINT IF EXISTS {quote_ident(self.constraint_name)};"
+
+
+@dataclass
+class DropAndCreateDomainConstraint(Change):
+    """Replace a domain CHECK constraint whose definition changed."""
+
+    schema: str = "public"
+    domain: str = ""
+    constraint: Constraint = field(
+        default_factory=lambda: Constraint(name="", type="c", definition="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.domain}.{self.constraint.name}"
+        if not self.description:
+            self.description = f"Drop and recreate constraint {self.constraint.name} on domain {self.schema}.{self.domain}"
+
+    def to_sql(self) -> str:
+        target = _domain_ident(self.schema, self.domain)
+        name = quote_ident(self.constraint.name)
+        drop_sql = f"ALTER DOMAIN {target} DROP CONSTRAINT IF EXISTS {name}"
+        add_sql = f"ALTER DOMAIN {target} ADD CONSTRAINT {name} {_valid_check(self.constraint.definition)}{_NOT_VALID_SUFFIX}"
+        return do_block(f"BEGIN {drop_sql}; {add_sql}; END")
+
+
+@dataclass
+class ValidateDomainConstraint(Change):
+    """Validate a NOT VALID domain constraint against existing data."""
+
+    schema: str = "public"
+    domain: str = ""
+    constraint_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.domain}.{self.constraint_name}"
+        if not self.description:
+            self.description = f"Validate constraint {self.constraint_name} on domain {self.schema}.{self.domain}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.domain)} VALIDATE CONSTRAINT {quote_ident(self.constraint_name)};"
+
+
+# =============================================================================
+# Sequence Changes
+# =============================================================================
+
+
+SEQUENCE_TYPES = frozenset({"smallint", "integer", "bigint"})
+
+
+def _sequence_ident(seq: Sequence) -> str:
+    return f"{quote_ident(seq.schema)}.{quote_ident(seq.name)}"
+
+
+def _sequence_options_sql(seq: Sequence) -> str:
+    """Every option, spelled out: the catalog's values, not PostgreSQL's defaults.
+
+    Writing all of them keeps CREATE and ALTER independent of the defaults
+    (which depend on the type and the sign of INCREMENT) and makes an `AS`
+    change unable to move MINVALUE/MAXVALUE behind the declaration's back.
+    """
+    # The type comes from format_type() on the catalog or the plan database;
+    # a sequence can only be one of these, so anything else is refused rather
+    # than written into SQL.
+    if seq.data_type not in SEQUENCE_TYPES:
+        raise ValueError(
+            f"sequence {seq.qualified_name}: unexpected type {seq.data_type!r}"
+        )
+    cycle = "CYCLE" if seq.cycle else "NO CYCLE"
+    return (
+        f"AS {seq.data_type} INCREMENT BY {int(seq.increment)}"
+        f" MINVALUE {int(seq.min_value)} MAXVALUE {int(seq.max_value)}"
+        f" START WITH {int(seq.start)} CACHE {int(seq.cache)} {cycle}"
+    )
+
+
+@dataclass
+class CreateSequence(Change):
+    """Create a sequence. Ownership is a separate SetSequenceOwner change.
+
+    A table's `nextval()` default needs the sequence first, and OWNED BY needs
+    the table first, so the two cannot be one statement.
+    """
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            self.description = f"Create sequence {self.sequence.qualified_name}"
+
+    def to_sql(self) -> str:
+        return f"CREATE SEQUENCE {_sequence_ident(self.sequence)} {_sequence_options_sql(self.sequence)};"
+
+
+@dataclass
+class AlterSequence(Change):
+    """Converge a sequence's options in place.
+
+    Never RESTART: `START WITH` only changes the value a future
+    `ALTER SEQUENCE ... RESTART` would use, so the current value survives.
+    """
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            self.description = (
+                f"Alter options of sequence {self.sequence.qualified_name}"
+            )
+
+    def to_sql(self) -> str:
+        return f"ALTER SEQUENCE {_sequence_ident(self.sequence)} {_sequence_options_sql(self.sequence)};"
+
+
+@dataclass
+class SetSequenceOwner(Change):
+    """`ALTER SEQUENCE ... OWNED BY table.column` (or `OWNED BY NONE`)."""
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            owner = self.sequence.owned_by
+            target = ".".join(owner) if owner else "nothing"
+            self.description = (
+                f"Set sequence {self.sequence.qualified_name} owned by {target}"
+            )
+
+    def to_sql(self) -> str:
+        owner = self.sequence.owned_by
+        if owner is None:
+            target = "NONE"
+        else:
+            target = ".".join(quote_ident(part) for part in owner)
+        return f"ALTER SEQUENCE {_sequence_ident(self.sequence)} OWNED BY {target};"
+
+
+@dataclass
+class DropSequence(Change):
+    """Drop a sequence that is no longer declared.
+
+    No CASCADE: if a column default still calls nextval() on it, PostgreSQL
+    refuses and the run fails rather than silently dropping the default. The
+    differ orders this after the table changes, so a default being removed in
+    the same run is gone first. IF EXISTS because dropping the owning table or
+    column already dropped an owned sequence.
+    """
+
+    schema: str = "public"
+    sequence_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.sequence_name}"
+        if not self.description:
+            self.description = f"Drop sequence {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP SEQUENCE IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.sequence_name)};"
+
+
+# =============================================================================
 # View Changes
 # =============================================================================
 
 
-def view_options_note(view: View) -> str:
+def view_options_note(view: Union[View, MaterializedView]) -> str:
     """Plan-summary suffix naming the view options a change applies."""
     if not view.reloptions:
         return ""
@@ -1208,6 +1619,10 @@ class DropAndCreateView(Change):
     # definition depends on an object built later in the same run, which lands
     # the grant on the pre-drop view and then throws it away.
     grants: list[Grant] = field(default_factory=list)
+    # Views and materialized views that read from this one. DROP refuses while
+    # they exist, so they are dropped first and rebuilt after, in this same
+    # statement. Attached by compute_diff.
+    dependents: list["DependentRelation"] = field(default_factory=list)
 
     def __post_init__(self):
         self.object_name = self.view.qualified_name
@@ -1232,8 +1647,10 @@ class DropAndCreateView(Change):
         )
         # Escape single quotes in view definition for EXECUTE
         escaped_create = create_sql.replace("'", "''")
-        inner = f"{drop_sql}; EXECUTE '{escaped_create}';"
+        inner = _drop_dependents_sql(self.dependents)
+        inner += f"{drop_sql}; EXECUTE '{escaped_create}';"
         inner += _replay_grants_sql(self.grants)
+        inner += _recreate_dependents_sql(self.dependents)
         return do_block(f"BEGIN {inner} END")
 
 
@@ -1283,6 +1700,252 @@ class AlterViewOptions(Change):
 
 
 # =============================================================================
+# Materialized View Changes
+# =============================================================================
+
+
+def _execute_sql(statement: str) -> str:
+    """`statement` as an `EXECUTE '...';` inside a DO block."""
+    escaped = statement.replace("'", "''")
+    return f" EXECUTE '{escaped}';"
+
+
+def _create_matview_sql(matview: MaterializedView) -> str:
+    """`CREATE MATERIALIZED VIEW ... AS <query> WITH [NO] DATA` (no trailing `;`)."""
+    # pg_get_viewdef ends the query with `;`, and WITH DATA has to follow it.
+    query = matview.definition.strip().rstrip(";").rstrip()
+    data = "WITH DATA" if matview.with_data else "WITH NO DATA"
+    return (
+        f"CREATE MATERIALIZED VIEW {quote_ident(matview.schema)}.{quote_ident(matview.name)}"
+        f"{matview.options_clause} AS {query} {data}"
+    )
+
+
+def _rebuild_indexes_sql(indexes: list[Index]) -> str:
+    """Rebuild a recreated materialized view's indexes inside its DO block.
+
+    DROP takes the indexes with it, and the diff, computed against the snapshot
+    taken before the run, still sees them, so nothing else would bring them
+    back. They are built in the same statement, not CONCURRENTLY: the object is
+    new, nobody can be reading it yet, and the index can never be missing.
+    """
+    return "".join(_execute_sql(index.definition) for index in indexes)
+
+
+@dataclass
+class DependentRelation:
+    """A view or materialized view that reads from a relation being recreated.
+
+    `relation` is its declared definition, or None when it is no longer
+    declared: then it is only dropped (its own DropView or
+    DropMaterializedView finds it gone).
+    """
+
+    schema: str
+    name: str
+    kind: str  # 'v' (view) or 'm' (materialized view)
+    relation: Optional[Union[View, MaterializedView]] = None
+    grants: list[Grant] = field(default_factory=list)
+    indexes: list[Index] = field(default_factory=list)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    @property
+    def rebuilds_data(self) -> bool:
+        return isinstance(self.relation, MaterializedView)
+
+    def drop_sql(self) -> str:
+        keyword = "MATERIALIZED VIEW" if self.kind == "m" else "VIEW"
+        return f"DROP {keyword} IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.name)};"
+
+    def create_sql(self) -> str:
+        relation = self.relation
+        if relation is None:
+            return ""
+        if isinstance(relation, MaterializedView):
+            create = _create_matview_sql(relation)
+        else:
+            create = (
+                f"CREATE VIEW {quote_ident(relation.schema)}.{quote_ident(relation.name)}"
+                f"{relation.options_clause} AS {relation.definition}"
+            )
+        return (
+            _execute_sql(create)
+            + _replay_grants_sql(self.grants)
+            + _rebuild_indexes_sql(self.indexes)
+        )
+
+
+def _drop_dependents_sql(dependents: list[DependentRelation]) -> str:
+    """Drop dependents, innermost first. `dependents` is in creation order."""
+    return "".join(f"{d.drop_sql()} " for d in reversed(dependents))
+
+
+def _recreate_dependents_sql(dependents: list[DependentRelation]) -> str:
+    """Rebuild the still-declared dependents, each after what it reads from."""
+    return "".join(d.create_sql() for d in dependents)
+
+
+def dependents_note(dependents: list[DependentRelation]) -> str:
+    """Plan-summary suffix for a recreate that carries its dependents along."""
+    rebuilt = [d.name for d in dependents if d.relation is not None]
+    dropped = [d.name for d in dependents if d.relation is None]
+    note = ""
+    if rebuilt:
+        note += f" (recreating dependent {', '.join(rebuilt)})"
+    if dropped:
+        note += f" (dropping dependent {', '.join(dropped)})"
+    return note
+
+
+def index_rebuild_note(count: int) -> str:
+    """Plan-summary suffix for a matview recreate that rebuilds `count` indexes."""
+    if not count:
+        return ""
+    return f" (rebuilding {count} index{'es' if count > 1 else ''})"
+
+
+@dataclass
+class CreateMaterializedView(Change):
+    """Create a materialized view, populated or not as declared."""
+
+    matview: MaterializedView = field(
+        default_factory=lambda: MaterializedView(
+            schema="public", name="", definition=""
+        )
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "MATERIALIZED VIEW"
+
+    def __post_init__(self):
+        self.object_name = self.matview.qualified_name
+        if not self.description:
+            data = "" if self.matview.with_data else " WITH NO DATA"
+            self.description = (
+                f"Create materialized view {self.matview.name}"
+                + view_options_note(self.matview)
+                + data
+            )
+
+    def to_sql(self) -> str:
+        return _create_matview_sql(self.matview) + ";"
+
+
+@dataclass
+class DropMaterializedView(Change):
+    """Drop a materialized view. Its data is derived, so nothing is lost."""
+
+    schema: str = "public"
+    matview_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "MATERIALIZED VIEW"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.matview_name}"
+        if not self.description:
+            self.description = f"Drop materialized view {self.matview_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP MATERIALIZED VIEW IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.matview_name)};"
+
+
+@dataclass
+class DropAndCreateMaterializedView(Change):
+    """Drop and recreate a materialized view whose query changed.
+
+    There is no `CREATE OR REPLACE MATERIALIZED VIEW`. The recreate re-runs the
+    query to repopulate the object (unless it is declared `WITH NO DATA`), and
+    the table lock it holds until commit blocks every reader of the
+    materialized view for that long, so it is OFFLINE.
+
+    Like DropAndCreateView, everything the DROP throws away is rebuilt inside
+    the same DO block: the declared grants, the declared indexes, and the
+    views and materialized views that read from this one. No execution order
+    can leave the object without them.
+    """
+
+    matview: MaterializedView = field(
+        default_factory=lambda: MaterializedView(
+            schema="public", name="", definition=""
+        )
+    )
+    category: ChangeCategory = ChangeCategory.OFFLINE
+    description: str = ""
+    object_type: str = "MATERIALIZED VIEW"
+    grants: list[Grant] = field(default_factory=list)
+    indexes: list[Index] = field(default_factory=list)
+    dependents: list[DependentRelation] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.object_name = self.matview.qualified_name
+        if not self.description:
+            self.description = (
+                f"Drop and recreate materialized view {self.matview.name}"
+                + view_options_note(self.matview)
+                + (
+                    " (rebuilds its data)"
+                    if self.matview.with_data
+                    else " WITH NO DATA"
+                )
+            )
+
+    def to_sql(self) -> str:
+        target = f"{quote_ident(self.matview.schema)}.{quote_ident(self.matview.name)}"
+        inner = _drop_dependents_sql(self.dependents)
+        inner += f"DROP MATERIALIZED VIEW IF EXISTS {target};"
+        inner += _execute_sql(_create_matview_sql(self.matview))
+        inner += _replay_grants_sql(self.grants)
+        inner += _rebuild_indexes_sql(self.indexes)
+        inner += _recreate_dependents_sql(self.dependents)
+        return do_block(f"BEGIN {inner} END")
+
+
+@dataclass
+class AlterMaterializedViewOptions(Change):
+    """Converge a materialized view's storage parameters in place."""
+
+    matview: MaterializedView = field(
+        default_factory=lambda: MaterializedView(
+            schema="public", name="", definition=""
+        )
+    )
+    current_reloptions: list[str] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "MATERIALIZED VIEW"
+
+    def __post_init__(self):
+        self.object_name = self.matview.qualified_name
+        if not self.description:
+            desired = ", ".join(self.matview.reloptions) or "no options"
+            self.description = (
+                f"Set storage options on materialized view {self.matview.name} "
+                f"to {desired}"
+            )
+
+    def to_sql(self) -> str:
+        target = f"{quote_ident(self.matview.schema)}.{quote_ident(self.matview.name)}"
+        desired_names = {opt.partition("=")[0] for opt in self.matview.reloptions}
+        removed = sorted(
+            {opt.partition("=")[0] for opt in self.current_reloptions} - desired_names
+        )
+        statements: list[str] = []
+        if removed:
+            statements.append(
+                f"ALTER MATERIALIZED VIEW {target} RESET ({', '.join(removed)});"
+            )
+        if self.matview.reloptions:
+            statements.append(
+                f"ALTER MATERIALIZED VIEW {target} SET ({', '.join(self.matview.reloptions)});"
+            )
+        return " ".join(statements)
+
+
+# =============================================================================
 # Grant/Revoke Changes
 # =============================================================================
 
@@ -1312,6 +1975,8 @@ class GrantPrivilege(Change):
             return f"GRANT {self.grant.privilege} ({quote_ident(self.grant.column)}) ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         elif self.grant.object_type == "FUNCTION":
             return f"GRANT {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
+        elif self.grant.object_type == "SEQUENCE":
+            return f"GRANT {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         else:
             return f"GRANT {self.grant.privilege} ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
 
@@ -1348,6 +2013,13 @@ class RevokePrivilege(Change):
             revoke_sql = f"REVOKE {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
             return do_block(
                 f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_function THEN NULL; END"
+            )
+        elif self.grant.object_type == "SEQUENCE":
+            # Wrap in DO block: the sequence may have been dropped in this
+            # batch, with its owning table or by DropSequence.
+            revoke_sql = f"REVOKE {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
+            return do_block(
+                f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_table THEN NULL; END"
             )
         else:
             return f"REVOKE {self.grant.privilege} ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)};"
@@ -1526,3 +2198,38 @@ class RevokeRoleMembership(Change):
 
     def to_sql(self) -> str:
         return f"REVOKE {quote_ident(self.membership.role)} FROM {quote_ident(self.membership.member)};"
+
+
+# =============================================================================
+# Comment Changes
+# =============================================================================
+
+
+@dataclass
+class SetComment(Change):
+    """Set, change or remove (`IS NULL`) the comment on an object.
+
+    The executor runs these in a phase of their own, after the DDL and the
+    concurrent index builds, so the object exists, in its final form, whatever
+    order the retry loop chose and whether or not it was dropped and recreated.
+    """
+
+    comment: Comment = field(
+        default_factory=lambda: Comment(object_type="", schema="", name="", text="")
+    )
+    # True writes `IS NULL`: the declaration was removed.
+    remove: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "COMMENT"
+
+    def __post_init__(self):
+        self.object_name = self.comment.key
+        if not self.description:
+            kind, _, target = self.comment.key.partition(":")
+            verb = "Remove comment on" if self.remove else "Set comment on"
+            self.description = f"{verb} {kind.lower()} {target}"
+
+    def to_sql(self) -> str:
+        text = "NULL" if self.remove else quote_literal(self.comment.text)
+        return f"COMMENT ON {self.comment.target_sql} IS {text};"

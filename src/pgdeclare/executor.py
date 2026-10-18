@@ -4,6 +4,7 @@ Migration execution engine.
 Executes schema changes with proper transaction handling:
 - Phase 1: DDL changes with retry-until-stable ordering
 - Phase 2: CONCURRENTLY index operations outside transaction (with retry)
+- Phase 3: COMMENT ON, once every object exists in its final form
 
 The retry-until-stable approach replaces complex priority-based ordering.
 PostgreSQL itself discovers the correct execution order by:
@@ -21,7 +22,15 @@ import psycopg2.errors
 
 from .quoting import quote_ident
 from .config import PgDeclareConfig, logger, plain, resolve
-from .changes import AddEnumValue, Change, CreateEnum, CreateIndex, CreateRole
+from .changes import (
+    AddEnumValue,
+    Change,
+    CreateEnum,
+    CreateIndex,
+    CreateRole,
+    SetComment,
+    DropDomain,
+)
 from .differ import categorize_changes, split_index_operations
 from .models import ChangeCategory
 from .retry_executor import ERROR_CODE_CATEGORIES, ErrorCategory
@@ -37,6 +46,12 @@ DEPENDENCY_ERROR_CODES = {
 # Change types that are idempotent (safe to skip if duplicate_object error)
 # CreateRole is cluster-wide - may already exist from retry_executor.py
 IDEMPOTENT_CHANGE_TYPES = (CreateRole,)
+
+# dependent_objects_still_exist. Retryable only for a DropDomain: the column or
+# signature that still uses the domain is dropped or retyped by another change
+# in the same run, and the drop succeeds once that one has.
+DEPENDENT_OBJECTS_ERROR_CODE = "2BP01"
+RETRY_WHILE_DEPENDED_ON = (DropDomain,)
 
 # PostgreSQL error code for "already exists" errors
 DUPLICATE_ERROR_CODE = "42710"  # duplicate_object
@@ -152,8 +167,13 @@ def execute_migration(
         )
         return False, []
 
-    # Split into DDL and index operations
-    ddl_changes, index_changes = split_index_operations(changes)
+    # Split into DDL, index and comment operations. Comments go last: an
+    # index only exists after the concurrent phase, and a view or function the
+    # DDL phase drops and recreates takes its comment with it.
+    comment_changes: list[Change] = [c for c in changes if isinstance(c, SetComment)]
+    ddl_changes, index_changes = split_index_operations(
+        [c for c in changes if not isinstance(c, SetComment)]
+    )
 
     executed_sql: list[str] = []
 
@@ -181,6 +201,14 @@ def execute_migration(
     if index_changes:
         success, index_sql = _execute_index_phase(connection_string, index_changes)
         executed_sql.extend(index_sql)
+        if not success:
+            return False, executed_sql
+
+    if comment_changes:
+        success, comment_sql = _execute_comment_phase(
+            connection_string, comment_changes, config=config
+        )
+        executed_sql.extend(comment_sql)
         if not success:
             return False, executed_sql
 
@@ -360,7 +388,10 @@ def _execute_with_retry_savepoints(
                     continue
 
                 # Check if this is a dependency error (retryable)
-                if error_code in DEPENDENCY_ERROR_CODES:
+                if error_code in DEPENDENCY_ERROR_CODES or (
+                    error_code == DEPENDENT_OBJECTS_ERROR_CODE
+                    and isinstance(change, RETRY_WHILE_DEPENDED_ON)
+                ):
                     # Defer for retry
                     deferred.append(
                         DeferredChange(change=change, error=e, error_code=error_code)
@@ -516,6 +547,46 @@ def _execute_index_phase(
                 return False, executed_sql
 
     logger.info("Index phase complete")
+    return True, executed_sql
+
+
+def _execute_comment_phase(
+    connection_string: str,
+    changes: list[Change],
+    config: Optional[PgDeclareConfig] = None,
+) -> tuple[bool, list[str]]:
+    """Write comments in one transaction, after every other change.
+
+    Nothing is left to wait for by now, so there is no retry: a failure is an
+    error, and the transaction rolls back.
+    """
+    executed_sql: list[str] = []
+    logger.info(f"Executing {len(changes)} comment changes...")
+    try:
+        with psycopg2.connect(connection_string) as conn:
+            with conn.cursor() as cur:
+                for change in changes:
+                    sql_stmt = change.to_sql()
+                    logger.info(f"  {change.description}")
+                    try:
+                        cur.execute(sql_stmt)
+                    except Exception as e:
+                        logger.error(f"Failed: {change.description}")
+                        logger.error(f"SQL: {change.to_display_sql()}")
+                        logger.error(f"Error: {e}")
+                        raise
+                    executed_sql.append(sql_stmt)
+            conn.commit()
+    except Exception as e:
+        failure = resolve(config).classify_failure(
+            e, "the comment phase of the schema diff", None
+        )
+        if failure is not None:
+            raise failure from e
+        logger.error(f"Comment phase failed: {e}")
+        return False, []
+
+    logger.info("Comment phase complete")
     return True, executed_sql
 
 

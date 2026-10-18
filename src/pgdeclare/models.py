@@ -7,7 +7,7 @@ Dataclasses representing PostgreSQL database objects for schema comparison.
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
-from .quoting import quote_literal
+from .quoting import quote_ident, quote_literal
 
 
 class ChangeCategory(Enum):
@@ -364,6 +364,98 @@ class CompositeType:
         )
 
 
+@dataclass
+class Domain:
+    """PostgreSQL domain type definition (typtype = 'd').
+
+    `base_type` is format_type() of the underlying type, `collation` the
+    quoted, schema-qualified collation when it differs from the base type's
+    default (None otherwise). NOT NULL is modelled on the domain, like a
+    column's, so PostgreSQL 18's NOT NULL constraint rows are not managed twice.
+    `constraints` holds the CHECK constraints, matched by name.
+
+    `dependents` describes what uses the domain in the live database (columns,
+    function arguments, other domains). It is not part of equality: it decides
+    whether a base-type change may drop and recreate the domain.
+    """
+
+    schema: str
+    name: str
+    base_type: str
+    nullable: bool = True
+    default: Optional[str] = None
+    collation: Optional[str] = None
+    constraints: list[Constraint] = field(default_factory=list)
+    dependents: list[str] = field(default_factory=list)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Domain):
+            return NotImplemented
+        return (
+            self.schema == other.schema
+            and self.name == other.name
+            and self.base_type == other.base_type
+            and self.nullable == other.nullable
+            and self.default == other.default
+            and self.collation == other.collation
+            and sorted(self.constraints, key=lambda c: c.name)
+            == sorted(other.constraints, key=lambda c: c.name)
+        )
+
+
+@dataclass
+class Sequence:
+    """A standalone sequence (CREATE SEQUENCE, or the one a serial column makes).
+
+    Identity-column sequences are not modelled here: the column owns them.
+    Options are compared as the catalog stores them (pg_sequence), so a
+    declaration that relies on defaults and one that spells them out are equal.
+    The current value is state, not schema, and is never compared.
+    """
+
+    schema: str
+    name: str
+    data_type: str = "bigint"  # format_type(seqtypid): smallint, integer, bigint
+    increment: int = 1
+    min_value: int = 1
+    max_value: int = 9223372036854775807
+    start: int = 1
+    cache: int = 1
+    cycle: bool = False
+    # OWNED BY: (schema, table, column) of the owning column, or None.
+    owned_by: Optional[tuple[str, str, str]] = None
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    def options_equal(self, other: "Sequence") -> bool:
+        """Whether every CREATE/ALTER SEQUENCE option matches (not ownership)."""
+        return (
+            self.data_type == other.data_type
+            and self.increment == other.increment
+            and self.min_value == other.min_value
+            and self.max_value == other.max_value
+            and self.start == other.start
+            and self.cache == other.cache
+            and self.cycle == other.cycle
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Sequence):
+            return NotImplemented
+        return (
+            self.schema == other.schema
+            and self.name == other.name
+            and self.options_equal(other)
+            and self.owned_by == other.owned_by
+        )
+
+
 def normalize_view_reloptions(raw: Optional[list[str]]) -> list[str]:
     """Canonicalize a view's `pg_class.reloptions` array for comparison.
 
@@ -418,6 +510,46 @@ class View:
         if not isinstance(other, View):
             return NotImplemented
         # Normalize whitespace for comparison
+        return (
+            self.definition.strip() == other.definition.strip()
+            and self.reloptions == other.reloptions
+        )
+
+
+@dataclass
+class MaterializedView:
+    """Materialized view definition (`CREATE MATERIALIZED VIEW`)."""
+
+    schema: str
+    name: str
+    definition: str  # Query text from pg_get_viewdef, as pg_matviews reports it
+    # Storage parameters (`WITH (fillfactor = 70)`, autovacuum settings),
+    # canonicalized like a view's options.
+    reloptions: list[str] = field(default_factory=list)
+    # Whether the object is populated. In the plan database this is the
+    # declaration (`WITH DATA` vs `WITH NO DATA`), and it decides how a create or
+    # recreate populates the object. It is not compared: a live matview that an
+    # application has refreshed, or emptied with `REFRESH ... WITH NO DATA`, has
+    # not drifted from its declaration.
+    with_data: bool = True
+
+    def __post_init__(self):
+        self.reloptions = normalize_view_reloptions(self.reloptions)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    @property
+    def options_clause(self) -> str:
+        """`" WITH (...)"` for a CREATE MATERIALIZED VIEW, or `""`."""
+        if not self.reloptions:
+            return ""
+        return f" WITH ({', '.join(self.reloptions)})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, MaterializedView):
+            return NotImplemented
         return (
             self.definition.strip() == other.definition.strip()
             and self.reloptions == other.reloptions
@@ -534,6 +666,55 @@ class RoleMembership:
         )
 
 
+# Object kinds that sit on a relation and are named `ON schema.table`.
+_COMMENT_ON_RELATION = frozenset({"CONSTRAINT", "TRIGGER", "POLICY"})
+
+
+@dataclass
+class Comment:
+    """A `COMMENT ON` an object the engine manages.
+
+    `object_type` is the keyword the COMMENT statement uses: TABLE, VIEW,
+    COLUMN, INDEX, FUNCTION, TYPE, CONSTRAINT, TRIGGER or POLICY. `name` is
+    the object itself, or for a column, constraint, trigger or policy the
+    relation it belongs to, with the member in `member`. `args` is a function's
+    identity signature, as `pg_get_function_identity_arguments` prints it.
+    """
+
+    object_type: str
+    schema: str
+    name: str
+    text: str
+    member: str = ""
+    args: str = ""
+
+    @property
+    def key(self) -> str:
+        """Unique key for the commented object (not the text)."""
+        if self.object_type == "FUNCTION":
+            return f"FUNCTION:{self.schema}.{self.name}({self.args})"
+        if self.member:
+            return f"{self.object_type}:{self.schema}.{self.name}.{self.member}"
+        return f"{self.object_type}:{self.schema}.{self.name}"
+
+    @property
+    def target_sql(self) -> str:
+        """The object as written after `COMMENT ON`, every name quoted."""
+        qualified = f"{quote_ident(self.schema)}.{quote_ident(self.name)}"
+        if self.object_type == "FUNCTION":
+            return f"FUNCTION {qualified}({self.args})"
+        if self.object_type == "COLUMN":
+            return f"COLUMN {qualified}.{quote_ident(self.member)}"
+        if self.object_type in _COMMENT_ON_RELATION:
+            return f"{self.object_type} {quote_ident(self.member)} ON {qualified}"
+        return f"{self.object_type} {qualified}"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Comment):
+            return NotImplemented
+        return self.key == other.key and self.text == other.text
+
+
 @dataclass
 class Dependency:
     """Object dependency from pg_depend."""
@@ -564,11 +745,24 @@ class Schema:
     composite_types: dict[str, CompositeType] = field(
         default_factory=dict
     )  # key = schema.type
+    domains: dict[str, Domain] = field(default_factory=dict)  # key = schema.domain
     views: dict[str, View] = field(default_factory=dict)  # key = schema.view
+    materialized_views: dict[str, MaterializedView] = field(
+        default_factory=dict
+    )  # key = schema.matview
+    # Views and materialized views that read from a view or materialized view:
+    # key = schema.name of the referenced relation, value = schema.name of each
+    # direct dependent. Dropping a relation fails while a dependent exists, so a
+    # recreate has to take its dependents down and rebuild them with it.
+    relation_dependents: dict[str, list[str]] = field(default_factory=dict)
+    sequences: dict[str, Sequence] = field(
+        default_factory=dict
+    )  # key = schema.sequence
     grants: list[Grant] = field(default_factory=list)
     dependencies: list[Dependency] = field(default_factory=list)
     roles: dict[str, Role] = field(default_factory=dict)  # key = role name
     role_memberships: list[RoleMembership] = field(default_factory=list)
+    comments: dict[str, Comment] = field(default_factory=dict)  # key = Comment.key
 
     def get_table(self, schema: str, name: str) -> Optional[Table]:
         """Get table by schema and name."""
@@ -589,6 +783,38 @@ class Schema:
             and g.schema == schema
             and g.object_name == object_name
         ]
+
+    def has_comment_target(self, comment: Comment) -> bool:
+        """Whether the object `comment` is on exists in this schema."""
+        relation = f"{comment.schema}.{comment.name}"
+        kind = comment.object_type
+        if kind == "TABLE":
+            return relation in self.tables
+        if kind == "VIEW":
+            return relation in self.views
+        if kind == "COLUMN":
+            table = self.tables.get(relation)
+            if table is not None:
+                return comment.member in table.columns
+            # View columns are not modelled; a view whose columns change is
+            # recreated, which the differ accounts for.
+            return relation in self.views
+        if kind == "CONSTRAINT":
+            table = self.tables.get(relation)
+            return table is not None and any(
+                c.name == comment.member for c in table.constraints
+            )
+        if kind == "TRIGGER":
+            return f"{relation}.{comment.member}" in self.triggers
+        if kind == "POLICY":
+            return f"{relation}.{comment.member}" in self.policies
+        if kind == "INDEX":
+            return relation in self.indexes
+        if kind == "FUNCTION":
+            return f"{relation}({comment.args})" in self.functions
+        if kind == "TYPE":
+            return relation in self.enums or relation in self.composite_types
+        return False
 
     def get_role(self, name: str) -> Optional[Role]:
         """Get role by name."""

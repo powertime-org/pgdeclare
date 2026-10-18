@@ -9,17 +9,21 @@ may change in minor releases.
 
 ### Added
 
-- `diff --prove` and `apply --dry-run --prove` (library: `prove_declared_schema`,
-  or `apply_declared_schema(..., dry_run=True, prove=True)`) rehearse the real
-  run on a throwaway `CREATE DATABASE ... TEMPLATE` clone of the target,
-  pending `@migrate-before`/`@migrate-after` blocks included, report the ledger
-  entries and DDL it would write, and fail if the schema does not converge or a
-  table loses rows without a `@drop` directive. The target is never written and
-  the clone is always dropped. Needs `CREATEDB`, ownership of the target and no
-  other sessions connected to it.
+### Changed
+
+- README: the plan database's privilege needs, the PostgreSQL 14 `public`
+  ownership caveat, a corrected Python example, and a comparison with other
+  tools.
 
 ### Fixed
 
+- A `DROP` that fails because another object still depends on it
+  (`2BP01`) is retried after the rest, like a missing dependency, so dropping
+  a stack of views no longer depends on the order they were listed in.
+- No `REVOKE` is planned on a table, view or materialized view the same run
+  drops; it used to fail on the missing relation and leave the run stuck.
+- `serial` and `bigserial` columns on a fresh database: the table's
+  `nextval()` default used to name a sequence that was never created.
 - A managed role that exists nowhere is a clear error naming the role, not a
   raw `UndefinedObject` traceback from introspection.
 - `apply --dry-run` with pending `@migrate-before` blocks reports drops it
@@ -30,12 +34,6 @@ may change in minor releases.
 - A key=value connection string passed to the library no longer builds the
   plan in the target database: the plan database name is now substituted into
   it, as it already was for `postgresql://` URLs.
-
-### Changed
-
-- README: the plan database's privilege needs, the PostgreSQL 14 `public`
-  ownership caveat, a corrected Python example, and a comparison with other
-  tools.
 
 ## [0.1.0] - 2026-10-16
 
