@@ -29,7 +29,9 @@ from .changes import (
     CreateIndex,
     CreateRole,
     SetComment,
+    DropCollation,
     DropDomain,
+    DropRangeType,
 )
 from .differ import categorize_changes, split_index_operations
 from .models import ChangeCategory
@@ -47,11 +49,11 @@ DEPENDENCY_ERROR_CODES = {
 # CreateRole is cluster-wide - may already exist from retry_executor.py
 IDEMPOTENT_CHANGE_TYPES = (CreateRole,)
 
-# dependent_objects_still_exist. Retryable only for a DropDomain: the column or
-# signature that still uses the domain is dropped or retyped by another change
-# in the same run, and the drop succeeds once that one has.
+# dependent_objects_still_exist. Retryable for a type or collation drop: the
+# column or signature that still uses it is dropped or retyped by another
+# change in the same run, and the drop succeeds once that one has.
 DEPENDENT_OBJECTS_ERROR_CODE = "2BP01"
-RETRY_WHILE_DEPENDED_ON = (DropDomain,)
+RETRY_WHILE_DEPENDED_ON = (DropDomain, DropRangeType, DropCollation)
 
 # PostgreSQL error code for "already exists" errors
 DUPLICATE_ERROR_CODE = "42710"  # duplicate_object

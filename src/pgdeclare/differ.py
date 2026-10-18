@@ -26,6 +26,7 @@ from .changes import (
     AlterSequence,
     AlterViewOptions,
     Change,
+    CreateCollation,
     CreateCompositeType,
     CreateDomain,
     CreateEnum,
@@ -33,8 +34,10 @@ from .changes import (
     CreateIndex,
     CreateMaterializedView,
     CreatePolicy,
+    CreateRangeType,
     CreateRole,
     CreateSequence,
+    CreateShellType,
     CreateTable,
     CreateTrigger,
     CreateView,
@@ -42,12 +45,15 @@ from .changes import (
     DisableRLS,
     DropAndCreateConstraint,
     DependentRelation,
+    DropAndCreateCollation,
     DropAndCreateDomain,
     DropAndCreateDomainConstraint,
     DropAndCreateFunction,
     DropAndCreateMaterializedView,
     DropAndCreatePolicy,
+    DropAndCreateRangeType,
     DropAndCreateView,
+    DropCollation,
     DropColumn,
     DropConstraint,
     DropDefault,
@@ -59,6 +65,7 @@ from .changes import (
     DropMaterializedView,
     DropNotNull,
     DropPolicy,
+    DropRangeType,
     DropSequence,
     DropTable,
     DropTrigger,
@@ -94,6 +101,7 @@ from .models import (
     Grant,
     Index,
     MaterializedView,
+    RangeType,
     Schema,
     Table,
     View,
@@ -147,7 +155,12 @@ def compute_diff(
     # Diff each object type
     # Order matters for dependency resolution:
     # - Enums before composite types (composite types may reference enums)
+    # - Collations before domains, ranges and tables, which may use them;
+    #   collation drops last, after everything that could still use one
     # - Domains before tables (columns may be typed with a domain)
+    # - Range types after domains and before composite types and tables
+    #   (a range may be over a domain; a column or attribute may be a range);
+    #   range drops after functions, like domain drops
     # - Composite types before functions (functions may use composite types)
     # - Views before functions (functions may SELECT from views, so views
     #   must be updated first when column types change)
@@ -157,7 +170,10 @@ def compute_diff(
     #   OWNED BY and sequence drops after tables and views (OWNED BY needs the
     #   column, and a drop must follow the removal of any default using it)
     changes.extend(_diff_enums(desired, actual))
+    collations_before, collations_after = _diff_collations(desired, actual)
+    changes.extend(collations_before)
     changes.extend(_diff_domains(desired, actual, managed_schemas=schemas))
+    changes.extend(_diff_ranges(desired, actual, managed_schemas=schemas))
     changes.extend(_diff_composite_types(desired, actual))
     sequences_before, sequences_after = _diff_sequences(desired, actual)
     changes.extend(sequences_before)
@@ -168,13 +184,16 @@ def compute_diff(
     changes.extend(_diff_materialized_views(desired, actual))
     changes.extend(sequences_after)
     changes.extend(_diff_functions(desired, actual))
+    changes.extend(_drop_ranges(desired, actual))
     changes.extend(_drop_domains(desired, actual))
+    changes.extend(collations_after)
     changes.extend(_diff_indexes(desired, actual))
     changes.extend(_diff_policies(desired, actual))
     changes.extend(_diff_triggers(desired, actual))
     changes.extend(_diff_grants(desired, actual))
     changes.extend(default_privilege_grants)
     changes = _skip_revokes_on_dropped_relations(changes)
+    changes = _skip_canonical_function_drops(changes, actual)
 
     # Re-apply grants for objects being dropped and recreated.
     #
@@ -570,6 +589,10 @@ def _recreated_objects(changes: list[Change]) -> tuple[set[str], set[str]]:
             mark("TYPE", c.enum.schema, c.enum.name)
         elif isinstance(c, CreateCompositeType):
             mark("TYPE", c.composite_type.schema, c.composite_type.name)
+        elif isinstance(c, (CreateRangeType, DropAndCreateRangeType)):
+            mark("TYPE", c.range_type.schema, c.range_type.name)
+        elif isinstance(c, (CreateCollation, DropAndCreateCollation)):
+            mark("COLLATION", c.collation.schema, c.collation.name)
     return objects, relations
 
 
@@ -794,9 +817,18 @@ def _diff_column_properties(
     # Type change (skip for generated columns: a same-type SET EXPRESSION needs
     # no AlterColumnType, and a type change on a generated column is not handled
     # automatically here).
-    if not desired.generated and _normalize_type(
-        desired.type, managed_schemas
-    ) != _normalize_type(actual.type, managed_schemas):
+    type_changed = _normalize_type(desired.type, managed_schemas) != _normalize_type(
+        actual.type, managed_schemas
+    )
+    if not desired.generated and (
+        type_changed or desired.collation != actual.collation
+    ):
+        # Without a COLLATE clause a retyped column takes the new type's
+        # default collation; a column only losing its explicit collation has
+        # to be given that default by name.
+        collation = desired.collation
+        if collation is None and not type_changed:
+            collation = 'pg_catalog."default"'
         changes.append(
             AlterColumnType(
                 schema=schema,
@@ -804,6 +836,7 @@ def _diff_column_properties(
                 column=desired.name,
                 old_type=actual.type,
                 new_type=desired.type,
+                collation=collation,
             )
         )
 
@@ -1254,6 +1287,139 @@ def _diff_domain_properties(desired: Domain, actual: Domain) -> list[Change]:
             )
 
     return changes
+
+
+def _in_use_error(kind: str, qualified: str, dependents: list[str]) -> ValueError:
+    schema, _, name = qualified.partition(".")
+    return ValueError(
+        f'cannot change {kind} "{schema}"."{name}": PostgreSQL has no ALTER for '
+        f"it, and dropping and recreating the {kind} would drop what uses it "
+        f"({'; '.join(dependents)}). Move those off it in an explicit "
+        f"@migrate-before block, or declare a new {kind} under another name "
+        "and move them to it."
+    )
+
+
+def _diff_collations(
+    desired: Schema, actual: Schema
+) -> tuple[list[Change], list[Change]]:
+    """Diff collations. Returns (changes before everything, drops after it).
+
+    A changed collation is dropped and recreated, which is only safe while
+    nothing uses it; otherwise the change is refused naming the dependents.
+    Drops come last, after the columns, domains and ranges that used them.
+    """
+    before: list[Change] = []
+    for key, collation in sorted(desired.collations.items()):
+        current = actual.collations.get(key)
+        if current is None:
+            before.append(CreateCollation(collation=collation))
+        elif collation != current:
+            if current.dependents:
+                raise _in_use_error("collation", key, current.dependents)
+            before.append(DropAndCreateCollation(collation=collation))
+    after: list[Change] = [
+        DropCollation(schema=c.schema, name=c.name)
+        for key, c in sorted(actual.collations.items())
+        if key not in desired.collations
+    ]
+    return before, after
+
+
+def _ranges_equal(
+    desired: RangeType, actual: RangeType, managed_schemas: list[str] | None
+) -> bool:
+    return (
+        _normalize_type(desired.subtype, managed_schemas)
+        == _normalize_type(actual.subtype, managed_schemas)
+        and dataclass_replace(desired, subtype=actual.subtype) == actual
+    )
+
+
+def _diff_ranges(
+    desired: Schema,
+    actual: Schema,
+    managed_schemas: list[str] | None = None,
+) -> list[Change]:
+    """Create range types and recreate the ones whose definition changed.
+
+    No option of a range has an ALTER, so a change drops and recreates the
+    type (its multirange goes with it), only while nothing uses either;
+    otherwise the change is refused naming the dependents. A range with a
+    canonical function gets a shell type first: the function's signature
+    names the type, and the range definition names the function. Drops of
+    undeclared ranges come from _drop_ranges, later in the plan.
+    """
+    changes: list[Change] = []
+    for key, range_type in sorted(desired.ranges.items()):
+        current = actual.ranges.get(key)
+        if current is None:
+            if range_type.canonical:
+                changes.append(
+                    CreateShellType(schema=range_type.schema, name=range_type.name)
+                )
+            changes.append(CreateRangeType(range_type=range_type))
+            continue
+        if _ranges_equal(range_type, current, managed_schemas):
+            continue
+        if current.dependents:
+            raise _in_use_error("range type", key, current.dependents)
+        if range_type.canonical:
+            # The canonical function would have to take the type that is
+            # about to be dropped.
+            raise ValueError(
+                f'cannot change range type "{range_type.schema}".'
+                f'"{range_type.name}" to one with a canonical function in '
+                "place: the function's signature names the type. Drop the "
+                "type and the function in an explicit @migrate-before block "
+                "and let the next run create both."
+            )
+        changes.append(DropAndCreateRangeType(range_type=range_type))
+    return changes
+
+
+def _drop_ranges(desired: Schema, actual: Schema) -> list[Change]:
+    """Drop range types that are no longer declared.
+
+    Emitted after the table, view and function changes so whatever used the
+    range is gone first; the executor also retries a drop that still finds a
+    dependent.
+    """
+    return [
+        DropRangeType(
+            schema=r.schema, name=r.name, has_canonical=r.canonical is not None
+        )
+        for key, r in sorted(actual.ranges.items())
+        if key not in desired.ranges
+    ]
+
+
+def _skip_canonical_function_drops(
+    changes: list[Change], actual: Schema
+) -> list[Change]:
+    """Leave a dropped range's canonical function to the range's own drop.
+
+    The function and the type depend on each other, so DropRangeType drops
+    the function with the type, after checking nothing else uses it. A
+    separate DROP FUNCTION ... CASCADE would take the type, and whatever
+    still uses it, down without that check.
+    """
+    dropped = {f"{c.schema}.{c.name}" for c in changes if isinstance(c, DropRangeType)}
+    signatures = {
+        r.canonical_signature
+        for key, r in actual.ranges.items()
+        if key in dropped and r.canonical_signature
+    }
+    if not signatures:
+        return changes
+    return [
+        c
+        for c in changes
+        if not (
+            isinstance(c, DropFunction)
+            and f"{c.schema}.{c.name}({c.args})" in signatures
+        )
+    ]
 
 
 def _drop_domains(desired: Schema, actual: Schema) -> list[Change]:

@@ -32,6 +32,9 @@ class Column:
     # pg_get_expr), or None when the column is not generated. Mutually
     # exclusive with `default`: a generated column never carries a DEFAULT.
     generated: Optional[str] = None
+    # Quoted, schema-qualified collation (`"public"."de"`) when it differs from
+    # the type's own; None for the type's default and for types without one.
+    collation: Optional[str] = None
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Column):
@@ -43,6 +46,7 @@ class Column:
             and self.default == other.default
             and self.identity == other.identity
             and self.generated == other.generated
+            and self.collation == other.collation
         )
 
 
@@ -456,6 +460,65 @@ class Domain:
 
 
 @dataclass
+class RangeType:
+    """A range type (CREATE TYPE ... AS RANGE) and its multirange.
+
+    `subtype` is format_type() of the subtype. The other options are quoted,
+    schema-qualified names, or None where PostgreSQL chose the default: the
+    subtype's default btree operator class, the subtype's own collation, no
+    canonical or subtype_diff function. `multirange_type_name` is always set
+    from the catalog, so a declared name and a derived one compare the same.
+
+    `dependents` describes what uses the range or its multirange in the live
+    database, and `canonical_signature` is the canonical function's
+    `Function.signature`. Neither takes part in equality.
+    """
+
+    schema: str
+    name: str
+    subtype: str
+    subtype_opclass: Optional[str] = None
+    collation: Optional[str] = None
+    canonical: Optional[str] = None
+    subtype_diff: Optional[str] = None
+    multirange_type_name: Optional[str] = None
+    dependents: list[str] = field(default_factory=list, compare=False)
+    canonical_signature: Optional[str] = field(default=None, compare=False)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+@dataclass
+class Collation:
+    """A collation (CREATE COLLATION).
+
+    `provider` is `libc`, `icu` or `builtin`. A libc collation has
+    `lc_collate` and `lc_ctype`; an ICU or builtin one has `locale`, and
+    `rules` holds ICU tailoring rules (PostgreSQL 16+). The collation version
+    is runtime state and is not compared.
+
+    `dependents` describes what uses the collation in the live database
+    (columns, domains, range types, indexes). It is not part of equality.
+    """
+
+    schema: str
+    name: str
+    provider: str = "libc"
+    locale: Optional[str] = None
+    lc_collate: Optional[str] = None
+    lc_ctype: Optional[str] = None
+    deterministic: bool = True
+    rules: Optional[str] = None
+    dependents: list[str] = field(default_factory=list, compare=False)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+@dataclass
 class Sequence:
     """A standalone sequence (CREATE SEQUENCE, or the one a serial column makes).
 
@@ -769,10 +832,10 @@ class Comment:
     """A `COMMENT ON` an object the engine manages.
 
     `object_type` is the keyword the COMMENT statement uses: TABLE, VIEW,
-    COLUMN, INDEX, FUNCTION, PROCEDURE, AGGREGATE, TYPE, CONSTRAINT, TRIGGER
-    or POLICY. `name` is the object itself, or for a column, constraint,
-    trigger or policy the relation it belongs to, with the member in `member`.
-    `args` is a routine's identity signature, as
+    COLUMN, INDEX, FUNCTION, PROCEDURE, AGGREGATE, TYPE, COLLATION, CONSTRAINT,
+    TRIGGER or POLICY. `name` is the object itself, or for a column,
+    constraint, trigger or policy the relation it belongs to, with the member
+    in `member`. `args` is a routine's identity signature, as
     `pg_get_function_identity_arguments` prints it.
     """
 
@@ -843,6 +906,10 @@ class Schema:
         default_factory=dict
     )  # key = schema.type
     domains: dict[str, Domain] = field(default_factory=dict)  # key = schema.domain
+    ranges: dict[str, RangeType] = field(default_factory=dict)  # key = schema.range
+    collations: dict[str, Collation] = field(
+        default_factory=dict
+    )  # key = schema.collation
     views: dict[str, View] = field(default_factory=dict)  # key = schema.view
     materialized_views: dict[str, MaterializedView] = field(
         default_factory=dict
@@ -912,7 +979,13 @@ class Schema:
             func = self.functions.get(f"{relation}({comment.args})")
             return func is not None and func.keyword == kind
         if kind == "TYPE":
-            return relation in self.enums or relation in self.composite_types
+            return (
+                relation in self.enums
+                or relation in self.composite_types
+                or relation in self.ranges
+            )
+        if kind == "COLLATION":
+            return relation in self.collations
         return False
 
     def get_role(self, name: str) -> Optional[Role]:

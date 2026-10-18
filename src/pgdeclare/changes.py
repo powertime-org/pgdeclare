@@ -14,6 +14,7 @@ from typing import Optional, Union
 from .quoting import do_block, dollar_tag, quote_ident, quote_literal, role_ident
 from .models import (
     ChangeCategory,
+    Collation,
     Column,
     Comment,
     CompositeType,
@@ -26,6 +27,7 @@ from .models import (
     Index,
     MaterializedView,
     Policy,
+    RangeType,
     Role,
     RoleMembership,
     Sequence,
@@ -112,6 +114,8 @@ class CreateTable(Change):
         columns_sql = []
         for col in self.table.columns.values():
             col_def = f"    {quote_ident(col.name)} {col.type}"
+            if col.collation:
+                col_def += f" COLLATE {col.collation}"
             # Add IDENTITY clause before NOT NULL
             if col.identity == "a":
                 col_def += " GENERATED ALWAYS AS IDENTITY"
@@ -197,6 +201,8 @@ class AddColumn(Change):
 
     def to_sql(self) -> str:
         sql = f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} ADD COLUMN {quote_ident(self.column.name)} {self.column.type}"
+        if self.column.collation:
+            sql += f" COLLATE {self.column.collation}"
         # Add IDENTITY clause before NOT NULL
         if self.column.identity == "a":
             sql += " GENERATED ALWAYS AS IDENTITY"
@@ -249,6 +255,9 @@ class AlterColumnType(Change):
     column: str = ""
     old_type: str = ""
     new_type: str = ""
+    # The COLLATE clause written with the type: a quoted collation name, or
+    # None for no clause (the new type's default).
+    collation: Optional[str] = None
     category: ChangeCategory = ChangeCategory.TRY_FIRST
     description: str = ""
     object_type: str = "COLUMN"
@@ -256,10 +265,16 @@ class AlterColumnType(Change):
     def __post_init__(self):
         self.object_name = f"{self.schema}.{self.table}.{self.column}"
         if not self.description:
-            self.description = f"Alter column {self.column} type from {self.old_type} to {self.new_type}"
+            if self.old_type == self.new_type:
+                self.description = (
+                    f"Alter column {self.column} collation to {self.collation}"
+                )
+            else:
+                self.description = f"Alter column {self.column} type from {self.old_type} to {self.new_type}"
 
     def to_sql(self) -> str:
-        return f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} ALTER COLUMN {quote_ident(self.column)} TYPE {self.new_type} USING {quote_ident(self.column)}::{self.new_type};"
+        collate = f" COLLATE {self.collation}" if self.collation else ""
+        return f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} ALTER COLUMN {quote_ident(self.column)} TYPE {self.new_type}{collate} USING {quote_ident(self.column)}::{self.new_type};"
 
 
 @dataclass
@@ -1440,6 +1455,240 @@ class ValidateDomainConstraint(Change):
 
     def to_sql(self) -> str:
         return f"ALTER DOMAIN {_domain_ident(self.schema, self.domain)} VALIDATE CONSTRAINT {quote_ident(self.constraint_name)};"
+
+
+# =============================================================================
+# Range Type Changes
+# =============================================================================
+
+
+def _create_range_sql(range_type: RangeType) -> str:
+    options = [f"SUBTYPE = {range_type.subtype}"]
+    if range_type.subtype_opclass:
+        options.append(f"SUBTYPE_OPCLASS = {range_type.subtype_opclass}")
+    if range_type.collation:
+        options.append(f"COLLATION = {range_type.collation}")
+    if range_type.canonical:
+        options.append(f"CANONICAL = {range_type.canonical}")
+    if range_type.subtype_diff:
+        options.append(f"SUBTYPE_DIFF = {range_type.subtype_diff}")
+    if range_type.multirange_type_name:
+        options.append(f"MULTIRANGE_TYPE_NAME = {range_type.multirange_type_name}")
+    target = _domain_ident(range_type.schema, range_type.name)
+    return f"CREATE TYPE {target} AS RANGE ({', '.join(options)});"
+
+
+@dataclass
+class CreateShellType(Change):
+    """Create a shell type, for a range whose canonical function takes it.
+
+    The canonical function's signature names the range type, so the type has
+    to exist (as a shell) before the function, and the function before the
+    range is defined over the shell.
+    """
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TYPE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Create shell type {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"CREATE TYPE {_domain_ident(self.schema, self.name)};"
+
+
+@dataclass
+class CreateRangeType(Change):
+    """Create a range type, with its multirange named explicitly."""
+
+    range_type: RangeType = field(
+        default_factory=lambda: RangeType(schema="public", name="", subtype="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TYPE"
+
+    def __post_init__(self):
+        self.object_name = self.range_type.qualified_name
+        if not self.description:
+            self.description = f"Create range type {self.range_type.qualified_name}"
+
+    def to_sql(self) -> str:
+        return _create_range_sql(self.range_type)
+
+
+@dataclass
+class DropRangeType(Change):
+    """Drop a range type (and its multirange) that is no longer declared.
+
+    Never a blind CASCADE: a column still typed with the range is dropped or
+    retyped by its own change, and the executor retries this drop until it
+    has been. A range with a canonical function is the exception PostgreSQL
+    forces: the function takes the type and the type names the function, so
+    neither can be dropped first. That drop checks, in the same statement,
+    that nothing but the canonical function still depends on the type, and
+    only then drops it with CASCADE.
+    """
+
+    schema: str = "public"
+    name: str = ""
+    has_canonical: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TYPE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop range type {self.object_name}"
+
+    def to_sql(self) -> str:
+        target = _domain_ident(self.schema, self.name)
+        if not self.has_canonical:
+            return f"DROP TYPE IF EXISTS {target};"
+        literal = quote_literal(target)
+        return do_block(
+            "DECLARE r regtype := to_regtype("
+            + literal
+            + "); BEGIN IF r IS NULL THEN RETURN; END IF; "
+            "IF EXISTS (SELECT 1 FROM pg_range g "
+            "JOIN pg_type t ON t.oid = g.rngtypid "
+            "JOIN pg_type m ON m.oid = g.rngmultitypid "
+            "JOIN pg_depend d ON d.refclassid = 'pg_type'::regclass "
+            "AND d.refobjid IN (t.oid, t.typarray, m.oid, m.typarray) "
+            "AND d.deptype = 'n' "
+            "WHERE g.rngtypid = r "
+            "AND NOT (d.classid = 'pg_proc'::regclass AND d.objid = g.rngcanonical) "
+            "AND NOT EXISTS (SELECT 1 FROM pg_depend o "
+            "WHERE o.classid = d.classid AND o.objid = d.objid "
+            "AND o.refclassid = 'pg_type'::regclass "
+            "AND o.refobjid IN (t.oid, m.oid) AND o.deptype = 'i')) "
+            "THEN RAISE EXCEPTION USING ERRCODE = 'dependent_objects_still_exist', "
+            "MESSAGE = format('range type %s is still in use', r); END IF; "
+            f"DROP TYPE {target} CASCADE; END"
+        )
+
+
+@dataclass
+class DropAndCreateRangeType(Change):
+    """Recreate a range type whose definition changed.
+
+    The differ emits this only when nothing in the database uses the range
+    or its multirange, so the plain DROP cannot cascade into data.
+    """
+
+    range_type: RangeType = field(
+        default_factory=lambda: RangeType(schema="public", name="", subtype="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TYPE"
+
+    def __post_init__(self):
+        self.object_name = self.range_type.qualified_name
+        if not self.description:
+            self.description = (
+                f"Drop and recreate range type {self.range_type.qualified_name}"
+            )
+
+    def to_sql(self) -> str:
+        target = _domain_ident(self.range_type.schema, self.range_type.name)
+        return f"DROP TYPE {target};\n{_create_range_sql(self.range_type)}"
+
+
+# =============================================================================
+# Collation Changes
+# =============================================================================
+
+
+def _create_collation_sql(collation: Collation) -> str:
+    options = [f"provider = {collation.provider}"]
+    if collation.provider == "libc":
+        options.append(f"lc_collate = {quote_literal(collation.lc_collate or '')}")
+        options.append(f"lc_ctype = {quote_literal(collation.lc_ctype or '')}")
+    else:
+        options.append(f"locale = {quote_literal(collation.locale or '')}")
+    if collation.rules:
+        options.append(f"rules = {quote_literal(collation.rules)}")
+    if not collation.deterministic:
+        options.append("deterministic = false")
+    target = _domain_ident(collation.schema, collation.name)
+    return f"CREATE COLLATION {target} ({', '.join(options)});"
+
+
+@dataclass
+class CreateCollation(Change):
+    """Create a collation."""
+
+    collation: Collation = field(
+        default_factory=lambda: Collation(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "COLLATION"
+
+    def __post_init__(self):
+        self.object_name = self.collation.qualified_name
+        if not self.description:
+            self.description = f"Create collation {self.collation.qualified_name}"
+
+    def to_sql(self) -> str:
+        return _create_collation_sql(self.collation)
+
+
+@dataclass
+class DropCollation(Change):
+    """Drop a collation that is no longer declared.
+
+    Never CASCADE: a column, domain or range still using it is dropped or
+    changed by its own change, and the executor retries this drop until then.
+    """
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "COLLATION"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop collation {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP COLLATION IF EXISTS {_domain_ident(self.schema, self.name)};"
+
+
+@dataclass
+class DropAndCreateCollation(Change):
+    """Recreate a collation whose definition changed.
+
+    PostgreSQL has no ALTER for a collation's locale or provider. The differ
+    emits this only when nothing uses the collation.
+    """
+
+    collation: Collation = field(
+        default_factory=lambda: Collation(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "COLLATION"
+
+    def __post_init__(self):
+        self.object_name = self.collation.qualified_name
+        if not self.description:
+            self.description = (
+                f"Drop and recreate collation {self.collation.qualified_name}"
+            )
+
+    def to_sql(self) -> str:
+        target = _domain_ident(self.collation.schema, self.collation.name)
+        return f"DROP COLLATION {target};\n{_create_collation_sql(self.collation)}"
 
 
 # =============================================================================
