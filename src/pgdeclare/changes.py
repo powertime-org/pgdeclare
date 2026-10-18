@@ -31,6 +31,8 @@ from .models import (
     Table,
     Trigger,
     View,
+    routine_args_sql,
+    routine_keyword,
 )
 
 
@@ -591,19 +593,24 @@ def _replay_grants_sql(grants: list[Grant]) -> str:
     return "".join(parts)
 
 
-def _revoke_public_execute_sql(schema: str, name: str, args: str) -> str:
+def _revoke_public_execute_sql(
+    schema: str, name: str, args: str, keyword: str = "FUNCTION"
+) -> str:
     """Bare `REVOKE EXECUTE ... FROM public` (no trailing `;`, no DO wrapper).
 
     Used for SECDEF lockdowns. Emitted either appended atomically to a
     function's CREATE/recreate (so PostgreSQL's default PUBLIC EXECUTE grant is
     revoked in the same change), or standalone for pure ACL drift.
     """
-    return f"REVOKE EXECUTE ON FUNCTION {quote_ident(schema)}.{quote_ident(name)}({args}) FROM public"
+    # GRANT/REVOKE has no AGGREGATE object type; an aggregate is a FUNCTION here.
+    if keyword == "AGGREGATE":
+        keyword = "FUNCTION"
+    return f"REVOKE EXECUTE ON {keyword} {quote_ident(schema)}.{quote_ident(name)}({args}) FROM public"
 
 
 @dataclass
 class CreateFunction(Change):
-    """Create or replace a function."""
+    """Create a function, procedure or aggregate (CREATE OR REPLACE)."""
 
     function: Function = field(
         default_factory=lambda: Function(
@@ -622,14 +629,20 @@ class CreateFunction(Change):
     def __post_init__(self):
         self.object_name = self.function.signature
         if not self.description:
-            self.description = f"Create function {self.function.signature}"
+            self.description = (
+                f"Create {self.function.keyword.lower()} {self.function.signature}"
+            )
 
     def to_sql(self) -> str:
         # The full_definition already contains CREATE OR REPLACE FUNCTION
+        # (or PROCEDURE, or AGGREGATE)
         sql = self.function.full_definition
         if self.revoke_public_execute:
             revoke = _revoke_public_execute_sql(
-                self.function.schema, self.function.name, self.function.args
+                self.function.schema,
+                self.function.name,
+                self.function.args,
+                self.function.keyword,
             )
             # Run in the same change (one savepoint/unit) so the default PUBLIC
             # EXECUTE granted at CREATE time is immediately revoked.
@@ -653,7 +666,9 @@ class ReplaceFunction(Change):
     def __post_init__(self):
         self.object_name = self.function.signature
         if not self.description:
-            self.description = f"Replace function {self.function.signature}"
+            self.description = (
+                f"Replace {self.function.keyword.lower()} {self.function.signature}"
+            )
 
     def to_sql(self) -> str:
         return self.function.full_definition
@@ -661,11 +676,14 @@ class ReplaceFunction(Change):
 
 @dataclass
 class DropFunction(Change):
-    """Drop a function."""
+    """Drop a function, procedure or aggregate."""
 
     schema: str = "public"
     name: str = ""
     args: str = ""
+    # pg_proc.prokind of the routine dropped; DROP FUNCTION refuses a
+    # procedure or an aggregate.
+    kind: str = "f"
     category: ChangeCategory = ChangeCategory.ONLINE
     description: str = ""
     object_type: str = "FUNCTION"
@@ -673,16 +691,23 @@ class DropFunction(Change):
     def __post_init__(self):
         self.object_name = f"{self.schema}.{self.name}({self.args})"
         if not self.description:
-            self.description = f"Drop function {self.object_name}"
+            keyword = routine_keyword(self.kind).lower()
+            self.description = f"Drop {keyword} {self.object_name}"
 
     def to_sql(self) -> str:
         # Use CASCADE to handle trigger dependencies
-        return f"DROP FUNCTION IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.name)}({self.args}) CASCADE;"
+        keyword = routine_keyword(self.kind)
+        args = routine_args_sql(self.kind, self.args)
+        return f"DROP {keyword} IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.name)}({args}) CASCADE;"
 
 
 @dataclass
 class DropAndCreateFunction(Change):
-    """Drop and recreate a function (required when return type or parameter names change)."""
+    """Drop and recreate a routine.
+
+    Required when the return type, the parameter names or the kind (function,
+    procedure, aggregate) change, none of which CREATE OR REPLACE can do.
+    """
 
     function: Function = field(
         default_factory=lambda: Function(
@@ -692,6 +717,9 @@ class DropAndCreateFunction(Change):
     old_args: Optional[str] = (
         None  # For parameter renames: args of the function to drop
     )
+    # pg_proc.prokind of the routine to drop, when it differs from the new
+    # one's: DROP has to name what is there now.
+    old_kind: Optional[str] = None
     category: ChangeCategory = ChangeCategory.ONLINE
     description: str = ""
     object_type: str = "FUNCTION"
@@ -707,8 +735,8 @@ class DropAndCreateFunction(Change):
         self.object_name = self.function.signature
         if not self.description:
             self.description = (
-                f"Drop and recreate function {self.function.signature}"
-                + grant_replay_note(len(self.grants))
+                f"Drop and recreate {self.function.keyword.lower()} "
+                f"{self.function.signature}" + grant_replay_note(len(self.grants))
             )
 
     def to_sql(self) -> str:
@@ -716,16 +744,23 @@ class DropAndCreateFunction(Change):
         # Wrap in DO block for atomicity - if CREATE fails, DROP is rolled back
         # CASCADE is safe here: dependents (triggers/views) are dropped atomically but
         # recreated when their owning tables are processed; if CREATE fails, everything rolls back
-        drop_args = self.old_args if self.old_args is not None else self.function.args
-        drop_sql = f"DROP FUNCTION IF EXISTS {quote_ident(self.function.schema)}.{quote_ident(self.function.name)}({drop_args}) CASCADE"
+        drop_kind = self.old_kind if self.old_kind is not None else self.function.kind
+        drop_args = routine_args_sql(
+            drop_kind,
+            self.old_args if self.old_args is not None else self.function.args,
+        )
+        drop_sql = f"DROP {routine_keyword(drop_kind)} IF EXISTS {quote_ident(self.function.schema)}.{quote_ident(self.function.name)}({drop_args}) CASCADE"
         # Escape single quotes in function definition for EXECUTE
         escaped_def = self.function.full_definition.replace("'", "''")
         inner = f"{drop_sql}; EXECUTE '{escaped_def}';"
         inner += _replay_grants_sql(self.grants)
         if self.revoke_public_execute:
             revoke = _revoke_public_execute_sql(
-                self.function.schema, self.function.name, self.function.args
-            )
+                self.function.schema,
+                self.function.name,
+                self.function.args,
+                self.function.keyword,
+            ).replace("'", "''")
             inner += f" EXECUTE '{revoke}';"
         return do_block(f"BEGIN {inner} END")
 
@@ -1973,8 +2008,8 @@ class GrantPrivilege(Change):
             return f"GRANT {self.grant.privilege} ON SCHEMA {quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         elif self.grant.column:
             return f"GRANT {self.grant.privilege} ({quote_ident(self.grant.column)}) ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
-        elif self.grant.object_type == "FUNCTION":
-            return f"GRANT {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
+        elif self.grant.object_type in ("FUNCTION", "PROCEDURE"):
+            return f"GRANT {self.grant.privilege} ON {self.grant.object_type} {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         elif self.grant.object_type == "SEQUENCE":
             return f"GRANT {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         else:
@@ -2008,11 +2043,14 @@ class RevokePrivilege(Change):
             return do_block(
                 f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_column THEN NULL; END"
             )
-        elif self.grant.object_type == "FUNCTION":
-            # Wrap in DO block: function may have been dropped (CASCADE removes grants too)
-            revoke_sql = f"REVOKE {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
+        elif self.grant.object_type in ("FUNCTION", "PROCEDURE"):
+            # Wrap in DO block: function may have been dropped (CASCADE removes
+            # grants too), or recreated this run as the other kind of routine
+            # (wrong_object_type), which took its old ACL with it.
+            revoke_sql = f"REVOKE {self.grant.privilege} ON {self.grant.object_type} {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
             return do_block(
-                f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_function THEN NULL; END"
+                f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_function"
+                " OR wrong_object_type THEN NULL; END"
             )
         elif self.grant.object_type == "SEQUENCE":
             # Wrap in DO block: the sequence may have been dropped in this
@@ -2043,6 +2081,7 @@ class RevokePublicExecute(Change):
     category: ChangeCategory = ChangeCategory.ONLINE
     description: str = ""
     object_type: str = "REVOKE"
+    keyword: str = "FUNCTION"  # PROCEDURE for a SECURITY DEFINER procedure
 
     def __post_init__(self):
         self.object_name = f"{self.schema}.{self.name}({self.args})"
@@ -2050,7 +2089,10 @@ class RevokePublicExecute(Change):
             self.description = f"Revoke PUBLIC EXECUTE on {self.object_name}"
 
     def to_sql(self) -> str:
-        return f"{_revoke_public_execute_sql(self.schema, self.name, self.args)};"
+        revoke = _revoke_public_execute_sql(
+            self.schema, self.name, self.args, self.keyword
+        )
+        return f"{revoke};"
 
 
 # =============================================================================

@@ -209,14 +209,16 @@ Within the managed schemas:
 | Views | yes | drop and re-create; `WITH (...)` options such as `security_invoker` | yes |
 | Materialized views | yes, `WITH DATA` or `WITH NO DATA` as declared | query: drop and re-create (offline, rebuilds the data); storage options in place | yes |
 | Functions | yes | replace, or drop and re-create when the signature changes | yes |
+| Procedures and window functions | yes | as functions; drop and re-create when the kind changes | yes |
+| Aggregates (normal, ordered-set, hypothetical-set) | yes, after the functions they call | `CREATE OR REPLACE AGGREGATE`; drop and re-create when the result type or kind changes, or when a function it calls is dropped | yes |
 | Triggers | yes | drop and re-create | yes |
 | Row level security | enable, force, and policies | policies drop and re-create | yes |
-| Grants to managed roles | tables, views, materialized views, columns, functions, sequences, schemas | revokes before grants | yes |
+| Grants to managed roles | tables, views, materialized views, columns, functions, procedures, aggregates, sequences, schemas | revokes before grants | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
-| Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, indexes, constraints, triggers, policies, enum and composite types | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
+| Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, procedures, aggregates, indexes, constraints, triggers, policies, enum and composite types | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
 
-Not managed: extensions, comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, operators, casts, comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
 A comment the schema files do not declare is removed, including one added by hand. Comments are written in a phase of their own after the DDL and index builds, so an object dropped and recreated in the same run gets its comment back.
 

@@ -9,6 +9,14 @@ may change in minor releases.
 
 ### Added
 
+- Procedures, aggregates and window functions are managed like functions:
+  created, replaced with `CREATE OR REPLACE` when the signature, return type
+  and kind are unchanged, otherwise dropped and re-created, and dropped when
+  undeclared. Aggregates are rendered from `pg_aggregate`, built after the
+  functions they call, and re-created when one of those is dropped. Grants to
+  managed roles use `ON PROCEDURE` for procedures, and `COMMENT ON PROCEDURE`
+  and `COMMENT ON AGGREGATE` are managed.
+
 ### Changed
 
 - README: the plan database's privilege needs, the PostgreSQL 14 `public`

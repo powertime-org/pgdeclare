@@ -2038,6 +2038,33 @@ class TestFunctionPublicExecute:
 
         assert not [c for c in changes if isinstance(c, RevokePublicExecute)]
 
+    def test_a_new_overload_does_not_absorb_the_lockdown(self):
+        """A same-name overload created this run must not take the locked one's flag."""
+        locked = self._secdef("sec_thing", args="integer")
+        overload = Function(
+            schema="public",
+            name="sec_thing",
+            args="text",
+            full_definition="CREATE FUNCTION sec_thing(text) ...",
+            definition_hash="h2",
+            security_definer=False,
+            public_execute=True,
+        )
+        desired = Schema(
+            functions={locked.signature: locked, overload.signature: overload}
+        )
+        actual = Schema(
+            functions={locked.signature: self._secdef("sec_thing", "integer")}
+        )
+
+        changes = compute_diff(desired, actual, locked_functions={"sec_thing"})
+
+        revokes = [c for c in changes if isinstance(c, RevokePublicExecute)]
+        assert [r.args for r in revokes] == ["integer"]
+        creates = [c for c in changes if isinstance(c, CreateFunction)]
+        assert [c.function.args for c in creates] == ["text"]
+        assert not creates[0].revoke_public_execute
+
     def test_fresh_create_sets_atomic_flag(self):
         """A locked function being created flags the CreateFunction, no standalone."""
         func = self._secdef("sec_thing")

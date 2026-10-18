@@ -81,9 +81,30 @@ class Table:
         return f"{self.schema}.{self.name}"
 
 
+_ROUTINE_KEYWORDS = {"p": "PROCEDURE", "a": "AGGREGATE"}
+
+
+def routine_keyword(kind: str) -> str:
+    """FUNCTION, PROCEDURE or AGGREGATE for a pg_proc.prokind."""
+    return _ROUTINE_KEYWORDS.get(kind, "FUNCTION")
+
+
+def routine_args_sql(kind: str, args: str) -> str:
+    """Identity arguments as DDL writes them.
+
+    `pg_get_function_identity_arguments` prints nothing for an aggregate that
+    takes no arguments, but DROP and COMMENT ON AGGREGATE spell it `(*)`.
+    """
+    return "*" if kind == "a" and not args else args
+
+
 @dataclass
 class Function:
-    """Database function definition."""
+    """A function, procedure, aggregate or window function (one pg_proc row).
+
+    For an aggregate, which `pg_get_functiondef` cannot print, the engine
+    renders `full_definition` itself from pg_aggregate.
+    """
 
     schema: str
     name: str
@@ -97,6 +118,16 @@ class Function:
     # Consumed only by _diff_function_public_execute (the SECDEF lockdown
     # pass); NOT part of the managed-role grant set-diff.
     public_execute: bool = True
+    # pg_proc.prokind: 'f' function, 'p' procedure, 'a' aggregate, 'w' window
+    # function. CREATE OR REPLACE cannot change it, so a change of kind is a
+    # drop and re-create.
+    kind: str = "f"
+    # Aggregates only: the result type and pg_aggregate.aggkind, neither of
+    # which CREATE OR REPLACE AGGREGATE can change.
+    result_type: str = ""
+    # Aggregates only: signatures of the functions the aggregate calls (state,
+    # final, combine and so on). Dropping one of them drops the aggregate.
+    support_functions: tuple[str, ...] = ()
 
     @property
     def qualified_name(self) -> str:
@@ -106,6 +137,21 @@ class Function:
     def signature(self) -> str:
         """Full function signature including arguments."""
         return f"{self.schema}.{self.name}({self.args})"
+
+    @property
+    def keyword(self) -> str:
+        """The object keyword DDL uses for this routine."""
+        return routine_keyword(self.kind)
+
+    @property
+    def args_sql(self) -> str:
+        """The argument list as written in DDL (`*` for a zero-argument aggregate)."""
+        return routine_args_sql(self.kind, self.args)
+
+    @property
+    def sql_name(self) -> str:
+        """`"schema"."name"(args)`, as DROP, COMMENT and REVOKE name it."""
+        return f"{quote_ident(self.schema)}.{quote_ident(self.name)}({self.args_sql})"
 
     def returns_primitive_type(self) -> bool:
         """
@@ -221,6 +267,8 @@ class Function:
         import re
 
         # Match RETURNS ... up to LANGUAGE or AS keyword
+        if self.kind == "a":
+            return self.result_type
         match = re.search(
             r"RETURNS\s+(.*?)(?=\s+LANGUAGE|\s+AS\s)",
             self.full_definition,
@@ -560,7 +608,7 @@ class MaterializedView:
 class Grant:
     """Privilege grant definition."""
 
-    object_type: str  # TABLE, FUNCTION, SCHEMA, SEQUENCE
+    object_type: str  # TABLE, COLUMN, FUNCTION, PROCEDURE, SCHEMA, SEQUENCE
     object_name: str  # Object name (may include schema)
     schema: str
     privilege: str  # SELECT, INSERT, UPDATE, DELETE, EXECUTE, USAGE, etc.
@@ -668,6 +716,7 @@ class RoleMembership:
 
 # Object kinds that sit on a relation and are named `ON schema.table`.
 _COMMENT_ON_RELATION = frozenset({"CONSTRAINT", "TRIGGER", "POLICY"})
+_COMMENT_ON_ROUTINE = {"FUNCTION": "f", "PROCEDURE": "p", "AGGREGATE": "a"}
 
 
 @dataclass
@@ -675,10 +724,11 @@ class Comment:
     """A `COMMENT ON` an object the engine manages.
 
     `object_type` is the keyword the COMMENT statement uses: TABLE, VIEW,
-    COLUMN, INDEX, FUNCTION, TYPE, CONSTRAINT, TRIGGER or POLICY. `name` is
-    the object itself, or for a column, constraint, trigger or policy the
-    relation it belongs to, with the member in `member`. `args` is a function's
-    identity signature, as `pg_get_function_identity_arguments` prints it.
+    COLUMN, INDEX, FUNCTION, PROCEDURE, AGGREGATE, TYPE, CONSTRAINT, TRIGGER
+    or POLICY. `name` is the object itself, or for a column, constraint,
+    trigger or policy the relation it belongs to, with the member in `member`.
+    `args` is a routine's identity signature, as
+    `pg_get_function_identity_arguments` prints it.
     """
 
     object_type: str
@@ -691,8 +741,8 @@ class Comment:
     @property
     def key(self) -> str:
         """Unique key for the commented object (not the text)."""
-        if self.object_type == "FUNCTION":
-            return f"FUNCTION:{self.schema}.{self.name}({self.args})"
+        if self.object_type in _COMMENT_ON_ROUTINE:
+            return f"{self.object_type}:{self.schema}.{self.name}({self.args})"
         if self.member:
             return f"{self.object_type}:{self.schema}.{self.name}.{self.member}"
         return f"{self.object_type}:{self.schema}.{self.name}"
@@ -701,8 +751,10 @@ class Comment:
     def target_sql(self) -> str:
         """The object as written after `COMMENT ON`, every name quoted."""
         qualified = f"{quote_ident(self.schema)}.{quote_ident(self.name)}"
-        if self.object_type == "FUNCTION":
-            return f"FUNCTION {qualified}({self.args})"
+        kind = _COMMENT_ON_ROUTINE.get(self.object_type)
+        if kind is not None:
+            args = routine_args_sql(kind, self.args)
+            return f"{self.object_type} {qualified}({args})"
         if self.object_type == "COLUMN":
             return f"COLUMN {qualified}.{quote_ident(self.member)}"
         if self.object_type in _COMMENT_ON_RELATION:
@@ -810,8 +862,9 @@ class Schema:
             return f"{relation}.{comment.member}" in self.policies
         if kind == "INDEX":
             return relation in self.indexes
-        if kind == "FUNCTION":
-            return f"{relation}({comment.args})" in self.functions
+        if kind in _COMMENT_ON_ROUTINE:
+            func = self.functions.get(f"{relation}({comment.args})")
+            return func is not None and func.keyword == kind
         if kind == "TYPE":
             return relation in self.enums or relation in self.composite_types
         return False
