@@ -9,6 +9,12 @@ may change in minor releases.
 
 ### Added
 
+- Default privileges (`ALTER DEFAULT PRIVILEGES [FOR ROLE] [IN SCHEMA] GRANT
+  ... ON TABLES | SEQUENCES | FUNCTIONS | ROUTINES | TYPES | SCHEMAS`) granted
+  to managed roles, schema-less or in a managed schema: declaring grants,
+  removing revokes, a change converges. The plan database runs them before
+  the other statements, so every declared object they cover gets the grant.
+
 ### Changed
 
 - README: the plan database's privilege needs, the PostgreSQL 14 `public`

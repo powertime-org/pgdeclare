@@ -212,13 +212,16 @@ Within the managed schemas:
 | Triggers | yes | drop and re-create | yes |
 | Row level security | enable, force, and policies | policies drop and re-create | yes |
 | Grants to managed roles | tables, views, materialized views, columns, functions, sequences, schemas | revokes before grants | yes |
+| Default privileges (`ALTER DEFAULT PRIVILEGES`) to managed roles | on tables, sequences, functions, types and schemas; for any target role (`FOR ROLE`, else the connecting role); schema-less or `IN SCHEMA` a managed schema | revoke and re-grant | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
 | Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, indexes, constraints, triggers, policies, enum and composite types | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
 
-Not managed: extensions, comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, default privileges for grantees that are not managed roles (`PUBLIC` included, so `REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` is not) or that take away a target role's own built-in privileges, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
 A comment the schema files do not declare is removed, including one added by hand. Comments are written in a phase of their own after the DDL and index builds, so an object dropped and recreated in the same run gets its comment back.
+
+Declared default privileges run first when the plan is built, whatever file they are in, so every declared object they cover gets the grant, as it would on a database that has had them since its first apply. Defaults no longer declared are revoked before anything is created and new ones granted after, so an object created in the same run gets exactly the grants the plan gives it. The target role is always written as `FOR ROLE`, so one omitted in the schema files means the role pgdeclare connects as.
 
 Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. A recreated materialized view rebuilds its indexes the same way, and a recreated view or materialized view drops the views and materialized views that read from it and builds them back, from their declarations, in that statement too. Whether a materialized view is populated is not compared: a `REFRESH` is runtime state, not drift. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
 

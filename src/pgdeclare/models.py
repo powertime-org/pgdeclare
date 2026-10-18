@@ -580,6 +580,51 @@ class Grant:
         return self.key == other.key
 
 
+# pg_default_acl.defaclobjtype -> the keyword ALTER DEFAULT PRIVILEGES uses.
+# ROUTINES is an alias of FUNCTIONS and is stored as 'f'.
+DEFAULT_PRIVILEGE_OBJECT_TYPES = {
+    "r": "TABLES",
+    "S": "SEQUENCES",
+    "f": "FUNCTIONS",
+    "T": "TYPES",
+    "n": "SCHEMAS",
+}
+
+
+@dataclass
+class DefaultPrivilege:
+    """One privilege of an ALTER DEFAULT PRIVILEGES entry (pg_default_acl).
+
+    `target_role` is the role whose future objects receive the privilege (the
+    `FOR ROLE`; the session user when the declaration names none). `schema` is
+    the `IN SCHEMA`, or None for an entry that applies in every schema.
+    `object_type` is the plural keyword: TABLES, SEQUENCES, FUNCTIONS, TYPES or
+    SCHEMAS.
+    """
+
+    target_role: str
+    schema: Optional[str]
+    object_type: str
+    privilege: str
+    grantee: str
+    grantable: bool = False
+
+    @property
+    def key(self) -> str:
+        """Unique key, grant option included, so a change of it re-grants."""
+        scope = self.schema if self.schema is not None else "*"
+        option = ":grantable" if self.grantable else ""
+        return (
+            f"{self.target_role}:{scope}:{self.object_type}:"
+            f"{self.privilege}:{self.grantee}{option}"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DefaultPrivilege):
+            return NotImplemented
+        return self.key == other.key
+
+
 @dataclass
 class Role:
     """Database role definition."""
@@ -759,6 +804,7 @@ class Schema:
         default_factory=dict
     )  # key = schema.sequence
     grants: list[Grant] = field(default_factory=list)
+    default_privileges: list[DefaultPrivilege] = field(default_factory=list)
     dependencies: list[Dependency] = field(default_factory=list)
     roles: dict[str, Role] = field(default_factory=dict)  # key = role name
     role_memberships: list[RoleMembership] = field(default_factory=list)

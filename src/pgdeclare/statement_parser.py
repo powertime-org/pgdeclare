@@ -70,6 +70,10 @@ UNTRACKED_STATEMENT_TYPES = {
 }
 
 
+ALTER_DEFAULT_PRIVILEGES = "ALTER DEFAULT PRIVILEGES"
+_ALTER_DEFAULT_PRIVILEGES = re.compile(r"ALTER\s+DEFAULT\s+PRIVILEGES\b")
+
+
 def parse_sql_file(
     file_path: Path, base_path: Optional[Path] = None
 ) -> list[ParsedStatement]:
@@ -296,6 +300,15 @@ def _parse_statement_metadata(
     elif stmt_upper.startswith("CREATE ROLE"):
         return _parse_create_role(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
+    elif _ALTER_DEFAULT_PRIVILEGES.match(stmt_upper):
+        # Named in full: the plan build runs these before the other statements.
+        return ParsedStatement(
+            raw_sql=raw_sql,
+            statement_type=ALTER_DEFAULT_PRIVILEGES,
+            source_file=source_file,
+            line_number=line_number,
+            is_idempotent=True,
         )
     else:
         # Generic statement (GRANT, REVOKE, ALTER, DO, etc.)

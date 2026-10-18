@@ -18,6 +18,7 @@ from .models import (
     Comment,
     CompositeType,
     Constraint,
+    DefaultPrivilege,
     Domain,
     EnumType,
     Function,
@@ -2153,6 +2154,80 @@ class DropRole(Change):
 
     def to_sql(self) -> str:
         return f"DROP ROLE IF EXISTS {quote_ident(self.role_name)};"
+
+
+def _default_privileges_prefix(entry: DefaultPrivilege) -> str:
+    """`ALTER DEFAULT PRIVILEGES FOR ROLE r [IN SCHEMA s]`, every name quoted.
+
+    The target role is always written out, so the statement does not depend on
+    which role the migrator connects as.
+    """
+    sql = f"ALTER DEFAULT PRIVILEGES FOR ROLE {role_ident(entry.target_role)}"
+    if entry.schema is not None:
+        sql += f" IN SCHEMA {quote_ident(entry.schema)}"
+    return sql
+
+
+def _default_privileges_scope(entry: DefaultPrivilege) -> str:
+    where = f"in schema {entry.schema}" if entry.schema is not None else "everywhere"
+    return f"{entry.object_type.lower()} of {entry.target_role} {where}"
+
+
+@dataclass
+class GrantDefaultPrivilege(Change):
+    """ALTER DEFAULT PRIVILEGES ... GRANT: future objects get the privilege."""
+
+    entry: DefaultPrivilege = field(
+        default_factory=lambda: DefaultPrivilege(
+            target_role="", schema=None, object_type="TABLES", privilege="", grantee=""
+        )
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DEFAULT_PRIVILEGE"
+
+    def __post_init__(self):
+        self.object_name = self.entry.key
+        if not self.description:
+            self.description = (
+                f"Grant {self.entry.privilege} on future "
+                f"{_default_privileges_scope(self.entry)} to {self.entry.grantee}"
+            )
+
+    def to_sql(self) -> str:
+        option = " WITH GRANT OPTION" if self.entry.grantable else ""
+        return (
+            f"{_default_privileges_prefix(self.entry)} GRANT {self.entry.privilege} "
+            f"ON {self.entry.object_type} TO {role_ident(self.entry.grantee)}{option};"
+        )
+
+
+@dataclass
+class RevokeDefaultPrivilege(Change):
+    """ALTER DEFAULT PRIVILEGES ... REVOKE. Objects that exist keep their ACL."""
+
+    entry: DefaultPrivilege = field(
+        default_factory=lambda: DefaultPrivilege(
+            target_role="", schema=None, object_type="TABLES", privilege="", grantee=""
+        )
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DEFAULT_PRIVILEGE"
+
+    def __post_init__(self):
+        self.object_name = self.entry.key
+        if not self.description:
+            self.description = (
+                f"Revoke {self.entry.privilege} on future "
+                f"{_default_privileges_scope(self.entry)} from {self.entry.grantee}"
+            )
+
+    def to_sql(self) -> str:
+        return (
+            f"{_default_privileges_prefix(self.entry)} REVOKE {self.entry.privilege} "
+            f"ON {self.entry.object_type} FROM {role_ident(self.entry.grantee)};"
+        )
 
 
 @dataclass
