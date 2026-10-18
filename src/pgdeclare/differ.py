@@ -505,7 +505,12 @@ def _diff_function_public_execute(
         actual_func = actual.functions.get(func.signature)
         if actual_func is not None and actual_func.public_execute:
             extra.append(
-                RevokePublicExecute(schema=func.schema, name=func.name, args=func.args)
+                RevokePublicExecute(
+                    schema=func.schema,
+                    name=func.name,
+                    args=func.args,
+                    keyword=func.keyword,
+                )
             )
 
     return extra
@@ -542,7 +547,7 @@ def _recreated_objects(changes: list[Change]) -> tuple[set[str], set[str]]:
             mark("INDEX", c.index.schema, c.index.name)
         elif isinstance(c, (CreateFunction, DropAndCreateFunction)):
             f = c.function
-            mark("FUNCTION", f.schema, f.name, args=f.args)
+            mark(f.keyword, f.schema, f.name, args=f.args)
         elif isinstance(c, CreateTrigger):
             mark("TRIGGER", c.trigger.schema, c.trigger.table, c.trigger.name)
         elif isinstance(c, (CreatePolicy, DropAndCreatePolicy)):
@@ -933,18 +938,49 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
                     DropAndCreateFunction(
                         function=func,
                         old_args=rename_source.args,  # Pass old args for correct DROP
+                        old_kind=rename_source.kind,
                     )
                 )
             else:
                 changes.append(CreateFunction(function=func))
         elif func.definition_hash != actual.functions[key].definition_hash:
-            # Check if return type changed - requires DROP + CREATE instead of REPLACE
+            # A changed return type or kind requires DROP + CREATE: CREATE OR
+            # REPLACE refuses both.
             actual_func = actual.functions[key]
-            if func.get_return_clause() != actual_func.get_return_clause():
-                # Return type changed - use combined Drop+Create to keep them together
-                changes.append(DropAndCreateFunction(function=func))
+            if (
+                func.kind != actual_func.kind
+                or func.get_return_clause() != actual_func.get_return_clause()
+            ):
+                # Use combined Drop+Create to keep them together
+                changes.append(
+                    DropAndCreateFunction(function=func, old_kind=actual_func.kind)
+                )
             else:
                 changes.append(ReplaceFunction(function=func))
+
+    # An aggregate goes with any support function this run drops (DROP ...
+    # CASCADE), so one that is otherwise unchanged is recreated with it.
+    dropped: set[str] = set(functions_to_drop_for_rename)
+    for c in changes:
+        if isinstance(c, DropAndCreateFunction):
+            f = c.function
+            old_args = c.old_args if c.old_args is not None else f.args
+            dropped.add(f"{f.schema}.{f.name}({old_args})")
+    dropped.update(k for k in actual.functions if k not in desired.functions)
+    changed = {
+        c.function.signature
+        for c in changes
+        if isinstance(c, (CreateFunction, ReplaceFunction, DropAndCreateFunction))
+    }
+    for key, func in desired.functions.items():
+        existing = actual.functions.get(key)
+        if (
+            func.kind == "a"
+            and existing is not None
+            and key not in changed
+            and dropped.intersection(existing.support_functions)
+        ):
+            changes.append(DropAndCreateFunction(function=func, old_kind=existing.kind))
 
     # Functions to drop (excluding those handled by parameter rename above)
     for key, func in actual.functions.items():
@@ -954,10 +990,22 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
                     schema=func.schema,
                     name=func.name,
                     args=func.args,
+                    kind=func.kind,
                 )
             )
 
-    return changes
+    # Aggregates are built after the functions they call. The executor would
+    # retry an early one, but a recreated support function's DROP ... CASCADE
+    # would then take the freshly built aggregate with it.
+    def builds_aggregate(c: Change) -> bool:
+        return (
+            isinstance(c, (CreateFunction, ReplaceFunction, DropAndCreateFunction))
+            and c.function.kind == "a"
+        )
+
+    return [c for c in changes if not builds_aggregate(c)] + [
+        c for c in changes if builds_aggregate(c)
+    ]
 
 
 def _diff_indexes(desired: Schema, actual: Schema) -> list[Change]:

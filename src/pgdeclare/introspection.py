@@ -11,7 +11,7 @@ from typing import Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from .quoting import quote_ident
+from .quoting import quote_ident, quote_literal
 from .config import PgDeclareConfig, logger, resolve
 from .models import (
     Column,
@@ -81,6 +81,7 @@ def introspect_schema(
 
             functions = _query_functions(conn, schema)
             result.functions.update(functions)
+            result.functions.update(_query_aggregates(conn, schema))
 
             indexes = _query_indexes(conn, schema)
             result.indexes.update(indexes)
@@ -299,7 +300,11 @@ def _query_constraints(conn, schema: str, table_name: str) -> list[Constraint]:
 
 
 def _query_functions(conn, schema: str) -> dict[str, Function]:
-    """Query functions from pg_proc."""
+    """Query functions, procedures and window functions from pg_proc.
+
+    Aggregates come from `_query_aggregates`: `pg_get_functiondef` cannot
+    print them.
+    """
     functions: dict[str, Function] = {}
 
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -311,6 +316,7 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
                 p.prosecdef AS security_definer,
                 pg_get_functiondef(p.oid) AS full_definition,
                 p.oid AS func_oid,
+                p.prokind AS kind,
                 -- PUBLIC retains EXECUTE if the ACL is default (NULL => PUBLIC
                 -- EXECUTE) or an explicit grantee=0 EXECUTE entry exists.
                 (
@@ -323,7 +329,7 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE n.nspname = %s
-              AND p.prokind = 'f'
+              AND p.prokind IN ('f', 'p', 'w')
               -- Objects an extension owns belong to the extension, not the schema files.
               AND NOT EXISTS (
                   SELECT 1 FROM pg_depend ext
@@ -345,10 +351,164 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
                 definition_hash=hashlib.sha256(full_def.encode()).hexdigest()[:16],
                 security_definer=row["security_definer"],
                 public_execute=row["public_execute"],
+                kind=row["kind"],
             )
             functions[func.signature] = func
 
     return functions
+
+
+# FINALFUNC_MODIFY / MFINALFUNC_MODIFY spellings of pg_aggregate.aggfinalmodify.
+_FINALFUNC_MODIFY = {"r": "READ_ONLY", "s": "SHAREABLE", "w": "READ_WRITE"}
+_PARALLEL = {"s": "SAFE", "r": "RESTRICTED"}
+# pg_aggregate columns naming a support function, with the CREATE AGGREGATE
+# option each one is written as, in the order they are written.
+_AGGREGATE_FUNCTIONS = (
+    ("aggtransfn", "SFUNC"),
+    ("aggfinalfn", "FINALFUNC"),
+    ("aggcombinefn", "COMBINEFUNC"),
+    ("aggserialfn", "SERIALFUNC"),
+    ("aggdeserialfn", "DESERIALFUNC"),
+    ("aggmtransfn", "MSFUNC"),
+    ("aggminvtransfn", "MINVFUNC"),
+    ("aggmfinalfn", "MFINALFUNC"),
+)
+
+
+def _query_aggregates(conn, schema: str) -> dict[str, Function]:
+    """Query aggregates from pg_aggregate, rendering each one's CREATE statement.
+
+    `pg_get_functiondef` refuses aggregates, so the definition is written here,
+    from the catalog, with every name quoted. It is compared like a function's:
+    two aggregates are equal when their rendered definitions are.
+    """
+    support_cols = ", ".join(
+        f"a.{col}::oid AS {col}" for col, _ in _AGGREGATE_FUNCTIONS
+    )
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                p.proname AS name,
+                pg_get_function_identity_arguments(p.oid) AS args,
+                format_type(p.prorettype, NULL) AS result_type,
+                p.proparallel AS parallel,
+                a.aggkind, {support_cols},
+                a.aggfinalextra, a.aggmfinalextra,
+                a.aggfinalmodify, a.aggmfinalmodify,
+                format_type(a.aggtranstype, NULL) AS stype,
+                a.aggtransspace,
+                CASE WHEN a.aggmtranstype <> 0
+                     THEN format_type(a.aggmtranstype, NULL) END AS mstype,
+                a.aggmtransspace,
+                a.agginitval, a.aggminitval,
+                op.oprname AS sortop_name, opn.nspname AS sortop_schema
+            FROM pg_aggregate a
+            JOIN pg_proc p ON p.oid = a.aggfnoid
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            LEFT JOIN pg_operator op ON op.oid = a.aggsortop
+            LEFT JOIN pg_namespace opn ON opn.oid = op.oprnamespace
+            WHERE n.nspname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_proc'::regclass AND ext.objid = p.oid
+                    AND ext.deptype = 'e'
+              )
+            ORDER BY p.oid
+            """,
+            (schema,),
+        )
+        rows = cur.fetchall()
+        support_oids = sorted(
+            {row[col] for row in rows for col, _ in _AGGREGATE_FUNCTIONS if row[col]}
+        )
+        support: dict[int, tuple[str, str, str]] = {}
+        if support_oids:
+            cur.execute(
+                """
+                SELECT p.oid, n.nspname, p.proname,
+                       pg_get_function_identity_arguments(p.oid) AS args
+                FROM pg_proc p
+                JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE p.oid = ANY(%s::oid[])
+                """,
+                (support_oids,),
+            )
+            for r in cur.fetchall():
+                support[r["oid"]] = (r["nspname"], r["proname"], r["args"] or "")
+
+    aggregates: dict[str, Function] = {}
+    for row in rows:
+        args = row["args"] or ""
+        options: list[str] = []
+        signatures: list[str] = []
+        for col, option in _AGGREGATE_FUNCTIONS:
+            target = support.get(row[col]) if row[col] else None
+            if target is None:
+                continue
+            fn_schema, fn_name, fn_args = target
+            signatures.append(f"{fn_schema}.{fn_name}({fn_args})")
+            options.append(
+                f"{option} = {quote_ident(fn_schema)}.{quote_ident(fn_name)}"
+            )
+            if option == "SFUNC":
+                options.append(f"STYPE = {row['stype']}")
+                if row["aggtransspace"]:
+                    options.append(f"SSPACE = {row['aggtransspace']}")
+            elif option == "FINALFUNC":
+                if row["aggfinalextra"]:
+                    options.append("FINALFUNC_EXTRA")
+                options.append(
+                    f"FINALFUNC_MODIFY = {_FINALFUNC_MODIFY[row['aggfinalmodify']]}"
+                )
+            elif option == "MSFUNC":
+                options.append(f"MSTYPE = {row['mstype']}")
+                if row["aggmtransspace"]:
+                    options.append(f"MSSPACE = {row['aggmtransspace']}")
+            elif option == "MFINALFUNC":
+                if row["aggmfinalextra"]:
+                    options.append("MFINALFUNC_EXTRA")
+                options.append(
+                    f"MFINALFUNC_MODIFY = {_FINALFUNC_MODIFY[row['aggmfinalmodify']]}"
+                )
+        if row["agginitval"] is not None:
+            options.append(f"INITCOND = {quote_literal(row['agginitval'])}")
+        if row["aggminitval"] is not None:
+            options.append(f"MINITCOND = {quote_literal(row['aggminitval'])}")
+        if row["sortop_name"]:
+            # An operator name is made of operator characters only, so it
+            # cannot carry a quote; the schema is quoted like any name.
+            options.append(
+                f"SORTOP = OPERATOR({quote_ident(row['sortop_schema'])}."
+                f"{row['sortop_name']})"
+            )
+        if row["parallel"] in _PARALLEL:
+            options.append(f"PARALLEL = {_PARALLEL[row['parallel']]}")
+        if row["aggkind"] == "h":
+            options.append("HYPOTHETICAL")
+
+        func = Function(
+            schema=schema,
+            name=row["name"],
+            args=args,
+            full_definition="",
+            kind="a",
+            result_type=f"{row['aggkind']}:{row['result_type']}",
+            support_functions=tuple(signatures),
+            # Aggregates are never SECURITY DEFINER.
+            security_definer=False,
+        )
+        body = ",\n    ".join(options)
+        func.full_definition = (
+            f"CREATE OR REPLACE AGGREGATE {func.sql_name} (\n    {body}\n)\n"
+        )
+        func.definition_hash = hashlib.sha256(
+            func.full_definition.encode()
+        ).hexdigest()[:16]
+        aggregates[func.signature] = func
+
+    return aggregates
 
 
 def _query_indexes(conn, schema: str) -> dict[str, Index]:
@@ -773,8 +933,13 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = %(schema)s
 
 UNION ALL
-SELECT 'FUNCTION', p.proname, '', pg_get_function_identity_arguments(p.oid),
-       d.description
+SELECT
+    CASE p.prokind
+        WHEN 'p' THEN 'PROCEDURE'
+        WHEN 'a' THEN 'AGGREGATE'
+        ELSE 'FUNCTION'
+    END,
+    p.proname, '', pg_get_function_identity_arguments(p.oid), d.description
 FROM pg_description d
 JOIN pg_proc p ON d.classoid = 'pg_proc'::regclass AND d.objoid = p.oid
 JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -1125,18 +1290,23 @@ def _query_grants(conn, schema: str, grantee: str) -> list[Grant]:
                 )
             )
 
-        # Function grants
+        # Function, procedure and aggregate grants. specific_name is
+        # `<name>_<oid>`, which is how the view names one overload; the oid
+        # tells a procedure (GRANT ... ON PROCEDURE) from the rest.
         cur.execute(
             """
             SELECT
-                routine_name AS object_name,
-                'FUNCTION' AS object_type,
-                privilege_type,
-                grantee,
+                g.routine_name AS object_name,
+                CASE p.prokind WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END
+                    AS object_type,
+                g.privilege_type,
+                g.grantee,
                 NULL AS column_name
-            FROM information_schema.role_routine_grants
-            WHERE grantee = %s
-              AND routine_schema = %s
+            FROM information_schema.role_routine_grants g
+            LEFT JOIN pg_proc p
+              ON p.oid = substring(g.specific_name::text from '_([0-9]+)$')::oid
+            WHERE g.grantee = %s
+              AND g.routine_schema = %s
             """,
             (grantee, schema),
         )
