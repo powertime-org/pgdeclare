@@ -364,6 +364,98 @@ class CompositeType:
         )
 
 
+@dataclass
+class Domain:
+    """PostgreSQL domain type definition (typtype = 'd').
+
+    `base_type` is format_type() of the underlying type, `collation` the
+    quoted, schema-qualified collation when it differs from the base type's
+    default (None otherwise). NOT NULL is modelled on the domain, like a
+    column's, so PostgreSQL 18's NOT NULL constraint rows are not managed twice.
+    `constraints` holds the CHECK constraints, matched by name.
+
+    `dependents` describes what uses the domain in the live database (columns,
+    function arguments, other domains). It is not part of equality: it decides
+    whether a base-type change may drop and recreate the domain.
+    """
+
+    schema: str
+    name: str
+    base_type: str
+    nullable: bool = True
+    default: Optional[str] = None
+    collation: Optional[str] = None
+    constraints: list[Constraint] = field(default_factory=list)
+    dependents: list[str] = field(default_factory=list)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Domain):
+            return NotImplemented
+        return (
+            self.schema == other.schema
+            and self.name == other.name
+            and self.base_type == other.base_type
+            and self.nullable == other.nullable
+            and self.default == other.default
+            and self.collation == other.collation
+            and sorted(self.constraints, key=lambda c: c.name)
+            == sorted(other.constraints, key=lambda c: c.name)
+        )
+
+
+@dataclass
+class Sequence:
+    """A standalone sequence (CREATE SEQUENCE, or the one a serial column makes).
+
+    Identity-column sequences are not modelled here: the column owns them.
+    Options are compared as the catalog stores them (pg_sequence), so a
+    declaration that relies on defaults and one that spells them out are equal.
+    The current value is state, not schema, and is never compared.
+    """
+
+    schema: str
+    name: str
+    data_type: str = "bigint"  # format_type(seqtypid): smallint, integer, bigint
+    increment: int = 1
+    min_value: int = 1
+    max_value: int = 9223372036854775807
+    start: int = 1
+    cache: int = 1
+    cycle: bool = False
+    # OWNED BY: (schema, table, column) of the owning column, or None.
+    owned_by: Optional[tuple[str, str, str]] = None
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    def options_equal(self, other: "Sequence") -> bool:
+        """Whether every CREATE/ALTER SEQUENCE option matches (not ownership)."""
+        return (
+            self.data_type == other.data_type
+            and self.increment == other.increment
+            and self.min_value == other.min_value
+            and self.max_value == other.max_value
+            and self.start == other.start
+            and self.cache == other.cache
+            and self.cycle == other.cycle
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Sequence):
+            return NotImplemented
+        return (
+            self.schema == other.schema
+            and self.name == other.name
+            and self.options_equal(other)
+            and self.owned_by == other.owned_by
+        )
+
+
 def normalize_view_reloptions(raw: Optional[list[str]]) -> list[str]:
     """Canonicalize a view's `pg_class.reloptions` array for comparison.
 
@@ -418,6 +510,46 @@ class View:
         if not isinstance(other, View):
             return NotImplemented
         # Normalize whitespace for comparison
+        return (
+            self.definition.strip() == other.definition.strip()
+            and self.reloptions == other.reloptions
+        )
+
+
+@dataclass
+class MaterializedView:
+    """Materialized view definition (`CREATE MATERIALIZED VIEW`)."""
+
+    schema: str
+    name: str
+    definition: str  # Query text from pg_get_viewdef, as pg_matviews reports it
+    # Storage parameters (`WITH (fillfactor = 70)`, autovacuum settings),
+    # canonicalized like a view's options.
+    reloptions: list[str] = field(default_factory=list)
+    # Whether the object is populated. In the plan database this is the
+    # declaration (`WITH DATA` vs `WITH NO DATA`), and it decides how a create or
+    # recreate populates the object. It is not compared: a live matview that an
+    # application has refreshed, or emptied with `REFRESH ... WITH NO DATA`, has
+    # not drifted from its declaration.
+    with_data: bool = True
+
+    def __post_init__(self):
+        self.reloptions = normalize_view_reloptions(self.reloptions)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    @property
+    def options_clause(self) -> str:
+        """`" WITH (...)"` for a CREATE MATERIALIZED VIEW, or `""`."""
+        if not self.reloptions:
+            return ""
+        return f" WITH ({', '.join(self.reloptions)})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, MaterializedView):
+            return NotImplemented
         return (
             self.definition.strip() == other.definition.strip()
             and self.reloptions == other.reloptions
@@ -613,7 +745,19 @@ class Schema:
     composite_types: dict[str, CompositeType] = field(
         default_factory=dict
     )  # key = schema.type
+    domains: dict[str, Domain] = field(default_factory=dict)  # key = schema.domain
     views: dict[str, View] = field(default_factory=dict)  # key = schema.view
+    materialized_views: dict[str, MaterializedView] = field(
+        default_factory=dict
+    )  # key = schema.matview
+    # Views and materialized views that read from a view or materialized view:
+    # key = schema.name of the referenced relation, value = schema.name of each
+    # direct dependent. Dropping a relation fails while a dependent exists, so a
+    # recreate has to take its dependents down and rebuild them with it.
+    relation_dependents: dict[str, list[str]] = field(default_factory=dict)
+    sequences: dict[str, Sequence] = field(
+        default_factory=dict
+    )  # key = schema.sequence
     grants: list[Grant] = field(default_factory=list)
     dependencies: list[Dependency] = field(default_factory=list)
     roles: dict[str, Role] = field(default_factory=dict)  # key = role name

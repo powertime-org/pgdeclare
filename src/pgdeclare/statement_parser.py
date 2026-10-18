@@ -45,6 +45,7 @@ TRACKED_OBJECT_TYPES = {
     "TABLE",
     "FUNCTION",
     "VIEW",
+    "MATERIALIZED VIEW",
     "INDEX",
     "TRIGGER",
     "POLICY",
@@ -254,6 +255,10 @@ def _parse_statement_metadata(
         return _parse_create_view(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
         )
+    elif stmt_upper.startswith("CREATE MATERIALIZED VIEW"):
+        return _parse_create_materialized_view(
+            raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
     elif stmt_upper.startswith("CREATE INDEX"):
         return _parse_create_index(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
@@ -270,6 +275,10 @@ def _parse_statement_metadata(
         )
     elif stmt_upper.startswith("CREATE TYPE"):
         return _parse_create_type(
+            raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
+    elif stmt_upper.startswith("CREATE DOMAIN"):
+        return _parse_create_domain(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
         )
     elif stmt_upper.startswith("CREATE EXTENSION"):
@@ -497,6 +506,44 @@ def _parse_create_view(
     )
 
 
+def _parse_create_materialized_view(
+    raw_sql: str,
+    sql_for_parsing: str,
+    source_file: Optional[str],
+    line_number: int,
+    is_idempotent: bool,
+) -> ParsedStatement:
+    """Parse CREATE MATERIALIZED VIEW (a CREATE TABLE AS node) using pglast AST."""
+    object_name = None
+
+    try:
+        tree = parse_sql(sql_for_parsing)
+        for raw_stmt in tree:
+            stmt = raw_stmt.stmt
+            if (
+                isinstance(stmt, ast.CreateTableAsStmt)
+                and stmt.into is not None
+                and stmt.into.rel is not None
+            ):
+                schema = stmt.into.rel.schemaname or "public"
+                object_name = f"{schema}.{stmt.into.rel.relname}"
+                if stmt.if_not_exists:
+                    is_idempotent = True
+                break
+    except Exception:
+        pass  # If pglast fails, PostgreSQL would fail too
+
+    return ParsedStatement(
+        raw_sql=raw_sql,
+        statement_type="CREATE MATERIALIZED VIEW",
+        object_type="MATERIALIZED VIEW",
+        object_name=object_name,
+        source_file=source_file,
+        line_number=line_number,
+        is_idempotent=is_idempotent,
+    )
+
+
 def _parse_create_index(
     raw_sql: str,
     sql_for_parsing: str,
@@ -642,6 +689,45 @@ def _parse_create_type(
     return ParsedStatement(
         raw_sql=raw_sql,
         statement_type="CREATE TYPE",
+        object_type="TYPE",
+        object_name=object_name,
+        source_file=source_file,
+        line_number=line_number,
+        is_idempotent=is_idempotent,
+    )
+
+
+def _parse_create_domain(
+    raw_sql: str,
+    sql_for_parsing: str,
+    source_file: Optional[str],
+    line_number: int,
+    is_idempotent: bool,
+) -> ParsedStatement:
+    """Parse CREATE DOMAIN statement using pglast AST.
+
+    A domain shares the type namespace, so it is keyed as a TYPE: declaring an
+    enum and a domain of the same name is reported as a duplicate.
+    """
+    object_name = None
+
+    try:
+        tree = parse_sql(sql_for_parsing)
+        for raw_stmt in tree:
+            stmt = raw_stmt.stmt
+            if isinstance(stmt, ast.CreateDomainStmt):
+                parts = [n.sval for n in stmt.domainname or () if hasattr(n, "sval")]
+                if len(parts) == 1:
+                    object_name = f"public.{parts[0]}"
+                elif len(parts) >= 2:
+                    object_name = f"{parts[-2]}.{parts[-1]}"
+                break
+    except Exception:
+        pass  # If pglast fails, PostgreSQL would fail too
+
+    return ParsedStatement(
+        raw_sql=raw_sql,
+        statement_type="CREATE DOMAIN",
         object_type="TYPE",
         object_name=object_name,
         source_file=source_file,

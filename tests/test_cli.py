@@ -4,6 +4,7 @@ import json
 import tomllib
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psycopg2
 import pytest
@@ -375,3 +376,110 @@ def test_an_owned_plan_database_is_reused_and_kept(tmp_path, target):
         assert _rows(target, f"SELECT 1 FROM pg_database WHERE datname = '{plan}'")
     finally:
         _admin(target, f'DROP DATABASE IF EXISTS "{plan}" WITH (FORCE)')
+
+
+@pytest.mark.integration
+def test_an_undeclared_managed_role_is_a_clear_error(tmp_path, target, capsys):
+    sql_dir = tmp_path / "sql"
+    role = f"pgdeclare_reader_{uuid.uuid4().hex[:8]}"
+    base = ["--database-url", target, "--sql-dir", str(sql_dir), "--role", role]
+    _write(sql_dir, "CREATE TABLE note (id int PRIMARY KEY);")
+    assert main(["diff", *base]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert f"managed role(s) not found: {role}" in err
+    assert "CREATE ROLE" in err
+
+    _write(sql_dir, f'CREATE ROLE "{role}" NOLOGIN;', name="00_roles.sql")
+    try:
+        assert main(["apply", *base]) == EXIT_OK
+    finally:
+        _admin(target, f'DROP ROLE IF EXISTS "{role}"')
+
+
+@pytest.mark.integration
+def test_a_dry_run_rename_is_not_a_blocked_drop(tmp_path, target, capsys):
+    sql_dir = tmp_path / "sql"
+    base = ["--database-url", target, "--sql-dir", str(sql_dir)]
+    _write(sql_dir, "CREATE TABLE note (id int PRIMARY KEY, author text);")
+    assert main(["apply", *base]) == EXIT_OK
+    _admin(target, "INSERT INTO note VALUES (1, 'ada')")
+
+    _write(
+        sql_dir,
+        "CREATE TABLE note (id int PRIMARY KEY, writer text);\n"
+        "-- @migrate-before:2026-02-01_rename_author\n"
+        "ALTER TABLE note RENAME COLUMN author TO writer;\n"
+        "-- @end-migrate\n",
+    )
+    # The dry run cannot see the rename, so the drop is a warning, not an error.
+    assert main(["apply", "--dry-run", *base]) == EXIT_OK
+    assert _rows(target, "SELECT author FROM note") == [("ada",)]
+    assert main(["apply", *base]) == EXIT_OK
+    assert _rows(target, "SELECT writer FROM note") == [("ada",)]
+
+    # With nothing pending, a real data-loss drop still fails the dry run.
+    _write(sql_dir, "CREATE TABLE note (id int PRIMARY KEY);")
+    assert main(["apply", "--dry-run", *base]) == EXIT_ERROR
+
+
+@pytest.mark.integration
+def test_a_role_without_createdb_is_told_what_to_do(tmp_path, target, capsys):
+    sql = str(_write(tmp_path / "sql", "CREATE TABLE note (id int PRIMARY KEY);"))
+    role = f"pgdeclare_nocreatedb_{uuid.uuid4().hex[:8]}"
+    _admin(target, f"CREATE ROLE \"{role}\" LOGIN PASSWORD 'pw'")
+    try:
+        parsed = urlsplit(target)
+        url = parsed._replace(
+            netloc=f"{role}:pw@{parsed.hostname}:{parsed.port or 5432}"
+        ).geturl()
+        assert main(["diff", "--database-url", url, "--sql-dir", sql]) == EXIT_ERROR
+        err = capsys.readouterr().err
+        assert "lacks CREATEDB" in err and "--plan-database" in err
+    finally:
+        _admin(target, f'DROP ROLE IF EXISTS "{role}"')
+
+
+COMBINED = """
+CREATE DOMAIN email AS text CONSTRAINT email_has_at CHECK (VALUE LIKE '%@%');
+CREATE SEQUENCE ticket_no AS integer START WITH 1000;
+
+CREATE TABLE IF NOT EXISTS person (
+    id     serial PRIMARY KEY,
+    email  email NOT NULL,
+    ticket integer NOT NULL DEFAULT nextval('ticket_no')
+);
+COMMENT ON TABLE person IS 'People';
+COMMENT ON COLUMN person.email IS 'Contact address';
+
+CREATE VIEW person_emails AS SELECT id, email FROM person;
+COMMENT ON VIEW person_emails IS 'Emails only';
+
+CREATE MATERIALIZED VIEW person_count AS SELECT count(*) AS n FROM person_emails;
+CREATE INDEX IF NOT EXISTS person_count_n_idx ON person_count (n);
+"""
+
+
+@pytest.mark.integration
+def test_new_object_kinds_converge_together(tmp_path, target):
+    sql_dir = tmp_path / "sql"
+    base = ["--database-url", target, "--sql-dir", str(sql_dir)]
+    _write(sql_dir, COMBINED)
+    assert main(["apply", *base]) == EXIT_OK
+    assert main(["diff", "--exit-code", *base]) == EXIT_OK
+    _admin(target, "INSERT INTO person (email) VALUES ('a@b.c')")
+
+    # Change the view under the matview, a comment, and the sequence options.
+    changed = (
+        COMBINED.replace(
+            "SELECT id, email FROM person;", "SELECT id, email, ticket FROM person;"
+        )
+        .replace("'Emails only'", "'Emails and tickets'")
+        .replace("START WITH 1000", "START WITH 1000 CACHE 5")
+    )
+    _write(sql_dir, changed)
+    assert main(["apply", "--offline", *base]) == EXIT_OK
+    assert main(["diff", "--exit-code", *base]) == EXIT_OK
+    assert _rows(target, "SELECT id, ticket FROM person") == [(1, 1000)]
+    assert _rows(
+        target, "SELECT obj_description('public.person_emails'::regclass)"
+    ) == [("Emails and tickets",)]

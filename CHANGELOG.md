@@ -9,13 +9,28 @@ may change in minor releases.
 
 ### Added
 
-- Comments (`COMMENT ON`) on tables, columns of tables and views, views,
-  functions, indexes, constraints, triggers, policies, and enum and composite
-  types. Declaring a comment creates it, changing the text updates it, and
-  removing the declaration removes it (`IS NULL`). Comments are applied after
-  the DDL and index phases, so a recreated object gets its comment back.
-  Upgrading note: comments in a managed schema that the schema files do not
-  declare are now removed.
+### Changed
+
+- README: the plan database's privilege needs, the PostgreSQL 14 `public`
+  ownership caveat, a corrected Python example, and a comparison with other
+  tools.
+
+### Fixed
+
+- A `DROP` that fails because another object still depends on it
+  (`2BP01`) is retried after the rest, like a missing dependency, so dropping
+  a stack of views no longer depends on the order they were listed in.
+- No `REVOKE` is planned on a table, view or materialized view the same run
+  drops; it used to fail on the missing relation and leave the run stuck.
+- `serial` and `bigserial` columns on a fresh database: the table's
+  `nextval()` default used to name a sequence that was never created.
+- A managed role that exists nowhere is a clear error naming the role, not a
+  raw `UndefinedObject` traceback from introspection.
+- `apply --dry-run` with pending `@migrate-before` blocks reports drops it
+  cannot rule out (a rename looks like drop plus add) as warnings, instead of
+  failing with a `@drop` error the real run would not raise.
+- A role without `CREATEDB` is told to create a plan database and pass
+  `--plan-database`, instead of a bare permission error.
 
 ## [0.1.0] - 2026-10-16
 

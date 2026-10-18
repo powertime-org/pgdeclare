@@ -217,6 +217,17 @@ def _build_desired_schema(
     # Introspect the plan database
     schema = introspect_schema(plan_url, schemas, config=config)
 
+    # Roles are cluster-wide, so building the plan creates every declared role.
+    # A managed role still missing is declared nowhere.
+    missing = [r for r in resolve(config).managed_roles if r not in schema.roles]
+    if missing:
+        raise ValueError(
+            "managed role(s) not found: "
+            + ", ".join(missing)
+            + ". Declare each with CREATE ROLE in your schema files, "
+            "or create it on the server."
+        )
+
     # Inject passwords into introspected roles
     _inject_role_passwords(schema, passwords)
 

@@ -29,6 +29,7 @@ from .changes import (
     CreateIndex,
     CreateRole,
     SetComment,
+    DropDomain,
 )
 from .differ import categorize_changes, split_index_operations
 from .models import ChangeCategory
@@ -45,6 +46,12 @@ DEPENDENCY_ERROR_CODES = {
 # Change types that are idempotent (safe to skip if duplicate_object error)
 # CreateRole is cluster-wide - may already exist from retry_executor.py
 IDEMPOTENT_CHANGE_TYPES = (CreateRole,)
+
+# dependent_objects_still_exist. Retryable only for a DropDomain: the column or
+# signature that still uses the domain is dropped or retyped by another change
+# in the same run, and the drop succeeds once that one has.
+DEPENDENT_OBJECTS_ERROR_CODE = "2BP01"
+RETRY_WHILE_DEPENDED_ON = (DropDomain,)
 
 # PostgreSQL error code for "already exists" errors
 DUPLICATE_ERROR_CODE = "42710"  # duplicate_object
@@ -381,7 +388,10 @@ def _execute_with_retry_savepoints(
                     continue
 
                 # Check if this is a dependency error (retryable)
-                if error_code in DEPENDENCY_ERROR_CODES:
+                if error_code in DEPENDENCY_ERROR_CODES or (
+                    error_code == DEPENDENT_OBJECTS_ERROR_CODE
+                    and isinstance(change, RETRY_WHILE_DEPENDED_ON)
+                ):
                     # Defer for retry
                     deferred.append(
                         DeferredChange(change=change, error=e, error_code=error_code)

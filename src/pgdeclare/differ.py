@@ -5,42 +5,61 @@ Compares desired schema state against actual database state and produces
 a list of Change objects needed to synchronize them.
 """
 
+from dataclasses import replace as dataclass_replace
 from typing import Callable, Optional, Union
 
 from .changes import (
     AddColumn,
     AddConstraint,
+    AddDomainConstraint,
     AddEnumValue,
     AddIdentity,
     AlterColumnDropExpression,
     AlterColumnSetExpression,
     AlterColumnType,
+    AlterMaterializedViewOptions,
+    AlterDomainDropDefault,
+    AlterDomainDropNotNull,
+    AlterDomainSetDefault,
+    AlterDomainSetNotNull,
     AlterRole,
+    AlterSequence,
     AlterViewOptions,
     Change,
     CreateCompositeType,
+    CreateDomain,
     CreateEnum,
     CreateFunction,
     CreateIndex,
+    CreateMaterializedView,
     CreatePolicy,
     CreateRole,
+    CreateSequence,
     CreateTable,
     CreateTrigger,
     CreateView,
     DEFERRED_CONSTRAINT_TYPES,
     DisableRLS,
     DropAndCreateConstraint,
+    DependentRelation,
+    DropAndCreateDomain,
+    DropAndCreateDomainConstraint,
     DropAndCreateFunction,
+    DropAndCreateMaterializedView,
     DropAndCreatePolicy,
     DropAndCreateView,
     DropColumn,
     DropConstraint,
     DropDefault,
+    DropDomain,
+    DropDomainConstraint,
     DropFunction,
     DropIdentity,
     DropIndex,
+    DropMaterializedView,
     DropNotNull,
     DropPolicy,
+    DropSequence,
     DropTable,
     DropTrigger,
     DropView,
@@ -55,18 +74,27 @@ from .changes import (
     RevokeRoleMembership,
     SetComment,
     SetDefault,
+    SetSequenceOwner,
     SetNotNull,
     ValidateConstraint,
+    dependents_note,
+    ValidateDomainConstraint,
     grant_replay_note,
+    index_rebuild_note,
 )
 from .config import PgDeclareConfig, resolve
 from .models import (
     ChangeCategory,
     Column,
     Comment,
+    Domain,
     Function,
+    Grant,
+    Index,
+    MaterializedView,
     Schema,
     Table,
+    View,
 )
 
 
@@ -107,20 +135,33 @@ def compute_diff(
     # Diff each object type
     # Order matters for dependency resolution:
     # - Enums before composite types (composite types may reference enums)
+    # - Domains before tables (columns may be typed with a domain)
     # - Composite types before functions (functions may use composite types)
     # - Views before functions (functions may SELECT from views, so views
     #   must be updated first when column types change)
+    # - Domain drops after tables, views and functions, which drop or retype
+    #   whatever still uses the domain
+    # - Sequences before tables (a column default calls nextval() on one);
+    #   OWNED BY and sequence drops after tables and views (OWNED BY needs the
+    #   column, and a drop must follow the removal of any default using it)
     changes.extend(_diff_enums(desired, actual))
+    changes.extend(_diff_domains(desired, actual, managed_schemas=schemas))
     changes.extend(_diff_composite_types(desired, actual))
+    sequences_before, sequences_after = _diff_sequences(desired, actual)
+    changes.extend(sequences_before)
     changes.extend(
         _diff_tables(desired, actual, check_data_fn, managed_schemas=schemas)
     )
     changes.extend(_diff_views(desired, actual))
+    changes.extend(_diff_materialized_views(desired, actual))
+    changes.extend(sequences_after)
     changes.extend(_diff_functions(desired, actual))
+    changes.extend(_drop_domains(desired, actual))
     changes.extend(_diff_indexes(desired, actual))
     changes.extend(_diff_policies(desired, actual))
     changes.extend(_diff_triggers(desired, actual))
     changes.extend(_diff_grants(desired, actual))
+    changes = _skip_revokes_on_dropped_relations(changes)
 
     # Re-apply grants for objects being dropped and recreated.
     #
@@ -136,17 +177,32 @@ def compute_diff(
     # The grants are therefore carried inside the recreate's own DO block, the
     # same way the SECDEF REVOKE is atomic with the function recreate. Object
     # and ACL are one unit, so no execution order can separate them.
+    #
+    # A recreated view or materialized view also takes its dependents down with
+    # it; those ride inside the same statement too (_carry_recreate_dependents).
+    changes = _carry_recreate_dependents(changes, desired, actual)
     recreations: dict[
-        tuple[str, str], list[Union[DropAndCreateView, DropAndCreateFunction]]
+        tuple[str, str],
+        list[
+            Union[
+                DropAndCreateView, DropAndCreateFunction, DropAndCreateMaterializedView
+            ]
+        ],
     ] = {}
     for c in changes:
         if isinstance(c, DropAndCreateView):
             recreations.setdefault((c.view.schema, c.view.name), []).append(c)
         elif isinstance(c, DropAndCreateFunction):
             recreations.setdefault((c.function.schema, c.function.name), []).append(c)
+        elif isinstance(c, DropAndCreateMaterializedView):
+            recreations.setdefault((c.matview.schema, c.matview.name), []).append(c)
     if recreations:
         for grant in desired.grants:
             for recreate in recreations.get((grant.schema, grant.object_name), []):
+                if isinstance(
+                    recreate, DropAndCreateMaterializedView
+                ) and not _is_relation_grant(grant):
+                    continue
                 recreate.grants.append(grant)
         # Say so in the plan, so a recreate's ACL work is visible.
         for recreated in recreations.values():
@@ -195,6 +251,16 @@ def compute_diff(
                     constraint_name=change.constraint.name,
                 )
             )
+    # Domain CHECK constraints are always added NOT VALID, for the same reason.
+    for change in changes:
+        if isinstance(change, (AddDomainConstraint, DropAndCreateDomainConstraint)):
+            validation_changes.append(
+                ValidateDomainConstraint(
+                    schema=change.schema,
+                    domain=change.domain,
+                    constraint_name=change.constraint.name,
+                )
+            )
     changes.extend(validation_changes)
 
     # Comments last: a recreate this run wipes the object's comment, so the
@@ -202,6 +268,189 @@ def compute_diff(
     changes.extend(_diff_comments(desired, actual, changes))
 
     return changes
+
+
+def _skip_revokes_on_dropped_relations(changes: list[Change]) -> list[Change]:
+    """Leave out revokes on a table, view or materialized view this run drops.
+
+    The DROP takes the ACL with it. A REVOKE ordered after it would fail on the
+    missing relation and stay deferred until the run reported itself stuck.
+    """
+    dropped: set[tuple[str, str]] = set()
+    for c in changes:
+        if isinstance(c, DropMaterializedView):
+            dropped.add((c.schema, c.matview_name))
+        elif isinstance(c, DropView):
+            dropped.add((c.schema, c.view_name))
+        elif isinstance(c, DropTable):
+            dropped.add((c.schema, c.table_name))
+    if not dropped:
+        return changes
+    return [
+        c
+        for c in changes
+        if not (
+            isinstance(c, RevokePrivilege)
+            and _is_relation_grant(c.grant)
+            and (c.grant.schema, c.grant.object_name) in dropped
+        )
+    ]
+
+
+def _is_relation_grant(grant: Grant) -> bool:
+    """A grant on a table-like object (table, view, materialized view)."""
+    return grant.object_type in ("TABLE", "COLUMN")
+
+
+def _relation_dependent_order(root: str, dependents: dict[str, list[str]]) -> list[str]:
+    """Every view or materialized view reading from `root`, directly or not.
+
+    Returned in creation order: each one after everything it reads from, so
+    dropping in reverse and creating in order never trips over a dependency.
+    """
+    order: list[str] = []
+    seen: set[str] = set()
+
+    def visit(name: str) -> None:
+        for dependent in dependents.get(name, []):
+            if dependent not in seen:
+                seen.add(dependent)
+                visit(dependent)
+                order.append(dependent)
+
+    visit(root)
+    # Post-order puts the deepest dependents first; reversed, each relation
+    # precedes everything that reads from it.
+    order.reverse()
+    return order
+
+
+def _carry_recreate_dependents(
+    changes: list[Change], desired: Schema, actual: Schema
+) -> list[Change]:
+    """Fold a recreated relation's dependents, and a matview's indexes, into it.
+
+    DROP VIEW / DROP MATERIALIZED VIEW refuse while another view reads from the
+    object, and a materialized view's DROP takes its indexes along. The diff is
+    computed against the snapshot taken before the run, so it never sees
+    either loss. Each recreate therefore drops its dependents first and builds
+    them, their grants and their indexes back, inside its own statement.
+
+    A dependent folded into a recreate no longer needs its own recreate,
+    options change or index changes: the recreate builds it from its
+    declaration, so those changes are removed.
+    """
+    roots = [
+        c
+        for c in changes
+        if isinstance(c, (DropAndCreateView, DropAndCreateMaterializedView))
+    ]
+    if not roots:
+        return changes
+
+    def root_name(c: Union[DropAndCreateView, DropAndCreateMaterializedView]) -> str:
+        return (
+            c.view.qualified_name
+            if isinstance(c, DropAndCreateView)
+            else c.matview.qualified_name
+        )
+
+    def relation_grants(schema: str, name: str) -> list[Grant]:
+        return [
+            g
+            for g in desired.grants
+            if g.schema == schema and g.object_name == name and _is_relation_grant(g)
+        ]
+
+    def relation_indexes(schema: str, name: str) -> list[Index]:
+        return [
+            i
+            for i in desired.indexes.values()
+            if i.schema == schema and i.table == name
+        ]
+
+    plans: dict[str, list[str]] = {
+        root_name(c): _relation_dependent_order(
+            root_name(c), actual.relation_dependents
+        )
+        for c in roots
+    }
+    folded: set[str] = {name for order in plans.values() for name in order}
+
+    # Relations whose indexes a recreate rebuilds: a recreated matview, and
+    # every still-declared matview dependent.
+    rebuilt_indexes: set[str] = set()
+
+    kept: list[Change] = []
+    for c in changes:
+        if isinstance(c, (DropAndCreateView, DropAndCreateMaterializedView)):
+            name = root_name(c)
+            if name in folded:
+                continue  # Another recreate rebuilds it.
+            dependents: list[DependentRelation] = []
+            for dep_name in plans[name]:
+                matview = actual.materialized_views.get(dep_name)
+                view = actual.views.get(dep_name)
+                existing = matview if matview is not None else view
+                if existing is None:
+                    # Outside the managed schemas: it cannot be rebuilt, so
+                    # leave it in place and let the DROP report it.
+                    continue
+                relation: Optional[Union[View, MaterializedView]] = (
+                    desired.materialized_views.get(dep_name)
+                    or desired.views.get(dep_name)
+                )
+                dependent = DependentRelation(
+                    schema=existing.schema,
+                    name=existing.name,
+                    kind="m" if matview is not None else "v",
+                    relation=relation,
+                )
+                if relation is not None:
+                    dependent.grants = relation_grants(relation.schema, relation.name)
+                    if isinstance(relation, MaterializedView):
+                        dependent.indexes = relation_indexes(
+                            relation.schema, relation.name
+                        )
+                        rebuilt_indexes.add(relation.qualified_name)
+                dependents.append(dependent)
+            c.dependents = dependents
+            if isinstance(c, DropAndCreateMaterializedView):
+                c.indexes = relation_indexes(c.matview.schema, c.matview.name)
+                rebuilt_indexes.add(name)
+                c.description += index_rebuild_note(len(c.indexes))
+            if any(d.rebuilds_data for d in dependents):
+                # A view recreate that rebuilds a materialized view's data holds
+                # that lock too.
+                c.category = ChangeCategory.OFFLINE
+            c.description += dependents_note(dependents)
+            kept.append(c)
+        elif (
+            isinstance(
+                c,
+                (
+                    AlterViewOptions,
+                    AlterMaterializedViewOptions,
+                ),
+            )
+            and c.object_name in folded
+        ):
+            continue
+        else:
+            kept.append(c)
+
+    if not rebuilt_indexes:
+        return kept
+
+    def index_relation(c: Change) -> Optional[str]:
+        if isinstance(c, CreateIndex):
+            return f"{c.index.schema}.{c.index.table}"
+        if isinstance(c, DropIndex):
+            index = actual.indexes.get(f"{c.schema}.{c.index_name}")
+            return f"{index.schema}.{index.table}" if index is not None else None
+        return None
+
+    return [c for c in kept if index_relation(c) not in rebuilt_indexes]
 
 
 def _diff_function_public_execute(
@@ -859,6 +1108,107 @@ def _diff_composite_types(desired: Schema, actual: Schema) -> list[Change]:
     return changes
 
 
+def _diff_domains(
+    desired: Schema,
+    actual: Schema,
+    managed_schemas: list[str] | None = None,
+) -> list[Change]:
+    """Create domains and converge the ones that exist.
+
+    Default, NOT NULL and CHECK constraints are altered in place. A changed
+    base type or collation has no ALTER, so the domain is dropped and
+    recreated, which is only safe while nothing uses it; otherwise the change
+    is refused with the dependents named. Drops of undeclared domains come
+    from _drop_domains, later in the plan.
+    """
+    changes: list[Change] = []
+
+    for key, domain in desired.domains.items():
+        current = actual.domains.get(key)
+        if current is None:
+            changes.append(CreateDomain(domain=domain))
+            continue
+
+        if _normalize_type(domain.base_type, managed_schemas) != _normalize_type(
+            current.base_type, managed_schemas
+        ) or (domain.collation or "") != (current.collation or ""):
+            if current.dependents:
+                raise ValueError(
+                    f'cannot change the base type of domain "{domain.schema}".'
+                    f'"{domain.name}" from {current.base_type} to '
+                    f"{domain.base_type}: PostgreSQL has no ALTER for it, and "
+                    "dropping and recreating the domain would drop what uses "
+                    f"it ({'; '.join(current.dependents)}). Move those to the "
+                    "new type in an explicit @migrate-before block, or declare "
+                    "a new domain and retype the columns to it."
+                )
+            changes.append(DropAndCreateDomain(domain=domain))
+            continue
+
+        changes.extend(_diff_domain_properties(domain, current))
+
+    return changes
+
+
+def _diff_domain_properties(desired: Domain, actual: Domain) -> list[Change]:
+    """Default, NOT NULL and CHECK constraint changes of an existing domain."""
+    changes: list[Change] = []
+    schema, name = desired.schema, desired.name
+
+    desired_default = _normalize_default(desired.default)
+    if desired_default != _normalize_default(actual.default):
+        if desired_default is None:
+            changes.append(AlterDomainDropDefault(schema=schema, name=name))
+        else:
+            changes.append(
+                AlterDomainSetDefault(
+                    schema=schema, name=name, default_value=desired.default or ""
+                )
+            )
+
+    if desired.nullable != actual.nullable:
+        if desired.nullable:
+            changes.append(AlterDomainDropNotNull(schema=schema, name=name))
+        else:
+            changes.append(AlterDomainSetNotNull(schema=schema, name=name))
+
+    desired_checks = {c.name: c for c in desired.constraints}
+    actual_checks = {c.name: c for c in actual.constraints}
+    # Drops first: a renamed constraint must not briefly coexist with its
+    # replacement, and a dropped CHECK may be what the new one would violate.
+    for cname in sorted(actual_checks.keys() - desired_checks.keys()):
+        changes.append(
+            DropDomainConstraint(schema=schema, domain=name, constraint_name=cname)
+        )
+    for cname, constraint in sorted(desired_checks.items()):
+        if cname not in actual_checks:
+            changes.append(
+                AddDomainConstraint(schema=schema, domain=name, constraint=constraint)
+            )
+        elif constraint.definition != actual_checks[cname].definition:
+            changes.append(
+                DropAndCreateDomainConstraint(
+                    schema=schema, domain=name, constraint=constraint
+                )
+            )
+
+    return changes
+
+
+def _drop_domains(desired: Schema, actual: Schema) -> list[Change]:
+    """Drop domains that are no longer declared.
+
+    Emitted after the table, view and function changes so the columns and
+    signatures that used the domain are gone first; the executor also retries
+    a drop that still finds a dependent.
+    """
+    return [
+        DropDomain(schema=domain.schema, name=domain.name)
+        for key, domain in sorted(actual.domains.items())
+        if key not in desired.domains
+    ]
+
+
 def _diff_views(desired: Schema, actual: Schema) -> list[Change]:
     """Diff views between desired and actual schemas."""
     changes: list[Change] = []
@@ -889,6 +1239,81 @@ def _diff_views(desired: Schema, actual: Schema) -> list[Change]:
             changes.append(DropView(schema=view.schema, view_name=view.name))
 
     return changes
+
+
+def _diff_materialized_views(desired: Schema, actual: Schema) -> list[Change]:
+    """Diff materialized views between desired and actual schemas.
+
+    Only the query and the storage options are compared. Whether a live
+    materialized view is populated is runtime state (an application refreshes
+    it); `WITH [NO] DATA` from the declaration decides how a create or recreate
+    populates it.
+    """
+    changes: list[Change] = []
+
+    for key, matview in desired.materialized_views.items():
+        current = actual.materialized_views.get(key)
+        if current is None:
+            changes.append(CreateMaterializedView(matview=matview))
+        elif matview.definition.strip() != current.definition.strip():
+            changes.append(DropAndCreateMaterializedView(matview=matview))
+        elif matview.reloptions != current.reloptions:
+            changes.append(
+                AlterMaterializedViewOptions(
+                    matview=matview, current_reloptions=list(current.reloptions)
+                )
+            )
+
+    for key, matview in actual.materialized_views.items():
+        if key not in desired.materialized_views:
+            changes.append(
+                DropMaterializedView(schema=matview.schema, matview_name=matview.name)
+            )
+
+    return changes
+
+
+def _diff_sequences(
+    desired: Schema, actual: Schema
+) -> tuple[list[Change], list[Change]]:
+    """Diff sequences. Returns (changes before tables, changes after them).
+
+    Creates and option changes go before the tables, so a new table's
+    nextval() default finds its sequence. OWNED BY goes after, because it
+    names a column that may be created in the same run; releasing an old owner
+    goes before, since dropping that owner would drop the sequence. Drops go
+    after too:
+    DROP SEQUENCE has no CASCADE, so a default still using the sequence must
+    already be gone (or the drop fails, which is the point).
+    """
+    before: list[Change] = []
+    after: list[Change] = []
+
+    for key, seq in desired.sequences.items():
+        current = actual.sequences.get(key)
+        if current is None:
+            before.append(CreateSequence(sequence=seq))
+            if seq.owned_by is not None:
+                after.append(SetSequenceOwner(sequence=seq))
+            continue
+        if not seq.options_equal(current):
+            before.append(AlterSequence(sequence=seq))
+        if seq.owned_by != current.owned_by:
+            if current.owned_by is not None:
+                # Release the old owner before the tables change: dropping the
+                # old owning column or table would otherwise take the sequence
+                # with it.
+                before.append(
+                    SetSequenceOwner(sequence=dataclass_replace(seq, owned_by=None))
+                )
+            if seq.owned_by is not None:
+                after.append(SetSequenceOwner(sequence=seq))
+
+    for key, seq in actual.sequences.items():
+        if key not in desired.sequences:
+            after.append(DropSequence(schema=seq.schema, sequence_name=seq.name))
+
+    return before, after
 
 
 def _diff_grants(desired: Schema, actual: Schema) -> list[Change]:
