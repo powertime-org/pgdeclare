@@ -36,6 +36,9 @@ ERROR_CODE_CATEGORIES = {
     "42703": ErrorCategory.DEPENDENCY,  # undefined_column
     "3F000": ErrorCategory.DEPENDENCY,  # invalid_schema_name
     "42830": ErrorCategory.DEPENDENCY,  # invalid_foreign_key (no matching unique constraint)
+    # dependent_objects_still_exist: a DROP that has to wait until what reads
+    # from the object (a view on a materialized view, say) is dropped first.
+    "2BP01": ErrorCategory.DEPENDENCY,
     # Duplicate errors
     "42P07": ErrorCategory.DUPLICATE,  # duplicate_table
     "42710": ErrorCategory.DUPLICATE,  # duplicate_object (includes roles)

@@ -9,7 +9,7 @@ Each Change subclass represents a specific database modification with:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 from .quoting import do_block, dollar_tag, quote_ident, quote_literal, role_ident
 from .models import (
@@ -21,6 +21,7 @@ from .models import (
     Function,
     Grant,
     Index,
+    MaterializedView,
     Policy,
     Role,
     RoleMembership,
@@ -1139,7 +1140,7 @@ class CreateCompositeType(Change):
 # =============================================================================
 
 
-def view_options_note(view: View) -> str:
+def view_options_note(view: Union[View, MaterializedView]) -> str:
     """Plan-summary suffix naming the view options a change applies."""
     if not view.reloptions:
         return ""
@@ -1208,6 +1209,10 @@ class DropAndCreateView(Change):
     # definition depends on an object built later in the same run, which lands
     # the grant on the pre-drop view and then throws it away.
     grants: list[Grant] = field(default_factory=list)
+    # Views and materialized views that read from this one. DROP refuses while
+    # they exist, so they are dropped first and rebuilt after, in this same
+    # statement. Attached by compute_diff.
+    dependents: list["DependentRelation"] = field(default_factory=list)
 
     def __post_init__(self):
         self.object_name = self.view.qualified_name
@@ -1232,8 +1237,10 @@ class DropAndCreateView(Change):
         )
         # Escape single quotes in view definition for EXECUTE
         escaped_create = create_sql.replace("'", "''")
-        inner = f"{drop_sql}; EXECUTE '{escaped_create}';"
+        inner = _drop_dependents_sql(self.dependents)
+        inner += f"{drop_sql}; EXECUTE '{escaped_create}';"
         inner += _replay_grants_sql(self.grants)
+        inner += _recreate_dependents_sql(self.dependents)
         return do_block(f"BEGIN {inner} END")
 
 
@@ -1278,6 +1285,252 @@ class AlterViewOptions(Change):
         if self.view.reloptions:
             statements.append(
                 f"ALTER VIEW {target} SET ({', '.join(self.view.reloptions)});"
+            )
+        return " ".join(statements)
+
+
+# =============================================================================
+# Materialized View Changes
+# =============================================================================
+
+
+def _execute_sql(statement: str) -> str:
+    """`statement` as an `EXECUTE '...';` inside a DO block."""
+    escaped = statement.replace("'", "''")
+    return f" EXECUTE '{escaped}';"
+
+
+def _create_matview_sql(matview: MaterializedView) -> str:
+    """`CREATE MATERIALIZED VIEW ... AS <query> WITH [NO] DATA` (no trailing `;`)."""
+    # pg_get_viewdef ends the query with `;`, and WITH DATA has to follow it.
+    query = matview.definition.strip().rstrip(";").rstrip()
+    data = "WITH DATA" if matview.with_data else "WITH NO DATA"
+    return (
+        f"CREATE MATERIALIZED VIEW {quote_ident(matview.schema)}.{quote_ident(matview.name)}"
+        f"{matview.options_clause} AS {query} {data}"
+    )
+
+
+def _rebuild_indexes_sql(indexes: list[Index]) -> str:
+    """Rebuild a recreated materialized view's indexes inside its DO block.
+
+    DROP takes the indexes with it, and the diff, computed against the snapshot
+    taken before the run, still sees them, so nothing else would bring them
+    back. They are built in the same statement, not CONCURRENTLY: the object is
+    new, nobody can be reading it yet, and the index can never be missing.
+    """
+    return "".join(_execute_sql(index.definition) for index in indexes)
+
+
+@dataclass
+class DependentRelation:
+    """A view or materialized view that reads from a relation being recreated.
+
+    `relation` is its declared definition, or None when it is no longer
+    declared: then it is only dropped (its own DropView or
+    DropMaterializedView finds it gone).
+    """
+
+    schema: str
+    name: str
+    kind: str  # 'v' (view) or 'm' (materialized view)
+    relation: Optional[Union[View, MaterializedView]] = None
+    grants: list[Grant] = field(default_factory=list)
+    indexes: list[Index] = field(default_factory=list)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    @property
+    def rebuilds_data(self) -> bool:
+        return isinstance(self.relation, MaterializedView)
+
+    def drop_sql(self) -> str:
+        keyword = "MATERIALIZED VIEW" if self.kind == "m" else "VIEW"
+        return f"DROP {keyword} IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.name)};"
+
+    def create_sql(self) -> str:
+        relation = self.relation
+        if relation is None:
+            return ""
+        if isinstance(relation, MaterializedView):
+            create = _create_matview_sql(relation)
+        else:
+            create = (
+                f"CREATE VIEW {quote_ident(relation.schema)}.{quote_ident(relation.name)}"
+                f"{relation.options_clause} AS {relation.definition}"
+            )
+        return (
+            _execute_sql(create)
+            + _replay_grants_sql(self.grants)
+            + _rebuild_indexes_sql(self.indexes)
+        )
+
+
+def _drop_dependents_sql(dependents: list[DependentRelation]) -> str:
+    """Drop dependents, innermost first. `dependents` is in creation order."""
+    return "".join(f"{d.drop_sql()} " for d in reversed(dependents))
+
+
+def _recreate_dependents_sql(dependents: list[DependentRelation]) -> str:
+    """Rebuild the still-declared dependents, each after what it reads from."""
+    return "".join(d.create_sql() for d in dependents)
+
+
+def dependents_note(dependents: list[DependentRelation]) -> str:
+    """Plan-summary suffix for a recreate that carries its dependents along."""
+    rebuilt = [d.name for d in dependents if d.relation is not None]
+    dropped = [d.name for d in dependents if d.relation is None]
+    note = ""
+    if rebuilt:
+        note += f" (recreating dependent {', '.join(rebuilt)})"
+    if dropped:
+        note += f" (dropping dependent {', '.join(dropped)})"
+    return note
+
+
+def index_rebuild_note(count: int) -> str:
+    """Plan-summary suffix for a matview recreate that rebuilds `count` indexes."""
+    if not count:
+        return ""
+    return f" (rebuilding {count} index{'es' if count > 1 else ''})"
+
+
+@dataclass
+class CreateMaterializedView(Change):
+    """Create a materialized view, populated or not as declared."""
+
+    matview: MaterializedView = field(
+        default_factory=lambda: MaterializedView(
+            schema="public", name="", definition=""
+        )
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "MATERIALIZED VIEW"
+
+    def __post_init__(self):
+        self.object_name = self.matview.qualified_name
+        if not self.description:
+            data = "" if self.matview.with_data else " WITH NO DATA"
+            self.description = (
+                f"Create materialized view {self.matview.name}"
+                + view_options_note(self.matview)
+                + data
+            )
+
+    def to_sql(self) -> str:
+        return _create_matview_sql(self.matview) + ";"
+
+
+@dataclass
+class DropMaterializedView(Change):
+    """Drop a materialized view. Its data is derived, so nothing is lost."""
+
+    schema: str = "public"
+    matview_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "MATERIALIZED VIEW"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.matview_name}"
+        if not self.description:
+            self.description = f"Drop materialized view {self.matview_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP MATERIALIZED VIEW IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.matview_name)};"
+
+
+@dataclass
+class DropAndCreateMaterializedView(Change):
+    """Drop and recreate a materialized view whose query changed.
+
+    There is no `CREATE OR REPLACE MATERIALIZED VIEW`. The recreate re-runs the
+    query to repopulate the object (unless it is declared `WITH NO DATA`), and
+    the table lock it holds until commit blocks every reader of the
+    materialized view for that long, so it is OFFLINE.
+
+    Like DropAndCreateView, everything the DROP throws away is rebuilt inside
+    the same DO block: the declared grants, the declared indexes, and the
+    views and materialized views that read from this one. No execution order
+    can leave the object without them.
+    """
+
+    matview: MaterializedView = field(
+        default_factory=lambda: MaterializedView(
+            schema="public", name="", definition=""
+        )
+    )
+    category: ChangeCategory = ChangeCategory.OFFLINE
+    description: str = ""
+    object_type: str = "MATERIALIZED VIEW"
+    grants: list[Grant] = field(default_factory=list)
+    indexes: list[Index] = field(default_factory=list)
+    dependents: list[DependentRelation] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.object_name = self.matview.qualified_name
+        if not self.description:
+            self.description = (
+                f"Drop and recreate materialized view {self.matview.name}"
+                + view_options_note(self.matview)
+                + (
+                    " (rebuilds its data)"
+                    if self.matview.with_data
+                    else " WITH NO DATA"
+                )
+            )
+
+    def to_sql(self) -> str:
+        target = f"{quote_ident(self.matview.schema)}.{quote_ident(self.matview.name)}"
+        inner = _drop_dependents_sql(self.dependents)
+        inner += f"DROP MATERIALIZED VIEW IF EXISTS {target};"
+        inner += _execute_sql(_create_matview_sql(self.matview))
+        inner += _replay_grants_sql(self.grants)
+        inner += _rebuild_indexes_sql(self.indexes)
+        inner += _recreate_dependents_sql(self.dependents)
+        return do_block(f"BEGIN {inner} END")
+
+
+@dataclass
+class AlterMaterializedViewOptions(Change):
+    """Converge a materialized view's storage parameters in place."""
+
+    matview: MaterializedView = field(
+        default_factory=lambda: MaterializedView(
+            schema="public", name="", definition=""
+        )
+    )
+    current_reloptions: list[str] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "MATERIALIZED VIEW"
+
+    def __post_init__(self):
+        self.object_name = self.matview.qualified_name
+        if not self.description:
+            desired = ", ".join(self.matview.reloptions) or "no options"
+            self.description = (
+                f"Set storage options on materialized view {self.matview.name} "
+                f"to {desired}"
+            )
+
+    def to_sql(self) -> str:
+        target = f"{quote_ident(self.matview.schema)}.{quote_ident(self.matview.name)}"
+        desired_names = {opt.partition("=")[0] for opt in self.matview.reloptions}
+        removed = sorted(
+            {opt.partition("=")[0] for opt in self.current_reloptions} - desired_names
+        )
+        statements: list[str] = []
+        if removed:
+            statements.append(
+                f"ALTER MATERIALIZED VIEW {target} RESET ({', '.join(removed)});"
+            )
+        if self.matview.reloptions:
+            statements.append(
+                f"ALTER MATERIALIZED VIEW {target} SET ({', '.join(self.matview.reloptions)});"
             )
         return " ".join(statements)
 

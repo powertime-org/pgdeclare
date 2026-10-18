@@ -196,20 +196,21 @@ Within the managed schemas:
 | Tables | yes | via columns and constraints | yes (`@drop` if it holds data) |
 | Columns | yes | type, NOT NULL, default, identity, generated expression | yes (`@drop` if it holds data) |
 | Constraints (PK, FK, UNIQUE, CHECK, EXCLUDE) | yes | drop and re-add | yes |
-| Indexes | yes, `CONCURRENTLY` | drop and re-create | yes |
+| Indexes (on tables and materialized views) | yes, `CONCURRENTLY` | drop and re-create | yes |
 | Enum types | yes | add values (in position) | no (values are never removed) |
 | Composite types | yes | no | no |
 | Views | yes | drop and re-create; `WITH (...)` options such as `security_invoker` | yes |
+| Materialized views | yes, `WITH DATA` or `WITH NO DATA` as declared | query: drop and re-create (offline, rebuilds the data); storage options in place | yes |
 | Functions | yes | replace, or drop and re-create when the signature changes | yes |
 | Triggers | yes | drop and re-create | yes |
 | Row level security | enable, force, and policies | policies drop and re-create | yes |
-| Grants to managed roles | tables, columns, functions, schemas | revokes before grants | yes |
+| Grants to managed roles | tables, views, materialized views, columns, functions, schemas | revokes before grants | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
 
 Not managed: extensions, sequences outside identity columns, domains, comments, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
-Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
+Grants on a recreated view or function are replayed inside the same statement as the recreate, so no execution order can leave the object without its ACL. A recreated materialized view rebuilds its indexes the same way, and a recreated view or materialized view drops the views and materialized views that read from it and builds them back, from their declarations, in that statement too. Whether a materialized view is populated is not compared: a `REFRESH` is runtime state, not drift. When a set of SECURITY DEFINER functions is passed as `locked_functions`, their default `PUBLIC` EXECUTE is revoked atomically with their creation.
 
 ## Configuration
 

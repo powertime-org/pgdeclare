@@ -5,6 +5,29 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [Unreleased]
+
+### Added
+
+- Materialized views: created `WITH DATA` or `WITH NO DATA` as declared,
+  dropped when no longer declared, storage options (`WITH (fillfactor = 70)`)
+  converged in place. A changed query drops and re-creates the materialized
+  view; that rebuilds its data under a lock readers wait on, so it is offline.
+  The recreate rebuilds the declared indexes and replays the grants to managed
+  roles inside the same statement. Grants on materialized views are now
+  introspected (`information_schema` leaves them out).
+- A recreated view or materialized view takes the views and materialized
+  views that read from it down and builds them back from their declarations in
+  the same statement, instead of failing on `DROP`.
+
+### Fixed
+
+- A `DROP` that fails because another object still depends on it
+  (`2BP01`) is retried after the rest, like a missing dependency, so dropping
+  a stack of views no longer depends on the order they were listed in.
+- No `REVOKE` is planned on a table, view or materialized view the same run
+  drops; it used to fail on the missing relation and leave the run stuck.
+
 ## [0.1.0] - 2026-10-16
 
 First real release: a schema engine proven in production, extracted and made generic.

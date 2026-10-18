@@ -425,6 +425,46 @@ class View:
 
 
 @dataclass
+class MaterializedView:
+    """Materialized view definition (`CREATE MATERIALIZED VIEW`)."""
+
+    schema: str
+    name: str
+    definition: str  # Query text from pg_get_viewdef, as pg_matviews reports it
+    # Storage parameters (`WITH (fillfactor = 70)`, autovacuum settings),
+    # canonicalized like a view's options.
+    reloptions: list[str] = field(default_factory=list)
+    # Whether the object is populated. In the plan database this is the
+    # declaration (`WITH DATA` vs `WITH NO DATA`), and it decides how a create or
+    # recreate populates the object. It is not compared: a live matview that an
+    # application has refreshed, or emptied with `REFRESH ... WITH NO DATA`, has
+    # not drifted from its declaration.
+    with_data: bool = True
+
+    def __post_init__(self):
+        self.reloptions = normalize_view_reloptions(self.reloptions)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+    @property
+    def options_clause(self) -> str:
+        """`" WITH (...)"` for a CREATE MATERIALIZED VIEW, or `""`."""
+        if not self.reloptions:
+            return ""
+        return f" WITH ({', '.join(self.reloptions)})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, MaterializedView):
+            return NotImplemented
+        return (
+            self.definition.strip() == other.definition.strip()
+            and self.reloptions == other.reloptions
+        )
+
+
+@dataclass
 class Grant:
     """Privilege grant definition."""
 
@@ -565,6 +605,14 @@ class Schema:
         default_factory=dict
     )  # key = schema.type
     views: dict[str, View] = field(default_factory=dict)  # key = schema.view
+    materialized_views: dict[str, MaterializedView] = field(
+        default_factory=dict
+    )  # key = schema.matview
+    # Views and materialized views that read from a view or materialized view:
+    # key = schema.name of the referenced relation, value = schema.name of each
+    # direct dependent. Dropping a relation fails while a dependent exists, so a
+    # recreate has to take its dependents down and rebuild them with it.
+    relation_dependents: dict[str, list[str]] = field(default_factory=dict)
     grants: list[Grant] = field(default_factory=list)
     dependencies: list[Dependency] = field(default_factory=list)
     roles: dict[str, Role] = field(default_factory=dict)  # key = role name
