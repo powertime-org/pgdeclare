@@ -272,6 +272,10 @@ def _parse_statement_metadata(
         return _parse_create_type(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
         )
+    elif stmt_upper.startswith("CREATE DOMAIN"):
+        return _parse_create_domain(
+            raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
     elif stmt_upper.startswith("CREATE EXTENSION"):
         return _parse_create_extension(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
@@ -642,6 +646,45 @@ def _parse_create_type(
     return ParsedStatement(
         raw_sql=raw_sql,
         statement_type="CREATE TYPE",
+        object_type="TYPE",
+        object_name=object_name,
+        source_file=source_file,
+        line_number=line_number,
+        is_idempotent=is_idempotent,
+    )
+
+
+def _parse_create_domain(
+    raw_sql: str,
+    sql_for_parsing: str,
+    source_file: Optional[str],
+    line_number: int,
+    is_idempotent: bool,
+) -> ParsedStatement:
+    """Parse CREATE DOMAIN statement using pglast AST.
+
+    A domain shares the type namespace, so it is keyed as a TYPE: declaring an
+    enum and a domain of the same name is reported as a duplicate.
+    """
+    object_name = None
+
+    try:
+        tree = parse_sql(sql_for_parsing)
+        for raw_stmt in tree:
+            stmt = raw_stmt.stmt
+            if isinstance(stmt, ast.CreateDomainStmt):
+                parts = [n.sval for n in stmt.domainname or () if hasattr(n, "sval")]
+                if len(parts) == 1:
+                    object_name = f"public.{parts[0]}"
+                elif len(parts) >= 2:
+                    object_name = f"{parts[-2]}.{parts[-1]}"
+                break
+    except Exception:
+        pass  # If pglast fails, PostgreSQL would fail too
+
+    return ParsedStatement(
+        raw_sql=raw_sql,
+        statement_type="CREATE DOMAIN",
         object_type="TYPE",
         object_name=object_name,
         source_file=source_file,

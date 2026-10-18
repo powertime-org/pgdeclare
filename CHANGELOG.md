@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [Unreleased]
+
+### Added
+
+- Domain types (`CREATE DOMAIN`) in the managed schemas: created, default and
+  NOT NULL altered in place (`SET NOT NULL` is offline), CHECK constraints
+  added `NOT VALID` then validated, replaced or dropped, and undeclared domains
+  dropped once the columns using them are gone. A base type or collation
+  change drops and re-creates the domain while nothing uses it, and is refused
+  with the dependents named otherwise. Columns typed with a domain introspect
+  and diff by the domain's name.
+
 ## [0.1.0] - 2026-10-16
 
 First real release: a schema engine proven in production, extracted and made generic.

@@ -18,6 +18,7 @@ from .models import (
     CompositeType,
     Constraint,
     Dependency,
+    Domain,
     EnumType,
     Function,
     Grant,
@@ -87,6 +88,9 @@ def introspect_schema(
 
             composite_types = _query_composite_types(conn, schema)
             result.composite_types.update(composite_types)
+
+            domains = _query_domains(conn, schema, cfg.search_path_sql)
+            result.domains.update(domains)
 
             views = _query_views(conn, schema)
             result.views.update(views)
@@ -511,7 +515,7 @@ def _query_composite_types(conn, schema: str) -> dict[str, CompositeType]:
     This excludes:
     - Table row types (have a corresponding pg_class entry with reltype = type OID)
     - View row types
-    - Domain types
+    - Domain types (typtype = 'd', see _query_domains)
     - Enum types (typtype = 'e')
     """
     composite_types: dict[str, CompositeType] = {}
@@ -560,6 +564,95 @@ def _query_composite_types(conn, schema: str) -> dict[str, CompositeType]:
             composite_types[comp_type.qualified_name] = comp_type
 
     return composite_types
+
+
+def _query_domains(conn, schema: str, search_path: str = "public") -> dict[str, Domain]:
+    """Query domain types (typtype = 'd') and their CHECK constraints.
+
+    `search_path` is set first, as for columns, so the base type, the default
+    and the constraint expressions are named the way the SQL files wrote them.
+    NOT NULL comes from `typnotnull` on every version; PostgreSQL 18 also
+    records it as a contype 'n' constraint row, which is left out.
+    """
+    domains: dict[str, Domain] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SET search_path TO {search_path}")
+        cur.execute(
+            """
+            SELECT
+                t.oid AS type_oid,
+                t.typname AS domain_name,
+                format_type(t.typbasetype, t.typtypmod) AS base_type,
+                NOT t.typnotnull AS is_nullable,
+                pg_get_expr(t.typdefaultbin, 0) AS domain_default,
+                CASE
+                    WHEN t.typcollation <> 0 AND t.typcollation <> b.typcollation
+                    THEN quote_ident(cn.nspname) || '.' || quote_ident(co.collname)
+                END AS collation,
+                ARRAY(
+                    SELECT pg_describe_object(d.classid, d.objid, d.objsubid)
+                    FROM pg_depend d
+                    WHERE d.refclassid = 'pg_type'::regclass
+                      AND d.refobjid IN (t.oid, t.typarray)
+                      AND d.deptype = 'n'
+                    ORDER BY 1
+                ) AS dependents
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            JOIN pg_type b ON b.oid = t.typbasetype
+            LEFT JOIN pg_collation co ON co.oid = t.typcollation
+            LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
+            WHERE t.typtype = 'd'
+              AND n.nspname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_type'::regclass AND ext.objid = t.oid
+                    AND ext.deptype = 'e'
+              )
+            ORDER BY t.typname
+            """,
+            (schema,),
+        )
+        rows = cur.fetchall()
+
+        for row in rows:
+            cur.execute(
+                """
+                SELECT
+                    con.conname AS constraint_name,
+                    con.contype AS constraint_type,
+                    pg_get_constraintdef(con.oid) AS constraint_def
+                FROM pg_constraint con
+                WHERE con.contypid = %s
+                  AND con.contype = 'c'
+                ORDER BY con.conname
+                """,
+                (row["type_oid"],),
+            )
+            constraints = [
+                Constraint(
+                    name=c["constraint_name"],
+                    type=c["constraint_type"],
+                    definition=c["constraint_def"],
+                    table=row["domain_name"],
+                )
+                for c in cur.fetchall()
+            ]
+            domain = Domain(
+                schema=schema,
+                name=row["domain_name"],
+                base_type=row["base_type"],
+                nullable=row["is_nullable"],
+                default=row["domain_default"],
+                collation=row["collation"],
+                constraints=constraints,
+                dependents=list(row["dependents"] or []),
+            )
+            domains[domain.qualified_name] = domain
+
+    return domains
 
 
 def _query_views(conn, schema: str) -> dict[str, View]:
