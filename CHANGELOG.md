@@ -45,6 +45,16 @@ may change in minor releases.
 - Event triggers (event, `WHEN TAG` filter, function, enabled state); an
   undeclared one is dropped only when its function is in a managed schema.
   Creating one needs a superuser.
+- Declarative partitioning: partitioned tables (`PARTITION BY RANGE`, `LIST`,
+  `HASH`) and their partitions (`PARTITION OF ... FOR VALUES` or `DEFAULT`,
+  sub-partitioned ones included). Columns, defaults, NOT NULL, constraints,
+  indexes and triggers a partition inherits are not diffed on the partition.
+  A changed bound is a `DETACH` and `ATTACH` (offline). A partition the schema
+  files do not declare, such as one pg_partman created, is never dropped; the
+  output notes it. An index on a partitioned table is built `CONCURRENTLY` on
+  each partition and attached to an `ON ONLY` parent index. Converting a table
+  to or from partitioned, or changing its partition key, is refused with an
+  error pointing to `@migrate-before`.
 
 ### Changed
 

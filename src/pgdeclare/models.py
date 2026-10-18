@@ -79,10 +79,26 @@ class Table:
     constraints: list[Constraint] = field(default_factory=list)
     rls_enabled: bool = False  # ALTER TABLE ... ENABLE ROW LEVEL SECURITY
     rls_forced: bool = False  # ALTER TABLE ... FORCE ROW LEVEL SECURITY
+    # Declarative partitioning. `partition_key` is pg_get_partkeydef() of a
+    # partitioned table ("RANGE (created_at)"), None for a plain table.
+    # `partition_of` is the (schema, name) of the parent when this table is a
+    # partition, and `partition_bound` its bound as pg_get_expr() prints it
+    # ("FOR VALUES FROM (...) TO (...)" or "DEFAULT"). A sub-partitioned child
+    # has all three.
+    partition_key: Optional[str] = None
+    partition_of: Optional[tuple[str, str]] = None
+    partition_bound: Optional[str] = None
 
     @property
     def qualified_name(self) -> str:
         return f"{self.schema}.{self.name}"
+
+    @property
+    def parent_key(self) -> Optional[str]:
+        """`schema.name` of the partitioned parent, or None for a non-partition."""
+        if self.partition_of is None:
+            return None
+        return f"{self.partition_of[0]}.{self.partition_of[1]}"
 
 
 _ROUTINE_KEYWORDS = {"p": "PROCEDURE", "a": "AGGREGATE"}
@@ -300,6 +316,9 @@ class Index:
     schema: str
     definition: str  # Full CREATE INDEX statement from pg_indexes
     is_valid: bool = True  # False if index creation failed (CONCURRENTLY)
+    # An index on a partitioned table (relkind 'I'). Its definition reads
+    # `ON ONLY`, and it is built per partition and attached, not in one go.
+    partitioned: bool = False
 
     @property
     def qualified_name(self) -> str:

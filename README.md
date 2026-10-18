@@ -199,9 +199,11 @@ Within the managed schemas:
 | Object | Create | Change | Drop |
 |--------|--------|--------|------|
 | Tables | yes | via columns and constraints | yes (`@drop` if it holds data) |
+| Partitioned tables (`PARTITION BY RANGE`, `LIST`, `HASH`) | yes | via columns and constraints, which Postgres carries to every partition; never the partition key (refused) | yes (`@drop` if it holds data), with all its partitions |
+| Partitions (`PARTITION OF ... FOR VALUES` or `DEFAULT`, sub-partitioned too) | yes (offline beside a default partition, which Postgres scans) | bound: `DETACH`, then `ATTACH` (offline: `ATTACH` scans); own defaults, NOT NULL and constraints | never: an undeclared partition is left in place and noted |
 | Columns | yes | type, collation, NOT NULL, default, identity, generated expression | yes (`@drop` if it holds data) |
 | Constraints (PK, FK, UNIQUE, CHECK, EXCLUDE) | yes | drop and re-add | yes |
-| Indexes (on tables and materialized views) | yes, `CONCURRENTLY` | drop and re-create | yes |
+| Indexes (on tables, partitioned tables and materialized views) | yes, `CONCURRENTLY` (on a partitioned table: per partition, then attached) | drop and re-create | yes (on a partitioned table without `CONCURRENTLY`, which Postgres refuses there) |
 | Enum types | yes | add values (in position) | no (values are never removed) |
 | Composite types | yes | no | no |
 | Range types (with their multirange) | yes, with every option (a shell type first when there is a canonical function) | drop and re-create while nothing uses the range or its multirange | yes, after the columns that use it (with its canonical function) |
@@ -224,7 +226,9 @@ Within the managed schemas:
 | Event triggers (database-level; superuser) | yes, with `WHEN TAG IN` | drop and re-create; enabled state with `ALTER EVENT TRIGGER` | yes, when its function is in a managed schema |
 | Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, procedures, aggregates, indexes, constraints, triggers, policies, enum, composite and range types, collations | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
 
-Not managed: extensions, operators, casts, subscriptions (they hold connection strings and secrets, and creating one starts replication), collation versions (`ALTER COLLATION ... REFRESH VERSION`), comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, default privileges for grantees that are not managed roles (`PUBLIC` included, so `REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` is not) or that take away a target role's own built-in privileges, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, partitions the schema files do not declare, operators, casts, subscriptions (they hold connection strings and secrets, and creating one starts replication), collation versions (`ALTER COLLATION ... REFRESH VERSION`), comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, default privileges for grantees that are not managed roles (`PUBLIC` included, so `REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` is not) or that take away a target role's own built-in privileges, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+
+Partitions created at runtime (by pg_partman or a cron job, say) are never dropped. A live partition the schema files do not declare is left in place with everything on it, and `diff` and `apply` print a note naming it (`notes` in `diff --json`); to drop one, write the `DROP TABLE` in a `@migrate-before` block. An index on a partitioned table is created `ON ONLY` the parent, built `CONCURRENTLY` on each partition (the undeclared ones too) and attached, so no partition is locked for the build; a run that dies half way is finished by the next. Postgres has no `ALTER` that turns a table into a partitioned one, back, or changes a partition key: pgdeclare refuses those with an error, and the conversion goes in a `@migrate-before` block. A foreign key on a partitioned table is validated as it is added, which is offline, since PostgreSQL before 18 cannot add one `NOT VALID`.
 
 A comment the schema files do not declare is removed, including one added by hand. Comments are written in a phase of their own after the DDL and index builds, so an object dropped and recreated in the same run gets its comment back.
 

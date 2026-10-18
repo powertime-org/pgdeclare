@@ -112,9 +112,47 @@ class CreateTable(Change):
     def __post_init__(self):
         self.object_name = self.table.qualified_name
         if not self.description:
-            self.description = f"Create table {self.table.qualified_name}"
+            if self.table.partition_of is not None:
+                self.description = (
+                    f"Create partition {self.table.qualified_name} of "
+                    f"{self.table.parent_key} ({self.table.partition_bound})"
+                )
+            else:
+                self.description = f"Create table {self.table.qualified_name}"
+
+    def _inline_constraints(self) -> list[str]:
+        # Only PRIMARY KEY and CHECK constraints are inlined. FOREIGN KEY,
+        # UNIQUE and EXCLUDE are emitted as separate AddConstraint changes by
+        # the differ; see DEFERRED_CONSTRAINT_TYPES for why.
+        return [
+            f"    CONSTRAINT {quote_ident(constraint.name)} {constraint.definition}"
+            for constraint in self.table.constraints
+            if constraint.type not in DEFERRED_CONSTRAINT_TYPES
+        ]
+
+    def _partition_sql(self) -> str:
+        """`CREATE TABLE ... PARTITION OF parent ... FOR VALUES ...`.
+
+        The columns, their defaults and NOT NULL come from the parent; a
+        partition's own overrides are written by the differ afterwards.
+        """
+        table = self.table
+        assert table.partition_of is not None
+        parent = (
+            f"{quote_ident(table.partition_of[0])}.{quote_ident(table.partition_of[1])}"
+        )
+        sql = f"CREATE TABLE {quote_ident(table.schema)}.{quote_ident(table.name)} PARTITION OF {parent}"
+        constraints = self._inline_constraints()
+        if constraints:
+            sql += f" (\n{',\n'.join(constraints)}\n)"
+        sql += f" {table.partition_bound}"
+        if table.partition_key:
+            sql += f" PARTITION BY {table.partition_key}"
+        return sql + ";"
 
     def to_sql(self) -> str:
+        if self.table.partition_of is not None:
+            return self._partition_sql()
         columns_sql = []
         for col in self.table.columns.values():
             col_def = f"    {quote_ident(col.name)} {col.type}"
@@ -135,18 +173,93 @@ class CreateTable(Change):
                 col_def += f" DEFAULT {col.default}"
             columns_sql.append(col_def)
 
-        # Only PRIMARY KEY and CHECK constraints are inlined. FOREIGN KEY,
-        # UNIQUE and EXCLUDE are emitted as separate AddConstraint changes by
-        # the differ; see DEFERRED_CONSTRAINT_TYPES for why.
-        inline_constraints = []
-        for constraint in self.table.constraints:
-            if constraint.type not in DEFERRED_CONSTRAINT_TYPES:
-                inline_constraints.append(
-                    f"    CONSTRAINT {quote_ident(constraint.name)} {constraint.definition}"
+        all_parts = columns_sql + self._inline_constraints()
+        partition_by = (
+            f" PARTITION BY {self.table.partition_key}"
+            if self.table.partition_key
+            else ""
+        )
+        return f"CREATE TABLE {quote_ident(self.table.schema)}.{quote_ident(self.table.name)} (\n{',\n'.join(all_parts)}\n){partition_by};"
+
+
+def _qualified(name: tuple[str, str]) -> str:
+    return f"{quote_ident(name[0])}.{quote_ident(name[1])}"
+
+
+@dataclass
+class AttachPartition(Change):
+    """Attach a table as a partition, detaching it from its current parent first.
+
+    Used for a changed bound (detach and attach again to the same parent), a
+    partition moved to another parent, and a plain table declared as a
+    partition. ATTACH scans the table to check every row fits the bound, and a
+    default partition to check none of its rows do, under a lock, so this is
+    offline. Both statements run in one transaction.
+    """
+
+    schema: str = "public"
+    table: str = ""
+    parent: tuple[str, str] = ("public", "")
+    bound: str = ""
+    detach_from: Optional[tuple[str, str]] = None
+    old_bound: Optional[str] = None
+    category: ChangeCategory = ChangeCategory.OFFLINE
+    description: str = ""
+    object_type: str = "TABLE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table}"
+        if not self.description:
+            parent = f"{self.parent[0]}.{self.parent[1]}"
+            if self.detach_from == self.parent:
+                self.description = (
+                    f"Change bound of partition {self.object_name} of {parent}: "
+                    f"{self.old_bound} -> {self.bound} (DETACH, then ATTACH, "
+                    "which scans the partition to validate it)"
+                )
+            else:
+                self.description = (
+                    f"Attach {self.object_name} to {parent} as a partition "
+                    f"({self.bound}; ATTACH scans the table to validate it)"
                 )
 
-        all_parts = columns_sql + inline_constraints
-        return f"CREATE TABLE {quote_ident(self.table.schema)}.{quote_ident(self.table.name)} (\n{',\n'.join(all_parts)}\n);"
+    def to_sql(self) -> str:
+        table = f"{quote_ident(self.schema)}.{quote_ident(self.table)}"
+        statements = []
+        if self.detach_from is not None:
+            statements.append(
+                f"ALTER TABLE {_qualified(self.detach_from)} DETACH PARTITION {table};"
+            )
+        statements.append(
+            f"ALTER TABLE {_qualified(self.parent)} ATTACH PARTITION {table} {self.bound};"
+        )
+        return "\n".join(statements)
+
+
+@dataclass
+class DetachPartition(Change):
+    """Detach a partition that is now declared as a plain table."""
+
+    schema: str = "public"
+    table: str = ""
+    parent: tuple[str, str] = ("public", "")
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "TABLE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table}"
+        if not self.description:
+            self.description = (
+                f"Detach partition {self.object_name} from "
+                f"{self.parent[0]}.{self.parent[1]}"
+            )
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER TABLE {_qualified(self.parent)} DETACH PARTITION "
+            f"{quote_ident(self.schema)}.{quote_ident(self.table)};"
+        )
 
 
 @dataclass
@@ -560,6 +673,10 @@ class DropAndCreateConstraint(Change):
     constraint: Constraint = field(
         default_factory=lambda: Constraint(name="", type="", definition="")
     )
+    # Re-add CHECK and FOREIGN KEY constraints NOT VALID (validated afterwards).
+    # False where Postgres refuses NOT VALID: a foreign key on a partitioned
+    # table before PostgreSQL 18.
+    not_valid: bool = True
     category: ChangeCategory = ChangeCategory.ONLINE
     description: str = ""
     object_type: str = "CONSTRAINT"
@@ -575,7 +692,11 @@ class DropAndCreateConstraint(Change):
         # Wrap in DO block for atomicity - if ADD fails, DROP is rolled back
         drop_sql = f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} DROP CONSTRAINT IF EXISTS {quote_ident(self.constraint.name)}"
         # Add the new constraint (NOT VALID for CHECK/FK constraints)
-        not_valid_clause = " NOT VALID" if self.constraint.type in ("f", "c") else ""
+        not_valid_clause = (
+            " NOT VALID"
+            if self.not_valid and self.constraint.type in ("f", "c")
+            else ""
+        )
         add_sql = f"ALTER TABLE {quote_ident(self.schema)}.{quote_ident(self.table)} ADD CONSTRAINT {quote_ident(self.constraint.name)} {self.constraint.definition}{not_valid_clause}"
         # Escape single quotes for EXECUTE
         escaped_add = add_sql.replace("'", "''")
@@ -838,6 +959,175 @@ class DropIndex(Change):
     def to_sql(self) -> str:
         concurrently = "CONCURRENTLY " if self.concurrent else ""
         return f"DROP INDEX {concurrently}IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.index_name)};"
+
+
+# Postgres truncates identifiers to NAMEDATALEN - 1 bytes.
+_MAX_IDENTIFIER_BYTES = 63
+
+
+def _truncate_identifier(name: str, reserve: int = 0) -> str:
+    raw = name.encode()[: _MAX_IDENTIFIER_BYTES - reserve]
+    return raw.decode(errors="ignore")
+
+
+@dataclass
+class CreatePartitionedIndex(CreateIndex):
+    """Create an index on a partitioned table without a long lock.
+
+    `CREATE INDEX` on a partitioned table cannot be CONCURRENTLY, and builds
+    every partition's index under a lock. Instead, the parent's index is
+    created `ON ONLY` the parent (invalid and empty), each partition's index
+    is built CONCURRENTLY and attached to it, and the parent's index turns
+    valid once every partition has one. A sub-partitioned partition gets an
+    `ON ONLY` index of its own, filled the same way.
+
+    The partitions are read when the change runs, so ones created at runtime
+    and not declared get the index too, and a run that died half way resumes:
+    an existing parent index is kept and only partitions without an attached
+    index are built.
+    """
+
+    def __post_init__(self):
+        if not self.description:
+            self.description = (
+                f"Create index {self.index.name} on partitioned table "
+                f"{self.index.table} (per partition CONCURRENTLY, then attached)"
+            )
+        super().__post_init__()
+
+    def to_sql(self) -> str:
+        return (
+            f"{self.index.definition};\n"
+            "-- then, for each partition: CREATE INDEX CONCURRENTLY on it and "
+            f"ALTER INDEX {quote_ident(self.index.schema)}."
+            f"{quote_ident(self.index.name)} ATTACH PARTITION <its index>"
+        )
+
+    def execute(self, cur) -> list[str]:
+        """Run the build on an autocommit cursor; returns the statements run."""
+        executed: list[str] = []
+
+        def run(statement: str) -> None:
+            cur.execute(statement)
+            executed.append(statement)
+
+        index_oid = _index_oid(cur, self.index.schema, self.index.name)
+        if index_oid is None:
+            run(self.index.definition)
+            index_oid = _index_oid(cur, self.index.schema, self.index.name)
+            assert index_oid is not None
+        _fill_partitioned_index(cur, index_oid, run)
+        return executed
+
+
+def _index_oid(cur, schema: str, name: str) -> Optional[int]:
+    cur.execute(
+        """
+        SELECT c.oid FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('i', 'I')
+        """,
+        (schema, name),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _free_index_name(cur, schema: str, base: str) -> str:
+    """`base`, or `base_N`, whichever is not yet a relation in `schema`."""
+    candidate = _truncate_identifier(base)
+    n = 0
+    while True:
+        cur.execute(
+            """
+            SELECT 1 FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s
+            """,
+            (schema, candidate),
+        )
+        if cur.fetchone() is None:
+            return candidate
+        n += 1
+        suffix = f"_{n}"
+        candidate = _truncate_identifier(base, len(suffix.encode())) + suffix
+
+
+def _fill_partitioned_index(cur, index_oid: int, run) -> None:
+    """Give every partition of `index_oid`'s table an index attached to it."""
+    cur.execute(
+        """
+        SELECT n.nspname, c.relname, t.relname, ix.indisunique, ix.indrelid,
+               pg_get_indexdef(c.oid),
+               format('CREATE %%sINDEX %%s ON ONLY %%s.%%s ',
+                      CASE WHEN ix.indisunique THEN 'UNIQUE ' ELSE '' END,
+                      quote_ident(c.relname), quote_ident(tn.nspname),
+                      quote_ident(t.relname))
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_index ix ON ix.indexrelid = c.oid
+        JOIN pg_class t ON t.oid = ix.indrelid
+        JOIN pg_namespace tn ON tn.oid = t.relnamespace
+        WHERE c.oid = %s
+        """,
+        (index_oid,),
+    )
+    row = cur.fetchone()
+    assert row is not None
+    index_schema, index_name, _table, unique, table_oid, definition, prefix = row
+    if not definition.startswith(prefix):
+        raise ValueError(
+            f"cannot build partitioned index {quote_ident(index_schema)}."
+            f"{quote_ident(index_name)}: unexpected definition {definition!r}"
+        )
+    # Everything after the table name: "USING btree (col) INCLUDE ... WHERE ...".
+    tail = definition[len(prefix) :]
+    parent_index = f"{quote_ident(index_schema)}.{quote_ident(index_name)}"
+    create = "CREATE UNIQUE INDEX" if unique else "CREATE INDEX"
+
+    cur.execute(
+        """
+        SELECT c.oid, n.nspname, c.relname, c.relkind,
+               (SELECT x.indexrelid FROM pg_inherits ii
+                JOIN pg_index x ON x.indexrelid = ii.inhrelid
+                WHERE ii.inhparent = %s AND x.indrelid = c.oid) AS attached,
+               (SELECT x.indisvalid FROM pg_inherits ii
+                JOIN pg_index x ON x.indexrelid = ii.inhrelid
+                WHERE ii.inhparent = %s AND x.indrelid = c.oid) AS attached_valid
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE i.inhparent = %s
+        ORDER BY n.nspname, c.relname
+        """,
+        (index_oid, index_oid, table_oid),
+    )
+    partitions = cur.fetchall()
+    for _oid, schema, name, relkind, attached, attached_valid in partitions:
+        if relkind == "f":
+            continue  # Foreign tables cannot be indexed; Postgres skips them too.
+        table = f"{quote_ident(schema)}.{quote_ident(name)}"
+        if attached is not None:
+            if relkind == "p" and not attached_valid:
+                _fill_partitioned_index(cur, attached, run)
+            continue
+        child_name = _free_index_name(cur, schema, f"{name}_{index_name}")
+        child = f"{quote_ident(schema)}.{quote_ident(child_name)}"
+        if relkind == "p":
+            run(f"{create} {quote_ident(child_name)} ON ONLY {table} {tail}")
+            child_oid = _index_oid(cur, schema, child_name)
+            assert child_oid is not None
+            _fill_partitioned_index(cur, child_oid, run)
+        else:
+            try:
+                run(
+                    f"{create} CONCURRENTLY {quote_ident(child_name)} ON {table} {tail}"
+                )
+            except Exception:
+                # A failed CONCURRENTLY build leaves an invalid index behind.
+                cur.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {child}")
+                raise
+        run(f"ALTER INDEX {parent_index} ATTACH PARTITION {child}")
 
 
 # =============================================================================
