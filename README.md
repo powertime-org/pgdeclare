@@ -12,7 +12,7 @@ With migration files, reviewers read deltas, not the schema, and an LLM reading 
 
 A diff cannot infer everything, such as a rename or a backfill. For those you write small imperative `@migrate-before` / `@migrate-after` blocks next to the DDL they belong to. Each runs once per database and is recorded in a hash ledger, so an edit after it ran is refused rather than silently ignored. Destructive changes on tables that hold data need an explicit `@drop` directive.  Migrations that have run can be pruned so they don't pile up.  History still exists, in git, where history belongs.
 
-![The schema files are built into a scratch plan database and introspected. Pending @migrate-before blocks run on the live database, which is then introspected. The two are diffed, the difference is applied, @migrate-after and DO blocks run, and a second diff must come back empty.](docs/images/pipeline.svg)
+![The schema files are built into a scratch plan database and introspected. Pending @migrate-before blocks run on the live database, which is then introspected. The two are diffed, the difference is applied, @migrate-after and DO blocks run, and a second diff must come back empty.](https://raw.githubusercontent.com/powertime-org/pgdeclare/main/docs/images/pipeline.svg)
 
 Status: **0.1.1.** The engine has run the production schema of [Powertime](https://powertime.org) since it went into service on 10 December 2025. Backwards compatibility may not be preserved until 1.0.
 
@@ -95,20 +95,20 @@ UPDATE note SET title = left(body, 40) WHERE title IS NULL;
 
 `pgdeclare apply` adds the column, then runs the block once and records it.
 
-Every command, flag and exit code is in [docs/cli.md](docs/cli.md); the library API is in [docs/python.md](docs/python.md).
+Every command, flag and exit code is in [docs/cli.md](https://github.com/powertime-org/pgdeclare/blob/main/docs/cli.md); the library API is in [docs/python.md](https://github.com/powertime-org/pgdeclare/blob/main/docs/python.md).
 
 ## Documentation
 
-- [Command line](docs/cli.md): flags, exit codes, `--prove`.
-- [Python API](docs/python.md): the library entry points and their errors.
-- [Schema files](docs/schema-files.md): directory layout, `@migrate-before` / `@migrate-after`, `@drop`, `DO` blocks.
-- [Coverage](docs/coverage.md): every object kind pgdeclare manages, how, and what it leaves alone.
-- [Configuration](docs/configuration.md): every `PgDeclareConfig` field.
-- [Safety](docs/safety.md): previews, `--prove`, online/offline/blocked changes, quoting, masking, and the supported PostgreSQL versions (14 to 18).
+- [Command line](https://github.com/powertime-org/pgdeclare/blob/main/docs/cli.md): flags, exit codes, `--prove`.
+- [Python API](https://github.com/powertime-org/pgdeclare/blob/main/docs/python.md): the library entry points and their errors.
+- [Schema files](https://github.com/powertime-org/pgdeclare/blob/main/docs/schema-files.md): directory layout, `@migrate-before` / `@migrate-after`, `@drop`, `DO` blocks.
+- [Coverage](https://github.com/powertime-org/pgdeclare/blob/main/docs/coverage.md): every object kind pgdeclare manages, how, and what it leaves alone.
+- [Configuration](https://github.com/powertime-org/pgdeclare/blob/main/docs/configuration.md): every `PgDeclareConfig` field.
+- [Safety](https://github.com/powertime-org/pgdeclare/blob/main/docs/safety.md): previews, `--prove`, online/offline/blocked changes, quoting, masking, and the supported PostgreSQL versions (14 to 18).
 
 ## How it compares
 
-As of October 2026, pgdeclare manages nearly every object kind [pg-delta](https://github.com/supabase/pg-toolbelt) and [pgschema](https://github.com/pgplex/pgschema) do; the exact differences are in [Coverage](docs/coverage.md#compared-with-other-tools). pgdeclare's difference is where the steps a diff cannot infer live: next to the DDL they belong to, run once, and recorded by hash.
+As of October 2026, pgdeclare manages nearly every object kind [pg-delta](https://github.com/supabase/pg-toolbelt) and [pgschema](https://github.com/pgplex/pgschema) do; the exact differences are in [Coverage](https://github.com/powertime-org/pgdeclare/blob/main/docs/coverage.md#compared-with-other-tools). pgdeclare's difference is where the steps a diff cannot infer live: next to the DDL they belong to, run once, and recorded by hash.
 
 | Tool | Renames and backfills | Records what ran | Free licence | Notes |
 |------|-----------------------|------------------|--------------|-------|
@@ -121,10 +121,10 @@ As of October 2026, pgdeclare manages nearly every object kind [pg-delta](https:
 
 ## Contributing
 
-Issues and pull requests are welcome on [GitHub](https://github.com/powertime-org/pgdeclare). See [CONTRIBUTING.md](CONTRIBUTING.md) for running the tests, and [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+Issues and pull requests are welcome on [GitHub](https://github.com/powertime-org/pgdeclare). See [CONTRIBUTING.md](https://github.com/powertime-org/pgdeclare/blob/main/CONTRIBUTING.md) for running the tests, and [SECURITY.md](https://github.com/powertime-org/pgdeclare/blob/main/SECURITY.md) for reporting vulnerabilities.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0. See [LICENSE](https://github.com/powertime-org/pgdeclare/blob/main/LICENSE) and [NOTICE](https://github.com/powertime-org/pgdeclare/blob/main/NOTICE).
 
 Extracted from [Powertime](https://powertime.org), where it manages the application's schema.
