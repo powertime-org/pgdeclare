@@ -480,14 +480,14 @@ def _diff_function_public_execute(
 
     extra: list[Change] = []
 
-    # Index the create/recreate changes by (schema, name) so a locked function
+    # Index the create/recreate changes by full signature so a locked function
     # gets its REVOKE appended atomically instead of as a standalone statement.
-    create_changes: dict[
-        tuple[str, str], Union[CreateFunction, DropAndCreateFunction]
-    ] = {}
+    # Keying by name alone would let an overload (or an aggregate) of the same
+    # name absorb the flag, and the locked routine would keep PUBLIC EXECUTE.
+    create_changes: dict[str, Union[CreateFunction, DropAndCreateFunction]] = {}
     for c in changes:
         if isinstance(c, (CreateFunction, DropAndCreateFunction)):
-            create_changes[(c.function.schema, c.function.name)] = c
+            create_changes[c.function.signature] = c
 
     for func in desired.functions.values():
         if not func.security_definer or func.schema not in secdef_schemas:
@@ -495,7 +495,7 @@ def _diff_function_public_execute(
         if func.name.lower() not in locked_functions:
             continue
 
-        recreate = create_changes.get((func.schema, func.name))
+        recreate = create_changes.get(func.signature)
         if recreate is not None:
             # Atomic path: append the REVOKE to the (re)creation change.
             recreate.revoke_public_execute = True

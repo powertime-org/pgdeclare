@@ -602,6 +602,9 @@ def _revoke_public_execute_sql(
     function's CREATE/recreate (so PostgreSQL's default PUBLIC EXECUTE grant is
     revoked in the same change), or standalone for pure ACL drift.
     """
+    # GRANT/REVOKE has no AGGREGATE object type; an aggregate is a FUNCTION here.
+    if keyword == "AGGREGATE":
+        keyword = "FUNCTION"
     return f"REVOKE EXECUTE ON {keyword} {quote_ident(schema)}.{quote_ident(name)}({args}) FROM public"
 
 
