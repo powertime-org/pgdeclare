@@ -106,19 +106,6 @@ Every command, flag and exit code is in [docs/cli.md](https://github.com/powerti
 - [Configuration](https://github.com/powertime-org/pgdeclare/blob/main/docs/configuration.md): every `PgDeclareConfig` field.
 - [Safety](https://github.com/powertime-org/pgdeclare/blob/main/docs/safety.md): previews, `--prove`, online/offline/blocked changes, quoting, masking, and the supported PostgreSQL versions (14 to 18).
 
-## How it compares
-
-As of October 2026, pgdeclare manages nearly every object kind [pg-delta](https://github.com/supabase/pg-toolbelt) and [pgschema](https://github.com/pgplex/pgschema) do; the exact differences are in [Coverage](https://github.com/powertime-org/pgdeclare/blob/main/docs/coverage.md#compared-with-other-tools). pgdeclare's difference is where the steps a diff cannot infer live: next to the DDL they belong to, run once, and recorded by hash.
-
-| Tool | Renames and backfills | Records what ran | Free licence | Notes |
-|------|-----------------------|------------------|--------------|-------|
-| pgdeclare | `@migrate` blocks beside the DDL | Hash ledger; edited blocks are refused | Apache-2.0 | Re-diffs after applying and fails the run if anything is left; `--prove` rehearses the full run, `@migrate` blocks included, on a clone |
-| [pgschema](https://github.com/pgplex/pgschema) | Outside the tool | No; state only | Apache-2.0 | Terraform-style plan and apply; broad object coverage |
-| [pg-delta](https://github.com/supabase/pg-toolbelt) | Renames come out as drop plus add, edited by hand; never writes row changes | Through Supabase migration files | PostgreSQL | Alpha; very broad coverage; `prove` tests a plan on a clone first |
-| [Atlas](https://atlasgo.io) | Versioned migration files | Yes, in versioned mode | Apache-2.0 Community Edition | The Community Edition omits views, functions, triggers and RLS policies; the full binary is under the Atlas MSA |
-| [pg-schema-diff](https://github.com/stripe/pg-schema-diff) | Renames come out as drop plus add | No | MIT | Strong lock avoidance for online changes |
-| [migra](https://github.com/djrobstep/migra) | Not handled | No | Unlicense | Deprecated; last release 2022 |
-
 ## Contributing
 
 Issues and pull requests are welcome on [GitHub](https://github.com/powertime-org/pgdeclare). See [CONTRIBUTING.md](https://github.com/powertime-org/pgdeclare/blob/main/CONTRIBUTING.md) for running the tests, and [SECURITY.md](https://github.com/powertime-org/pgdeclare/blob/main/SECURITY.md) for reporting vulnerabilities.
