@@ -70,6 +70,7 @@ pgdeclare diff                 # what would change, as a summary plus SQL
 pgdeclare diff --json          # the same, machine-readable
 pgdeclare diff --exit-code     # exit 2 when anything is pending (for CI)
 pgdeclare apply --dry-run      # plan only, nothing written
+pgdeclare apply --dry-run --prove   # rehearse the real run on a throwaway clone
 pgdeclare apply                # converge the database
 ```
 
@@ -108,6 +109,8 @@ Options shared by both commands:
 
 `apply` also takes `--dry-run`, `--offline` (allow changes that lock or rewrite tables) and `--force` (bypass `@drop` checks, re-run edited blocks, continue despite non-convergence).
 
+`diff --prove` and `apply --dry-run --prove` also rehearse the real run on a throwaway clone of the target, inline migrations included (see [Safety](#safety)). With `diff --json` the result is under a `prove` key. A failed proof exits `1` with the reason.
+
 Exit codes: `0` success or nothing to do, `1` error, `2` changes pending (`diff --exit-code` only).
 
 The CLI also creates the managed schemas in the target database and installs any `CREATE EXTENSION` your schema files declare, in both the plan and the target database. The library leaves both to the caller.
@@ -139,7 +142,7 @@ print(format_changes_summary(changes))
 apply_declared_schema(url, Path("sql"), "app_plan", config=config)
 ```
 
-`apply_declared_schema` raises `SchemaConvergenceError` if a second diff after applying still finds work, and a plain `Exception` with the reason for any other failure. Progress goes to the standard `logging` logger `pgdeclare`, and user-facing lines to `config.report`.
+`apply_declared_schema` raises `SchemaConvergenceError` if a second diff after applying still finds work, and a plain `Exception` with the reason for any other failure. `prove_declared_schema(url, Path("sql"), "app_plan", config=config)` (or `apply_declared_schema(..., dry_run=True, prove=True)`) rehearses the run on a clone; it returns a `ProveResult` and raises `ProveFailedError` with the reasons. Progress goes to the standard `logging` logger `pgdeclare`, and user-facing lines to `config.report`.
 
 ## Directives
 
@@ -244,7 +247,12 @@ The plan database must be on the same server as the target and must already exis
 
 ## Safety
 
-- **Preview first.** `pgdeclare diff` and `apply --dry-run` write nothing to the target database. Declared roles are still created on the server when the plan is built, since roles are cluster-wide. A dry run cannot show the effect of pending `@migrate-before` blocks, and says so: a rename shows as a drop plus an add, reported as a warning rather than a `@drop` error.
+- **Preview first.** `pgdeclare diff` and `apply --dry-run` write nothing to the target database. Declared roles are still created on the server when the plan is built, since roles are cluster-wide. A dry run cannot show the effect of pending `@migrate-before` blocks, and says so: a rename shows as a drop plus an add, reported as a warning rather than a `@drop` error. `--prove` can.
+- **Prove on a clone.** `--prove` copies the target with `CREATE DATABASE <db>_pgdeclare_prove_<random> TEMPLATE <db>` on the same server and runs the whole real pipeline there with the same `--offline` and `--force`: `@migrate-before` blocks, diff, `@drop` checks, DDL, `@migrate-after` blocks, `DO` blocks. It reports the ledger entries and the DDL the real run would write, then fails if a second diff still finds work (even with `--force`) or if any table lost rows or vanished without a `@drop` directive naming it. Tables are matched by OID, so a rename is not a loss. The ledger is written only in the clone, the clone is always dropped, and nothing is written to the target. Its costs:
+  - **Exclusive access.** Postgres refuses to copy a database other sessions are connected to, so run it in a quiet window or against a staging copy. A busy production database will fail with a clear error.
+  - **Disk and time.** The clone is a full copy of the target, so it needs as much free disk, takes time proportional to its size, and the row check counts every managed table exactly.
+  - **Privileges.** The role needs `CREATEDB` and must own the target database (or be a superuser).
+  - **Cluster-wide changes are not rehearsed.** Role and role-membership changes would apply to the whole server, so they are listed, not run.
 - **Online, offline, blocked.** Every change is classified. Online changes apply directly. Offline changes (SET NOT NULL, column type changes, a new generation expression) lock or rewrite tables and need `--offline` (`offline=True`). Blocked changes (drops of data) need `@drop`.
 - **One migration at a time.** The DDL phase takes a session advisory lock on the target database and fails fast if another run holds it.
 - **Transactions.** Enum changes commit first (Postgres requires it); the rest of the DDL runs in one transaction with savepoints, so a stuck run changes nothing. Index builds run `CONCURRENTLY` afterwards; an invalid index left by a failed build is dropped and retried.

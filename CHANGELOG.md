@@ -7,6 +7,17 @@ may change in minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- `diff --prove` and `apply --dry-run --prove` (library: `prove_declared_schema`,
+  or `apply_declared_schema(..., dry_run=True, prove=True)`) rehearse the real
+  run on a throwaway `CREATE DATABASE ... TEMPLATE` clone of the target,
+  pending `@migrate-before`/`@migrate-after` blocks included, report the ledger
+  entries and DDL it would write, and fail if the schema does not converge or a
+  table loses rows without a `@drop` directive. The target is never written and
+  the clone is always dropped. Needs `CREATEDB`, ownership of the target and no
+  other sessions connected to it.
+
 ### Fixed
 
 - A managed role that exists nowhere is a clear error naming the role, not a
@@ -16,6 +27,9 @@ may change in minor releases.
   failing with a `@drop` error the real run would not raise.
 - A role without `CREATEDB` is told to create a plan database and pass
   `--plan-database`, instead of a bare permission error.
+- A key=value connection string passed to the library no longer builds the
+  plan in the target database: the plan database name is now substituted into
+  it, as it already was for `postgresql://` URLs.
 
 ### Changed
 

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 import psycopg2
+from psycopg2.extensions import make_dsn
 
 from .quoting import quote_ident
 from .config import PgDeclareConfig, logger, resolve
@@ -457,7 +458,9 @@ def _replace_db_in_url(connection_string: str, new_db: str) -> str:
                 return f"{parts[0]}/{new_db}?{query}"
             return f"{parts[0]}/{new_db}"
 
-    return connection_string
+    # A key=value string: returning it unchanged would point the plan build
+    # (which drops and recreates schemas) at the target database itself.
+    return make_dsn(connection_string, dbname=new_db)
 
 
 def ensure_schemas(
