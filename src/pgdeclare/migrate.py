@@ -189,6 +189,7 @@ def apply_declared_schema(
     # and record them as satisfied once the schema is created so follow-up
     # runs do not replay them against the current schema.
     is_fresh_install = len(actual.tables) == 0
+    dry_run_pending_before = False
     migration_blocks = parse_migration_blocks(sql_dir, cfg)
     pre_migrations_executed = 0
     if is_fresh_install:
@@ -201,10 +202,10 @@ def apply_declared_schema(
         pre_blocks = [b for b in migration_blocks if b.phase == "before"]
         post_blocks = [b for b in migration_blocks if b.phase == "after"]
         if dry_run:
-            report_pending_migration_blocks(
-                migration_blocks,
-                get_applied_migrations(connection_string, cfg),
-                force=force,
+            applied = get_applied_migrations(connection_string, cfg)
+            report_pending_migration_blocks(migration_blocks, applied, force=force)
+            dry_run_pending_before = any(
+                force or b.id not in applied for b in pre_blocks
             )
             pre_blocks = []
         for block in pre_blocks:
@@ -277,7 +278,15 @@ def apply_declared_schema(
             config=cfg,
         )
 
-        if drop_errors and not force:
+        if drop_errors and not force and dry_run_pending_before:
+            # The diff was computed without the pending @migrate-before blocks,
+            # so a rename they perform still looks like a drop plus an add.
+            logger.warning(format_drop_errors(drop_errors, cfg.decorate))
+            logger.warning(
+                "Dry run: pending @migrate-before blocks may resolve these "
+                "(a rename shows as a drop plus an add until it runs)."
+            )
+        elif drop_errors and not force:
             logger.error(format_drop_errors(drop_errors, cfg.decorate))
             raise Exception("@drop directive required for data-loss operations")
 
