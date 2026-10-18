@@ -49,7 +49,9 @@ from .introspection import (
 from .differ import (
     compute_diff,
     categorize_changes,
+    partition_notes,
     split_index_operations,
+    undeclared_partitions,
 )
 from .executor import (
     execute_migration,
@@ -133,7 +135,9 @@ __all__ = [
     # Differ
     "compute_diff",
     "categorize_changes",
+    "partition_notes",
     "split_index_operations",
+    "undeclared_partitions",
     # Executor
     "execute_migration",
     "cleanup_invalid_indexes",

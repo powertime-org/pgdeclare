@@ -27,6 +27,7 @@ from .changes import (
     Change,
     CreateEnum,
     CreateIndex,
+    CreatePartitionedIndex,
     CreateRole,
     SetComment,
     DropDomain,
@@ -509,6 +510,12 @@ def _execute_index_phase(
                 conn.autocommit = True
                 try:
                     with conn.cursor() as cur:
+                        if isinstance(change, CreatePartitionedIndex):
+                            # Several statements, resumable: an invalid parent
+                            # index is kept and only its gaps are filled.
+                            executed_sql.extend(change.execute(cur))
+                            success = True
+                            continue
                         # For CreateIndex, clean up any invalid index with same name first
                         if isinstance(change, CreateIndex):
                             _cleanup_invalid_index(
@@ -649,9 +656,10 @@ def cleanup_invalid_indexes(connection_string: str, schema: str) -> list[str]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT i.indexname
+                SELECT i.indexname, c.relkind = 'I'
                 FROM pg_indexes i
                 JOIN pg_class c ON c.relname = i.indexname
+                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname
                 JOIN pg_index ix ON ix.indexrelid = c.oid
                 WHERE NOT ix.indisvalid
                   AND i.schemaname = %s
@@ -659,11 +667,12 @@ def cleanup_invalid_indexes(connection_string: str, schema: str) -> list[str]:
                 (schema,),
             )
 
-            for row in cur.fetchall():
-                index_name = row[0]
+            for index_name, partitioned in cur.fetchall():
                 logger.info(f"Dropping invalid index: {schema}.{index_name}")
+                # Postgres refuses DROP INDEX CONCURRENTLY on a partitioned index.
+                concurrently = "" if partitioned else "CONCURRENTLY "
                 cur.execute(
-                    f"DROP INDEX CONCURRENTLY IF EXISTS {quote_ident(schema)}.{quote_ident(index_name)}"
+                    f"DROP INDEX {concurrently}IF EXISTS {quote_ident(schema)}.{quote_ident(index_name)}"
                 )
                 dropped.append(index_name)
 

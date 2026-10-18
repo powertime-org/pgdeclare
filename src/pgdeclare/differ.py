@@ -6,7 +6,7 @@ a list of Change objects needed to synchronize them.
 """
 
 from dataclasses import replace as dataclass_replace
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from .changes import (
     AddColumn,
@@ -25,6 +25,7 @@ from .changes import (
     AlterRole,
     AlterSequence,
     AlterViewOptions,
+    AttachPartition,
     Change,
     CreateCompositeType,
     CreateDomain,
@@ -32,6 +33,7 @@ from .changes import (
     CreateFunction,
     CreateIndex,
     CreateMaterializedView,
+    CreatePartitionedIndex,
     CreatePolicy,
     CreateRole,
     CreateSequence,
@@ -42,6 +44,7 @@ from .changes import (
     DisableRLS,
     DropAndCreateConstraint,
     DependentRelation,
+    DetachPartition,
     DropAndCreateDomain,
     DropAndCreateDomainConstraint,
     DropAndCreateFunction,
@@ -83,6 +86,7 @@ from .changes import (
     index_rebuild_note,
 )
 from .config import PgDeclareConfig, resolve
+from .quoting import quote_ident
 from .models import (
     ChangeCategory,
     Column,
@@ -128,6 +132,14 @@ def compute_diff(
     """
     changes: list[Change] = []
 
+    # Partitions created at runtime (pg_partman, a cron job) and not declared
+    # are never touched: they leave the comparison here, with everything on
+    # them. partition_notes() reports them.
+    parents_with_default = {
+        t.parent_key for t in actual.tables.values() if t.partition_bound == "DEFAULT"
+    }
+    actual = _without_undeclared_partitions(desired, actual)
+
     # Diff roles first (cluster-wide, needed before schemas)
     changes.extend(_diff_roles(desired, actual))
     changes.extend(_diff_role_memberships(desired, actual))
@@ -150,7 +162,13 @@ def compute_diff(
     sequences_before, sequences_after = _diff_sequences(desired, actual)
     changes.extend(sequences_before)
     changes.extend(
-        _diff_tables(desired, actual, check_data_fn, managed_schemas=schemas)
+        _diff_tables(
+            desired,
+            actual,
+            check_data_fn,
+            managed_schemas=schemas,
+            parents_with_default=parents_with_default,
+        )
     )
     changes.extend(_diff_views(desired, actual))
     changes.extend(_diff_materialized_views(desired, actual))
@@ -239,7 +257,10 @@ def compute_diff(
                 "c",
             )
         elif isinstance(change, DropAndCreateConstraint):
-            needs_validation = change.constraint.type in ("f", "c")
+            needs_validation = change.not_valid and change.constraint.type in (
+                "f",
+                "c",
+            )
         else:
             continue
 
@@ -268,6 +289,85 @@ def compute_diff(
     changes.extend(_diff_comments(desired, actual, changes))
 
     return changes
+
+
+def undeclared_partitions(desired: Schema, actual: Schema) -> list[Table]:
+    """Live partitions the schema files do not declare, sub-partitions included.
+
+    Applications often create partitions at runtime (pg_partman, a cron job).
+    Such a partition is never dropped or altered; the diff leaves it, and
+    everything on it, out of the comparison.
+    """
+    return [
+        table
+        for key, table in sorted(actual.tables.items())
+        if table.partition_of is not None and key not in desired.tables
+    ]
+
+
+def partition_notes(desired: Schema, actual: Schema) -> list[str]:
+    """One line per undeclared live partition of a declared table, for the output.
+
+    These are notes, not changes: the partition is left in place. Partitions of
+    a table that is itself going away are not mentioned; its drop takes them.
+    """
+
+    def root(table: Table) -> str:
+        seen: set[str] = set()
+        while table.parent_key is not None and table.parent_key not in seen:
+            seen.add(table.parent_key)
+            parent = actual.tables.get(table.parent_key)
+            if parent is None:
+                return table.parent_key
+            table = parent
+        return table.qualified_name
+
+    return [
+        f"Partition {table.qualified_name} of {table.parent_key} "
+        f"({table.partition_bound}) is not declared; left in place."
+        for table in undeclared_partitions(desired, actual)
+        if root(table) in desired.tables
+    ]
+
+
+def _without_undeclared_partitions(desired: Schema, actual: Schema) -> Schema:
+    """`actual` without the undeclared partitions and what sits on them."""
+    gone = {t.qualified_name for t in undeclared_partitions(desired, actual)}
+    if not gone:
+        return actual
+
+    def on_gone(schema: str, relation: str) -> bool:
+        return f"{schema}.{relation}" in gone
+
+    indexes = {
+        k: i for k, i in actual.indexes.items() if not on_gone(i.schema, i.table)
+    }
+    gone_indexes = actual.indexes.keys() - indexes.keys()
+
+    def keep_comment(c: Comment) -> bool:
+        if c.object_type == "INDEX":
+            return f"{c.schema}.{c.name}" not in gone_indexes
+        if c.object_type in ("TABLE", "COLUMN", "CONSTRAINT", "TRIGGER", "POLICY"):
+            return not on_gone(c.schema, c.name)
+        return True
+
+    return dataclass_replace(
+        actual,
+        tables={k: t for k, t in actual.tables.items() if k not in gone},
+        indexes=indexes,
+        policies={
+            k: p for k, p in actual.policies.items() if not on_gone(p.schema, p.table)
+        },
+        triggers={
+            k: t for k, t in actual.triggers.items() if not on_gone(t.schema, t.table)
+        },
+        grants=[
+            g
+            for g in actual.grants
+            if not (_is_relation_grant(g) and on_gone(g.schema, g.object_name))
+        ],
+        comments={k: c for k, c in actual.comments.items() if keep_comment(c)},
+    )
 
 
 def _skip_revokes_on_dropped_relations(changes: list[Change]) -> list[Change]:
@@ -596,14 +696,37 @@ def _diff_tables(
     actual: Schema,
     check_data_fn: Optional[Callable[..., bool]] = None,
     managed_schemas: list[str] | None = None,
+    parents_with_default: Optional[set[Optional[str]]] = None,
 ) -> list[Change]:
-    """Diff tables between desired and actual schemas."""
+    """Diff tables between desired and actual schemas.
+
+    A partition's columns belong to its parent: adding, dropping or retyping
+    one happens on the parent and Postgres carries it to every partition. Only
+    a partition's own defaults and NOT NULL are diffed, after everything else,
+    since the parent's changes recurse into its partitions first.
+    """
     changes: list[Change] = []
+    partition_columns: list[Change] = []
+    parents_with_default = parents_with_default or set()
 
     # Tables to create
     for key, table in desired.tables.items():
         if key not in actual.tables:
-            changes.append(CreateTable(table=table))
+            create = CreateTable(table=table)
+            if (
+                table.partition_of is not None
+                and table.partition_bound != "DEFAULT"
+                and table.parent_key in parents_with_default
+            ):
+                # Postgres scans the default partition for rows that now
+                # belong to the new one, under a lock.
+                create.category = ChangeCategory.OFFLINE
+                create.description += " (scans the default partition)"
+            changes.append(create)
+            if table.partition_of is not None:
+                partition_columns.extend(
+                    _diff_partition_columns(table, None, desired, actual)
+                )
             # CreateTable inlines only PRIMARY KEY and CHECK. Everything in
             # DEFERRED_CONSTRAINT_TYPES is added here instead: FOREIGN KEY so
             # circular dependencies resolve (post <-> comment), UNIQUE and
@@ -625,13 +748,44 @@ def _diff_tables(
             if table.rls_forced:
                 changes.append(ForceRLS(schema=table.schema, table=table.name))
         else:
-            # Table exists - diff columns, constraints, and RLS state
+            # Table exists - diff partitioning, columns, constraints, RLS state
             actual_table = actual.tables[key]
-            changes.extend(
-                _diff_columns(table, actual_table, check_data_fn, managed_schemas)
-            )
+            _check_partitioning(table, actual_table)
+            if table.partition_of is not None:
+                assert table.partition_bound is not None
+                if (actual_table.partition_of, actual_table.partition_bound) != (
+                    table.partition_of,
+                    table.partition_bound,
+                ):
+                    changes.append(
+                        AttachPartition(
+                            schema=table.schema,
+                            table=table.name,
+                            parent=table.partition_of,
+                            bound=table.partition_bound,
+                            detach_from=actual_table.partition_of,
+                            old_bound=actual_table.partition_bound,
+                        )
+                    )
+                partition_columns.extend(
+                    _diff_partition_columns(table, actual_table, desired, actual)
+                )
+            else:
+                if actual_table.partition_of is not None:
+                    changes.append(
+                        DetachPartition(
+                            schema=table.schema,
+                            table=table.name,
+                            parent=actual_table.partition_of,
+                        )
+                    )
+                changes.extend(
+                    _diff_columns(table, actual_table, check_data_fn, managed_schemas)
+                )
             changes.extend(_diff_constraints(table, actual_table))
             changes.extend(_diff_rls(table, actual_table))
+
+    changes.extend(partition_columns)
 
     # Tables to drop
     for key, table in actual.tables.items():
@@ -646,6 +800,112 @@ def _diff_tables(
                     has_data=has_data,
                 )
             )
+
+    return changes
+
+
+def _check_partitioning(desired: Table, actual: Table) -> None:
+    """Refuse what Postgres cannot do in place: a partitioning change of a table."""
+    name = f"{quote_ident(desired.schema)}.{quote_ident(desired.name)}"
+    how = (
+        "Do it in an explicit @migrate-before block: create the new table, "
+        "copy the rows (INSERT ... SELECT), drop the old one and rename the new "
+        "one into place."
+    )
+    if desired.partition_key == actual.partition_key:
+        return
+    if actual.partition_key is None:
+        raise ValueError(
+            f"cannot convert table {name} into a partitioned table "
+            f"(PARTITION BY {desired.partition_key}): PostgreSQL has no ALTER "
+            f"for it. {how}"
+        )
+    if desired.partition_key is None:
+        raise ValueError(
+            f"cannot convert partitioned table {name} (PARTITION BY "
+            f"{actual.partition_key}) into a plain table: PostgreSQL has no "
+            f"ALTER for it. {how}"
+        )
+    raise ValueError(
+        f"cannot change the partition key of {name} from PARTITION BY "
+        f"{actual.partition_key} to PARTITION BY {desired.partition_key}: "
+        f"PostgreSQL has no ALTER for it. {how}"
+    )
+
+
+def _diff_partition_columns(
+    desired_child: Table,
+    actual_child: Optional[Table],
+    desired: Schema,
+    actual: Schema,
+) -> list[Change]:
+    """A partition's own column defaults and NOT NULL.
+
+    A partition takes its columns, defaults and NOT NULL from its parent when
+    it is created, and a parent's ALTER COLUMN ... SET/DROP DEFAULT or NOT NULL
+    recurses into it, overwriting a partition's own value. So the value a
+    partition holds once the parent's changes have run is the parent's
+    declared one, unless the parent's value is unchanged and the partition is
+    already attached to it, in which case it keeps its own. Changes are
+    emitted where that differs from the declaration.
+    """
+    parent_key = desired_child.parent_key
+    desired_parent = desired.tables.get(parent_key) if parent_key else None
+    if desired_parent is None:
+        return []
+    actual_parent = actual.tables.get(parent_key) if parent_key else None
+    attached = (
+        actual_child is not None
+        and actual_child.partition_of == desired_child.partition_of
+    )
+    schema, table = desired_child.schema, desired_child.name
+    category = ChangeCategory.ONLINE if actual_child is None else ChangeCategory.OFFLINE
+    changes: list[Change] = []
+
+    for name, col in desired_child.columns.items():
+        parent_col = desired_parent.columns.get(name)
+        if parent_col is None or col.identity or col.generated:
+            continue
+        current = actual_child.columns.get(name) if actual_child else None
+        actual_parent_col = actual_parent.columns.get(name) if actual_parent else None
+
+        def held(attr: str, normalize: Callable[[Any], Any]) -> Any:
+            # What the partition holds after the parent's own changes.
+            assert parent_col is not None
+            if (
+                attached
+                and current is not None
+                and actual_parent_col is not None
+                and normalize(getattr(parent_col, attr))
+                == normalize(getattr(actual_parent_col, attr))
+            ):
+                return getattr(current, attr)
+            return getattr(parent_col, attr)
+
+        nullable = held("nullable", bool)
+        if col.nullable != nullable:
+            if col.nullable:
+                changes.append(DropNotNull(schema=schema, table=table, column=name))
+            else:
+                changes.append(
+                    SetNotNull(
+                        schema=schema, table=table, column=name, category=category
+                    )
+                )
+
+        default = held("default", _normalize_default)
+        if _normalize_default(col.default) != _normalize_default(default):
+            if col.default is None:
+                changes.append(DropDefault(schema=schema, table=table, column=name))
+            else:
+                changes.append(
+                    SetDefault(
+                        schema=schema,
+                        table=table,
+                        column=name,
+                        default_value=col.default,
+                    )
+                )
 
     return changes
 
@@ -866,12 +1126,21 @@ def _diff_constraints(
 
     # Constraints to add
     for name, constraint in desired_constraints.items():
+        # Before PostgreSQL 18 a partitioned table's foreign key cannot be
+        # added NOT VALID, so it is validated as it is added: a scan of every
+        # partition under a lock.
+        validated_now = desired_table.partition_key is not None and (
+            constraint.type == "f"
+        )
+        category = ChangeCategory.OFFLINE if validated_now else ChangeCategory.ONLINE
         if name not in actual_constraints:
             changes.append(
                 AddConstraint(
                     schema=schema,
                     table=table_name,
                     constraint=constraint,
+                    not_valid=not validated_now,
+                    category=category,
                 )
             )
         elif constraint.definition != actual_constraints[name].definition:
@@ -881,6 +1150,8 @@ def _diff_constraints(
                     schema=schema,
                     table=table_name,
                     constraint=constraint,
+                    not_valid=not validated_now,
+                    category=category,
                 )
             )
 
@@ -964,20 +1235,33 @@ def _diff_indexes(desired: Schema, actual: Schema) -> list[Change]:
     """Diff indexes between desired and actual schemas."""
     changes: list[Change] = []
 
+    # An index on a partitioned table is built per partition and attached
+    # (CreatePartitionedIndex), and dropped without CONCURRENTLY, which
+    # Postgres refuses for one; that drop runs in the DDL transaction.
+    def create(index: Index) -> CreateIndex:
+        if index.partitioned:
+            return CreatePartitionedIndex(index=index)
+        return CreateIndex(index=index, concurrent=True)
+
     # Indexes to create
     for key, index in desired.indexes.items():
-        if key not in actual.indexes:
-            changes.append(CreateIndex(index=index, concurrent=True))
-        elif index.definition != actual.indexes[key].definition:
+        current = actual.indexes.get(key)
+        if current is None:
+            changes.append(create(index))
+        elif index.definition != current.definition:
             # Index changed - drop and recreate
             changes.append(
                 DropIndex(
                     schema=index.schema,
                     index_name=index.name,
-                    concurrent=True,
+                    concurrent=not current.partitioned,
                 )
             )
-            changes.append(CreateIndex(index=index, concurrent=True))
+            changes.append(create(index))
+        elif index.partitioned and not current.is_valid:
+            # A partitioned index is invalid until every partition has an
+            # index attached to it: a run died half way. Finish the job.
+            changes.append(create(index))
 
     # Indexes to drop
     for key, index in actual.indexes.items():
@@ -986,7 +1270,7 @@ def _diff_indexes(desired: Schema, actual: Schema) -> list[Change]:
                 DropIndex(
                     schema=index.schema,
                     index_name=index.name,
-                    concurrent=True,
+                    concurrent=not index.partitioned,
                 )
             )
 

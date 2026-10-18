@@ -9,6 +9,17 @@ may change in minor releases.
 
 ### Added
 
+- Declarative partitioning: partitioned tables (`PARTITION BY RANGE`, `LIST`,
+  `HASH`) and their partitions (`PARTITION OF ... FOR VALUES` or `DEFAULT`,
+  sub-partitioned ones included). Columns, defaults, NOT NULL, constraints,
+  indexes and triggers a partition inherits are not diffed on the partition.
+  A changed bound is a `DETACH` and `ATTACH` (offline). A partition the schema
+  files do not declare, such as one pg_partman created, is never dropped; the
+  output notes it. An index on a partitioned table is built `CONCURRENTLY` on
+  each partition and attached to an `ON ONLY` parent index. Converting a table
+  to or from partitioned, or changing its partition key, is refused with an
+  error pointing to `@migrate-before`.
+
 ### Changed
 
 - README: the plan database's privilege needs, the PostgreSQL 14 `public`
@@ -17,6 +28,8 @@ may change in minor releases.
 
 ### Fixed
 
+- The name of a constraint inlined into `CREATE TABLE` is quoted, like every
+  other name the engine writes.
 - A `DROP` that fails because another object still depends on it
   (`2BP01`) is retried after the rest, like a missing dependency, so dropping
   a stack of views no longer depends on the order they were listed in.

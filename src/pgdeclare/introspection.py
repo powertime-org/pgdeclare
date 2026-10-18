@@ -146,10 +146,20 @@ def _query_tables(conn, schema: str, search_path: str = "public") -> dict[str, T
             SELECT
                 c.relname AS table_name,
                 c.relrowsecurity AS rls_enabled,
-                c.relforcerowsecurity AS rls_forced
+                c.relforcerowsecurity AS rls_forced,
+                CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) END
+                    AS partition_key,
+                pn.nspname AS parent_schema,
+                pc.relname AS parent_name,
+                CASE WHEN c.relispartition
+                    THEN pg_get_expr(c.relpartbound, c.oid) END AS partition_bound
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind = 'r'
+            -- A partition has exactly one pg_inherits row, naming its parent.
+            LEFT JOIN pg_inherits i ON c.relispartition AND i.inhrelid = c.oid
+            LEFT JOIN pg_class pc ON pc.oid = i.inhparent
+            LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+            WHERE c.relkind IN ('r', 'p')
               AND n.nspname = %s
               AND c.relname NOT LIKE 'pg_%%'
               AND NOT c.relname ~ '^_'
@@ -171,6 +181,13 @@ def _query_tables(conn, schema: str, search_path: str = "public") -> dict[str, T
                 name=table_name,
                 rls_enabled=row["rls_enabled"],
                 rls_forced=row["rls_forced"],
+                partition_key=row["partition_key"],
+                partition_of=(
+                    (row["parent_schema"], row["parent_name"])
+                    if row["parent_name"] is not None
+                    else None
+                ),
+                partition_bound=row["partition_bound"],
             )
 
             # Query columns for this table
@@ -280,6 +297,14 @@ def _query_constraints(conn, schema: str, table_name: str) -> list[Constraint]:
               -- Nullability is modelled on the column (SetNotNull/DropNotNull), so
               -- these rows would be managed twice. Earlier versions have none.
               AND con.contype != 'n'
+              -- A constraint with a parent is a clone Postgres made and keeps in
+              -- step: a partition's copy of the parent's PRIMARY KEY, UNIQUE or
+              -- FOREIGN KEY, or the per-partition rows of a foreign key that
+              -- references a partitioned table. The parent's row is the one managed.
+              AND con.conparentid = 0
+              -- A partition inherits its parent's CHECK constraints (conislocal
+              -- false); only the ones declared on the partition itself are its own.
+              AND (con.conislocal OR NOT c.relispartition)
             ORDER BY con.conname
             """,
             (table_name, schema),
@@ -368,12 +393,16 @@ def _query_indexes(conn, schema: str) -> dict[str, Index]:
                 i.indexname AS index_name,
                 i.tablename AS table_name,
                 i.indexdef AS index_definition,
-                ix.indisvalid AS is_valid
+                ix.indisvalid AS is_valid,
+                c.relkind = 'I' AS partitioned
             FROM pg_indexes i
             JOIN pg_class c ON c.relname = i.indexname
             JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname
             JOIN pg_index ix ON ix.indexrelid = c.oid
             WHERE i.schemaname = %s
+              -- A partition's index attached to its parent's index is created
+              -- and kept by Postgres; the parent's index is the one managed.
+              AND NOT c.relispartition
               -- Exclude indexes that back constraints (PK, UNIQUE, EXCLUDE)
               -- These are managed by _query_constraints / AddConstraint
               AND NOT EXISTS (
@@ -398,6 +427,7 @@ def _query_indexes(conn, schema: str) -> dict[str, Index]:
                 schema=schema,
                 definition=row["index_definition"],
                 is_valid=row["is_valid"],
+                partitioned=row["partitioned"],
             )
             indexes[idx.qualified_name] = idx
 
@@ -473,6 +503,9 @@ def _query_triggers(conn, schema: str) -> dict[str, Trigger]:
             JOIN pg_namespace np ON np.oid = p.pronamespace
             WHERE n.nspname = %s
               AND NOT t.tgisinternal
+              -- A partition's clone of a row trigger on its parent (internal
+              -- before PostgreSQL 15, ordinary since); the parent's is managed.
+              AND t.tgparentid = 0
             ORDER BY c.relname, t.tgname
             """,
             (schema,),
@@ -744,7 +777,7 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_attribute a
   ON d.objsubid <> 0 AND a.attrelid = c.oid AND a.attnum = d.objsubid
 WHERE n.nspname = %(schema)s
-  AND c.relkind IN ('r', 'p', 'v', 'i')
+  AND c.relkind IN ('r', 'p', 'v', 'i', 'I')
   AND (d.objsubid = 0 OR (a.attname IS NOT NULL AND NOT a.attisdropped))
 
 UNION ALL

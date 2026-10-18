@@ -211,7 +211,7 @@ class TestChanges:
         sql = change.to_sql()
 
         # PK constraint should be included inline
-        assert "CONSTRAINT post_pkey PRIMARY KEY (id)" in sql
+        assert 'CONSTRAINT "post_pkey" PRIMARY KEY (id)' in sql
 
         # FK constraint should NOT be included inline
         assert "post_last_comment_fkey" not in sql
@@ -250,7 +250,7 @@ class TestChanges:
         )
         sql = CreateTable(table=table).to_sql()
 
-        assert "CONSTRAINT enrollment_pkey PRIMARY KEY (course_id, student_id)" in sql
+        assert 'CONSTRAINT "enrollment_pkey" PRIMARY KEY (course_id, student_id)' in sql
         assert "enrollment_course_id_student_id_key" not in sql
 
     def test_differ_adds_unique_constraints_for_new_tables(self):

@@ -13,7 +13,7 @@ from typing import Callable, Optional
 
 from .changes import Change
 from .config import PgDeclareConfig, logger, resolve
-from .differ import compute_diff
+from .differ import compute_diff, partition_notes
 from .drop_directive import format_drop_errors, validate_drops_runtime
 from .executor import execute_migration, format_changes_summary
 from .introspection import check_table_has_data, introspect_schema
@@ -336,6 +336,8 @@ def run_declared_schema(
         locked_functions=locked_functions,
         config=cfg,
     )
+    for note in partition_notes(desired, actual):
+        say(f"Note: {note}")
     result = SchemaRunResult(
         desired=desired,
         migration_blocks=migration_blocks,

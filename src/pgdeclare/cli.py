@@ -37,7 +37,7 @@ from psycopg2 import sql as pgsql
 from . import __version__
 from .changes import Change
 from .config import PgDeclareConfig
-from .differ import compute_diff
+from .differ import compute_diff, partition_notes
 from .executor import format_changes_summary
 from .introspection import check_table_has_data, introspect_schema
 from .ledger import get_applied_migrations, parse_migration_blocks
@@ -275,6 +275,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     changes = compute_diff(
         desired, actual, has_data, schemas=list(cfg.schemas), config=cfg
     )
+    notes = partition_notes(desired, actual)
     applied = get_applied_migrations(url, cfg)
     pending = [b for b in parse_migration_blocks(sql_dir, cfg) if b.id not in applied]
 
@@ -282,6 +283,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
         payload = {
             "fresh_database": not actual.tables,
             "changes": [change_to_dict(c) for c in changes],
+            "notes": notes,
             "pending_migrations": [
                 {
                     "id": b.id,
@@ -304,6 +306,8 @@ def cmd_diff(args: argparse.Namespace) -> int:
                 print(change.to_display_sql())
         else:
             print("No schema changes.")
+        for note in notes:
+            print(f"Note: {note}")
         fresh = not actual.tables
         for block in pending:
             how = " (fresh database: recorded, not run)" if fresh else ""
