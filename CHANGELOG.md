@@ -7,8 +7,26 @@ may change in minor releases.
 
 ## [Unreleased]
 
+### Added
+
+- Standalone sequences (`CREATE SEQUENCE`) in the managed schemas: created
+  with every option spelled out, options converged with `ALTER SEQUENCE`
+  (never `RESTART`, so the current value is kept), `OWNED BY` a column, and
+  dropped when undeclared (without `CASCADE`, so a default still using one
+  refuses the drop). Sequences are created before tables, so a `nextval()`
+  column default resolves; identity-column sequences stay with their column.
+- Grants to managed roles on sequences (`USAGE`, `SELECT`, `UPDATE`).
+
+### Changed
+
+- README: the plan database's privilege needs, the PostgreSQL 14 `public`
+  ownership caveat, a corrected Python example, and a comparison with other
+  tools.
+
 ### Fixed
 
+- `serial` and `bigserial` columns on a fresh database: the table's
+  `nextval()` default used to name a sequence that was never created.
 - A managed role that exists nowhere is a clear error naming the role, not a
   raw `UndefinedObject` traceback from introspection.
 - `apply --dry-run` with pending `@migrate-before` blocks reports drops it
@@ -16,12 +34,6 @@ may change in minor releases.
   failing with a `@drop` error the real run would not raise.
 - A role without `CREATEDB` is told to create a plan database and pass
   `--plan-database`, instead of a bare permission error.
-
-### Changed
-
-- README: the plan database's privilege needs, the PostgreSQL 14 `public`
-  ownership caveat, a corrected Python example, and a comparison with other
-  tools.
 
 ## [0.1.0] - 2026-10-16
 

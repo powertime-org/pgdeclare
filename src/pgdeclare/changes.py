@@ -24,6 +24,7 @@ from .models import (
     Policy,
     Role,
     RoleMembership,
+    Sequence,
     Table,
     Trigger,
     View,
@@ -1135,6 +1136,145 @@ class CreateCompositeType(Change):
 
 
 # =============================================================================
+# Sequence Changes
+# =============================================================================
+
+
+SEQUENCE_TYPES = frozenset({"smallint", "integer", "bigint"})
+
+
+def _sequence_ident(seq: Sequence) -> str:
+    return f"{quote_ident(seq.schema)}.{quote_ident(seq.name)}"
+
+
+def _sequence_options_sql(seq: Sequence) -> str:
+    """Every option, spelled out: the catalog's values, not PostgreSQL's defaults.
+
+    Writing all of them keeps CREATE and ALTER independent of the defaults
+    (which depend on the type and the sign of INCREMENT) and makes an `AS`
+    change unable to move MINVALUE/MAXVALUE behind the declaration's back.
+    """
+    # The type comes from format_type() on the catalog or the plan database;
+    # a sequence can only be one of these, so anything else is refused rather
+    # than written into SQL.
+    if seq.data_type not in SEQUENCE_TYPES:
+        raise ValueError(
+            f"sequence {seq.qualified_name}: unexpected type {seq.data_type!r}"
+        )
+    cycle = "CYCLE" if seq.cycle else "NO CYCLE"
+    return (
+        f"AS {seq.data_type} INCREMENT BY {int(seq.increment)}"
+        f" MINVALUE {int(seq.min_value)} MAXVALUE {int(seq.max_value)}"
+        f" START WITH {int(seq.start)} CACHE {int(seq.cache)} {cycle}"
+    )
+
+
+@dataclass
+class CreateSequence(Change):
+    """Create a sequence. Ownership is a separate SetSequenceOwner change.
+
+    A table's `nextval()` default needs the sequence first, and OWNED BY needs
+    the table first, so the two cannot be one statement.
+    """
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            self.description = f"Create sequence {self.sequence.qualified_name}"
+
+    def to_sql(self) -> str:
+        return f"CREATE SEQUENCE {_sequence_ident(self.sequence)} {_sequence_options_sql(self.sequence)};"
+
+
+@dataclass
+class AlterSequence(Change):
+    """Converge a sequence's options in place.
+
+    Never RESTART: `START WITH` only changes the value a future
+    `ALTER SEQUENCE ... RESTART` would use, so the current value survives.
+    """
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            self.description = (
+                f"Alter options of sequence {self.sequence.qualified_name}"
+            )
+
+    def to_sql(self) -> str:
+        return f"ALTER SEQUENCE {_sequence_ident(self.sequence)} {_sequence_options_sql(self.sequence)};"
+
+
+@dataclass
+class SetSequenceOwner(Change):
+    """`ALTER SEQUENCE ... OWNED BY table.column` (or `OWNED BY NONE`)."""
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            owner = self.sequence.owned_by
+            target = ".".join(owner) if owner else "nothing"
+            self.description = (
+                f"Set sequence {self.sequence.qualified_name} owned by {target}"
+            )
+
+    def to_sql(self) -> str:
+        owner = self.sequence.owned_by
+        if owner is None:
+            target = "NONE"
+        else:
+            target = ".".join(quote_ident(part) for part in owner)
+        return f"ALTER SEQUENCE {_sequence_ident(self.sequence)} OWNED BY {target};"
+
+
+@dataclass
+class DropSequence(Change):
+    """Drop a sequence that is no longer declared.
+
+    No CASCADE: if a column default still calls nextval() on it, PostgreSQL
+    refuses and the run fails rather than silently dropping the default. The
+    differ orders this after the table changes, so a default being removed in
+    the same run is gone first. IF EXISTS because dropping the owning table or
+    column already dropped an owned sequence.
+    """
+
+    schema: str = "public"
+    sequence_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.sequence_name}"
+        if not self.description:
+            self.description = f"Drop sequence {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP SEQUENCE IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.sequence_name)};"
+
+
+# =============================================================================
 # View Changes
 # =============================================================================
 
@@ -1312,6 +1452,8 @@ class GrantPrivilege(Change):
             return f"GRANT {self.grant.privilege} ({quote_ident(self.grant.column)}) ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         elif self.grant.object_type == "FUNCTION":
             return f"GRANT {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
+        elif self.grant.object_type == "SEQUENCE":
+            return f"GRANT {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         else:
             return f"GRANT {self.grant.privilege} ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
 
@@ -1348,6 +1490,13 @@ class RevokePrivilege(Change):
             revoke_sql = f"REVOKE {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
             return do_block(
                 f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_function THEN NULL; END"
+            )
+        elif self.grant.object_type == "SEQUENCE":
+            # Wrap in DO block: the sequence may have been dropped in this
+            # batch, with its owning table or by DropSequence.
+            revoke_sql = f"REVOKE {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
+            return do_block(
+                f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_table THEN NULL; END"
             )
         else:
             return f"REVOKE {self.grant.privilege} ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)};"
