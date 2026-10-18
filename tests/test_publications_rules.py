@@ -176,6 +176,37 @@ class TestPublicationDiff:
         assert [type(c) for c in changes] == [DropPublication]
         assert changes[0].to_sql() == 'DROP PUBLICATION IF EXISTS "old";'
 
+    def test_undeclared_publication_on_a_managed_partitioned_table_is_dropped(self):
+        parent = Table(schema="public", name="events", partition_key="RANGE (at)")
+        child = Table(
+            schema="public",
+            name="events_2026",
+            partition_of=("public", "events"),
+            partition_bound="FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+        )
+        tables = {t.qualified_name: t for t in (parent, child)}
+        actual = Schema(
+            publications={"old": _pub("old", _member("events"))}, tables=tables
+        )
+        changes = compute_diff(Schema(tables=dict(tables)), actual)
+        assert [type(c) for c in changes] == [DropPublication]
+
+    def test_undeclared_publication_on_an_undeclared_partition_is_kept(self):
+        """A partition made at runtime is not pgdeclare's, nor what publishes it."""
+        parent = Table(schema="public", name="events", partition_key="RANGE (at)")
+        runtime = Table(
+            schema="public",
+            name="events_2030",
+            partition_of=("public", "events"),
+            partition_bound="FOR VALUES FROM ('2030-01-01') TO ('2031-01-01')",
+        )
+        actual = Schema(
+            publications={"cdc": _pub("cdc", _member("events_2030"))},
+            tables={t.qualified_name: t for t in (parent, runtime)},
+        )
+        desired = Schema(tables={parent.qualified_name: parent})
+        assert compute_diff(desired, actual) == []
+
     @pytest.mark.parametrize(
         "pub",
         [

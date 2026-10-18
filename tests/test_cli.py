@@ -483,3 +483,119 @@ def test_new_object_kinds_converge_together(tmp_path, target):
     assert _rows(
         target, "SELECT obj_description('public.person_emails'::regclass)"
     ) == [("Emails and tickets",)]
+
+
+ROLLUP = """
+CREATE ROLE {role} NOLOGIN;
+
+CREATE COLLATION plain_c (locale = 'C');
+CREATE TYPE span AS RANGE (subtype = integer);
+
+CREATE TABLE events (
+    id   bigint NOT NULL,
+    at   date NOT NULL,
+    tag  text COLLATE plain_c,
+    PRIMARY KEY (id, at)
+) PARTITION BY RANGE (at);
+CREATE TABLE events_2026 PARTITION OF events
+    FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+
+CREATE TABLE note (id int PRIMARY KEY, body text);
+CREATE PUBLICATION note_feed FOR TABLE note;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {role};
+
+CREATE PROCEDURE log_note(n int) LANGUAGE sql AS $$ SELECT n $$;
+CREATE AGGREGATE total(int) (SFUNC = int4pl, STYPE = int, INITCOND = '0');
+
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+CREATE SERVER elsewhere FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'elsewhere.invalid', dbname 'app');
+CREATE FOREIGN TABLE remote_note (id int, body text) SERVER elsewhere
+    OPTIONS (table_name 'note');
+"""
+
+
+@pytest.mark.integration
+def test_rollup_object_kinds_converge_together(tmp_path, target):
+    """The 0.1.1 kinds in one schema: apply, re-diff empty, change, re-diff empty."""
+    sql_dir = tmp_path / "sql"
+    role = f"pgdeclare_rollup_{uuid.uuid4().hex[:8]}"
+    base = ["--database-url", target, "--sql-dir", str(sql_dir), "--role", role]
+    sql = ROLLUP.format(role=f'"{role}"')
+    try:
+        _write(sql_dir, sql)
+        assert main(["apply", *base]) == EXIT_OK
+        assert main(["diff", "--exit-code", *base]) == EXIT_OK
+
+        # A partition made at runtime (pg_partman, say) is left alone, and it
+        # carries the parent's column collation like the declared one.
+        _admin(
+            target,
+            "CREATE TABLE events_2030 PARTITION OF events "
+            "FOR VALUES FROM ('2030-01-01') TO ('2031-01-01')",
+        )
+        assert main(["diff", "--exit-code", *base]) == EXIT_OK
+        assert _rows(
+            target,
+            "SELECT c.relname, co.collname FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_collation co ON co.oid = a.attcollation "
+            "WHERE a.attname = 'tag' AND c.relname LIKE 'events%' ORDER BY 1",
+        ) == [
+            ("events", "plain_c"),
+            ("events_2026", "plain_c"),
+            ("events_2030", "plain_c"),
+        ]
+        assert _rows(
+            target, f"SELECT has_table_privilege('{role}', 'public.note', 'SELECT')"
+        ) == [(True,)]
+
+        changed = (
+            sql.replace("$$ SELECT n $$", "$$ SELECT n + 1 $$")
+            .replace("INITCOND = '0'", "INITCOND = '10'")
+            .replace("GRANT SELECT ON TABLES", "GRANT SELECT, INSERT ON TABLES")
+            .replace("subtype = integer", "subtype = bigint")
+            .replace("FOR TABLE note;", "FOR TABLE note, events;")
+            .replace(
+                "(id int, body text) SERVER", "(id int, body text, at date) SERVER"
+            )
+            + "CREATE TABLE events_2027 PARTITION OF events\n"
+            "    FOR VALUES FROM ('2027-01-01') TO ('2028-01-01');\n"
+        )
+        _write(sql_dir, changed)
+        assert main(["apply", *base]) == EXIT_OK
+        assert main(["diff", "--exit-code", *base]) == EXIT_OK
+
+        assert _rows(
+            target,
+            "SELECT agginitval FROM pg_aggregate "
+            "WHERE aggfnoid = 'public.total(int)'::regprocedure",
+        ) == [("10",)]
+        assert _rows(
+            target,
+            "SELECT format_type(rngsubtype, NULL) FROM pg_range "
+            "WHERE rngtypid = 'public.span'::regtype",
+        ) == [("bigint",)]
+        assert _rows(
+            target,
+            "SELECT tablename FROM pg_publication_tables "
+            "WHERE pubname = 'note_feed' ORDER BY 1",
+        ) == [("events_2026",), ("events_2027",), ("events_2030",), ("note",)]
+        assert _rows(
+            target,
+            "SELECT relname FROM pg_class "
+            "WHERE relname LIKE 'events_20%' AND relkind = 'r' ORDER BY 1",
+        ) == [("events_2026",), ("events_2027",), ("events_2030",)]
+        assert _rows(
+            target,
+            "SELECT attname FROM pg_attribute "
+            "WHERE attrelid = 'public.remote_note'::regclass AND attnum > 0 "
+            "ORDER BY attnum",
+        ) == [("id",), ("body",), ("at",)]
+        assert _rows(
+            target,
+            f"SELECT has_table_privilege('{role}', 'public.events_2027', 'INSERT')",
+        ) == [(True,)]
+    finally:
+        _admin(target, f'DROP OWNED BY "{role}"; DROP ROLE IF EXISTS "{role}"')

@@ -70,9 +70,13 @@ may change in minor releases.
   diff does, so `diff` shows them.
 - Opt-in ownership (`manage_ownership`, `--manage-ownership`): an owner the
   schema files state with `ALTER ... OWNER TO`, when it is a managed role, is
-  converged on tables, foreign tables, views, materialized views, sequences,
-  functions, types, domains and the managed schemas, including after a
-  recreate.
+  converged on tables (partitioned ones too), foreign tables, views,
+  materialized views, sequences, functions, procedures, aggregates, enum,
+  composite and range types, domains, collations and the managed schemas,
+  including after a recreate. The owner's implicit privileges are left out of
+  the grant diff on that exact object only (kind and, for a routine,
+  signature), so a grant to the owner on a same-named object or another
+  overload is still converged.
 
 ### Changed
 
@@ -84,9 +88,14 @@ may change in minor releases.
 
 - `CREATE TABLE` quotes inline constraint names, so a name with a quote in it
   stays a name instead of breaking (or injecting into) the statement.
-- A `DROP` that fails because another object still depends on it
-  (`2BP01`) is retried after the rest, like a missing dependency, so dropping
-  a stack of views no longer depends on the order they were listed in.
+- A `DROP` written without `CASCADE` that fails because another object
+  still depends on it (`2BP01`) is retried after the rest, like a missing
+  dependency: views, materialized views, domains, range types, collations,
+  extensions and foreign tables. Dropping a stack of views no longer depends
+  on the order they were listed in.
+- Grants on functions, procedures and aggregates name the overload, so a
+  grant on one of several functions sharing a name is diffed and applied on
+  that one instead of failing as ambiguous.
 - No `REVOKE` is planned on a table, view or materialized view the same run
   drops; it used to fail on the missing relation and leave the run stuck.
 - `serial` and `bigserial` columns on a fresh database: the table's
