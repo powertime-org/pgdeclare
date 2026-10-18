@@ -5,6 +5,23 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [Unreleased]
+
+### Added
+
+- Standalone sequences (`CREATE SEQUENCE`) in the managed schemas: created
+  with every option spelled out, options converged with `ALTER SEQUENCE`
+  (never `RESTART`, so the current value is kept), `OWNED BY` a column, and
+  dropped when undeclared (without `CASCADE`, so a default still using one
+  refuses the drop). Sequences are created before tables, so a `nextval()`
+  column default resolves; identity-column sequences stay with their column.
+- Grants to managed roles on sequences (`USAGE`, `SELECT`, `UPDATE`).
+
+### Fixed
+
+- `serial` and `bigserial` columns on a fresh database: the table's
+  `nextval()` default used to name a sequence that was never created.
+
 ## [0.1.0] - 2026-10-16
 
 First real release: a schema engine proven in production, extracted and made generic.

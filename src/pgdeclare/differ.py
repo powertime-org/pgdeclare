@@ -5,6 +5,7 @@ Compares desired schema state against actual database state and produces
 a list of Change objects needed to synchronize them.
 """
 
+from dataclasses import replace as dataclass_replace
 from typing import Callable, Optional, Union
 
 from .changes import (
@@ -16,6 +17,7 @@ from .changes import (
     AlterColumnSetExpression,
     AlterColumnType,
     AlterRole,
+    AlterSequence,
     AlterViewOptions,
     Change,
     CreateCompositeType,
@@ -24,6 +26,7 @@ from .changes import (
     CreateIndex,
     CreatePolicy,
     CreateRole,
+    CreateSequence,
     CreateTable,
     CreateTrigger,
     CreateView,
@@ -41,6 +44,7 @@ from .changes import (
     DropIndex,
     DropNotNull,
     DropPolicy,
+    DropSequence,
     DropTable,
     DropTrigger,
     DropView,
@@ -54,6 +58,7 @@ from .changes import (
     RevokePublicExecute,
     RevokeRoleMembership,
     SetDefault,
+    SetSequenceOwner,
     SetNotNull,
     ValidateConstraint,
     grant_replay_note,
@@ -108,12 +113,18 @@ def compute_diff(
     # - Composite types before functions (functions may use composite types)
     # - Views before functions (functions may SELECT from views, so views
     #   must be updated first when column types change)
+    # - Sequences before tables (a column default calls nextval() on one);
+    #   OWNED BY and sequence drops after tables and views (OWNED BY needs the
+    #   column, and a drop must follow the removal of any default using it)
     changes.extend(_diff_enums(desired, actual))
     changes.extend(_diff_composite_types(desired, actual))
+    sequences_before, sequences_after = _diff_sequences(desired, actual)
+    changes.extend(sequences_before)
     changes.extend(
         _diff_tables(desired, actual, check_data_fn, managed_schemas=schemas)
     )
     changes.extend(_diff_views(desired, actual))
+    changes.extend(sequences_after)
     changes.extend(_diff_functions(desired, actual))
     changes.extend(_diff_indexes(desired, actual))
     changes.extend(_diff_policies(desired, actual))
@@ -803,6 +814,49 @@ def _diff_views(desired: Schema, actual: Schema) -> list[Change]:
             changes.append(DropView(schema=view.schema, view_name=view.name))
 
     return changes
+
+
+def _diff_sequences(
+    desired: Schema, actual: Schema
+) -> tuple[list[Change], list[Change]]:
+    """Diff sequences. Returns (changes before tables, changes after them).
+
+    Creates and option changes go before the tables, so a new table's
+    nextval() default finds its sequence. OWNED BY goes after, because it
+    names a column that may be created in the same run; releasing an old owner
+    goes before, since dropping that owner would drop the sequence. Drops go
+    after too:
+    DROP SEQUENCE has no CASCADE, so a default still using the sequence must
+    already be gone (or the drop fails, which is the point).
+    """
+    before: list[Change] = []
+    after: list[Change] = []
+
+    for key, seq in desired.sequences.items():
+        current = actual.sequences.get(key)
+        if current is None:
+            before.append(CreateSequence(sequence=seq))
+            if seq.owned_by is not None:
+                after.append(SetSequenceOwner(sequence=seq))
+            continue
+        if not seq.options_equal(current):
+            before.append(AlterSequence(sequence=seq))
+        if seq.owned_by != current.owned_by:
+            if current.owned_by is not None:
+                # Release the old owner before the tables change: dropping the
+                # old owning column or table would otherwise take the sequence
+                # with it.
+                before.append(
+                    SetSequenceOwner(sequence=dataclass_replace(seq, owned_by=None))
+                )
+            if seq.owned_by is not None:
+                after.append(SetSequenceOwner(sequence=seq))
+
+    for key, seq in actual.sequences.items():
+        if key not in desired.sequences:
+            after.append(DropSequence(schema=seq.schema, sequence_name=seq.name))
+
+    return before, after
 
 
 def _diff_grants(desired: Schema, actual: Schema) -> list[Change]:
