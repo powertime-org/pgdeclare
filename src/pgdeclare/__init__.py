@@ -23,6 +23,7 @@ from .config import DEFAULT_CONFIG, PgDeclareConfig
 from .models import (
     ChangeCategory,
     Column,
+    Comment,
     Constraint,
     Dependency,
     EnumType,
@@ -97,6 +98,7 @@ __all__ = [
     # Models
     "ChangeCategory",
     "Column",
+    "Comment",
     "Constraint",
     "Dependency",
     "EnumType",

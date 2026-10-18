@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [Unreleased]
+
+### Added
+
+- Comments (`COMMENT ON`) on tables, columns of tables and views, views,
+  functions, indexes, constraints, triggers, policies, and enum and composite
+  types. Declaring a comment creates it, changing the text updates it, and
+  removing the declaration removes it (`IS NULL`). Comments are applied after
+  the DDL and index phases, so a recreated object gets its comment back.
+  Upgrading note: comments in a managed schema that the schema files do not
+  declare are now removed.
+
 ## [0.1.0] - 2026-10-16
 
 First real release: a schema engine proven in production, extracted and made generic.

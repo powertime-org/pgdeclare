@@ -15,6 +15,7 @@ from .quoting import do_block, dollar_tag, quote_ident, quote_literal, role_iden
 from .models import (
     ChangeCategory,
     Column,
+    Comment,
     CompositeType,
     Constraint,
     EnumType,
@@ -1526,3 +1527,38 @@ class RevokeRoleMembership(Change):
 
     def to_sql(self) -> str:
         return f"REVOKE {quote_ident(self.membership.role)} FROM {quote_ident(self.membership.member)};"
+
+
+# =============================================================================
+# Comment Changes
+# =============================================================================
+
+
+@dataclass
+class SetComment(Change):
+    """Set, change or remove (`IS NULL`) the comment on an object.
+
+    The executor runs these in a phase of their own, after the DDL and the
+    concurrent index builds, so the object exists, in its final form, whatever
+    order the retry loop chose and whether or not it was dropped and recreated.
+    """
+
+    comment: Comment = field(
+        default_factory=lambda: Comment(object_type="", schema="", name="", text="")
+    )
+    # True writes `IS NULL`: the declaration was removed.
+    remove: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "COMMENT"
+
+    def __post_init__(self):
+        self.object_name = self.comment.key
+        if not self.description:
+            kind, _, target = self.comment.key.partition(":")
+            verb = "Remove comment on" if self.remove else "Set comment on"
+            self.description = f"{verb} {kind.lower()} {target}"
+
+    def to_sql(self) -> str:
+        text = "NULL" if self.remove else quote_literal(self.comment.text)
+        return f"COMMENT ON {self.comment.target_sql} IS {text};"

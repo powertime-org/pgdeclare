@@ -7,7 +7,7 @@ Dataclasses representing PostgreSQL database objects for schema comparison.
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
-from .quoting import quote_literal
+from .quoting import quote_ident, quote_literal
 
 
 class ChangeCategory(Enum):
@@ -534,6 +534,55 @@ class RoleMembership:
         )
 
 
+# Object kinds that sit on a relation and are named `ON schema.table`.
+_COMMENT_ON_RELATION = frozenset({"CONSTRAINT", "TRIGGER", "POLICY"})
+
+
+@dataclass
+class Comment:
+    """A `COMMENT ON` an object the engine manages.
+
+    `object_type` is the keyword the COMMENT statement uses: TABLE, VIEW,
+    COLUMN, INDEX, FUNCTION, TYPE, CONSTRAINT, TRIGGER or POLICY. `name` is
+    the object itself, or for a column, constraint, trigger or policy the
+    relation it belongs to, with the member in `member`. `args` is a function's
+    identity signature, as `pg_get_function_identity_arguments` prints it.
+    """
+
+    object_type: str
+    schema: str
+    name: str
+    text: str
+    member: str = ""
+    args: str = ""
+
+    @property
+    def key(self) -> str:
+        """Unique key for the commented object (not the text)."""
+        if self.object_type == "FUNCTION":
+            return f"FUNCTION:{self.schema}.{self.name}({self.args})"
+        if self.member:
+            return f"{self.object_type}:{self.schema}.{self.name}.{self.member}"
+        return f"{self.object_type}:{self.schema}.{self.name}"
+
+    @property
+    def target_sql(self) -> str:
+        """The object as written after `COMMENT ON`, every name quoted."""
+        qualified = f"{quote_ident(self.schema)}.{quote_ident(self.name)}"
+        if self.object_type == "FUNCTION":
+            return f"FUNCTION {qualified}({self.args})"
+        if self.object_type == "COLUMN":
+            return f"COLUMN {qualified}.{quote_ident(self.member)}"
+        if self.object_type in _COMMENT_ON_RELATION:
+            return f"{self.object_type} {quote_ident(self.member)} ON {qualified}"
+        return f"{self.object_type} {qualified}"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Comment):
+            return NotImplemented
+        return self.key == other.key and self.text == other.text
+
+
 @dataclass
 class Dependency:
     """Object dependency from pg_depend."""
@@ -569,6 +618,7 @@ class Schema:
     dependencies: list[Dependency] = field(default_factory=list)
     roles: dict[str, Role] = field(default_factory=dict)  # key = role name
     role_memberships: list[RoleMembership] = field(default_factory=list)
+    comments: dict[str, Comment] = field(default_factory=dict)  # key = Comment.key
 
     def get_table(self, schema: str, name: str) -> Optional[Table]:
         """Get table by schema and name."""
@@ -589,6 +639,38 @@ class Schema:
             and g.schema == schema
             and g.object_name == object_name
         ]
+
+    def has_comment_target(self, comment: Comment) -> bool:
+        """Whether the object `comment` is on exists in this schema."""
+        relation = f"{comment.schema}.{comment.name}"
+        kind = comment.object_type
+        if kind == "TABLE":
+            return relation in self.tables
+        if kind == "VIEW":
+            return relation in self.views
+        if kind == "COLUMN":
+            table = self.tables.get(relation)
+            if table is not None:
+                return comment.member in table.columns
+            # View columns are not modelled; a view whose columns change is
+            # recreated, which the differ accounts for.
+            return relation in self.views
+        if kind == "CONSTRAINT":
+            table = self.tables.get(relation)
+            return table is not None and any(
+                c.name == comment.member for c in table.constraints
+            )
+        if kind == "TRIGGER":
+            return f"{relation}.{comment.member}" in self.triggers
+        if kind == "POLICY":
+            return f"{relation}.{comment.member}" in self.policies
+        if kind == "INDEX":
+            return relation in self.indexes
+        if kind == "FUNCTION":
+            return f"{relation}({comment.args})" in self.functions
+        if kind == "TYPE":
+            return relation in self.enums or relation in self.composite_types
+        return False
 
     def get_role(self, name: str) -> Optional[Role]:
         """Get role by name."""
