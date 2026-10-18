@@ -30,6 +30,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import psycopg2
+import psycopg2.errors
 from psycopg2 import sql as pgsql
 
 from . import __version__
@@ -116,7 +117,16 @@ def plan_database(url: str, requested: str | None) -> Iterator[str]:
                 "user; refusing to build in it"
             )
     else:
-        _autocommit(url, pgsql.SQL("CREATE DATABASE {}").format(pgsql.Identifier(name)))
+        try:
+            _autocommit(
+                url, pgsql.SQL("CREATE DATABASE {}").format(pgsql.Identifier(name))
+            )
+        except psycopg2.errors.InsufficientPrivilege as exc:
+            raise CliError(
+                f"cannot create the plan database {name!r}: the role lacks CREATEDB. "
+                "Create one you own on the same server (createdb -O <role> <name>) "
+                "and pass --plan-database <name>"
+            ) from exc
         created = True
     try:
         yield name

@@ -17,6 +17,7 @@ from .models import (
     Column,
     CompositeType,
     Constraint,
+    Domain,
     EnumType,
     Function,
     Grant,
@@ -25,6 +26,7 @@ from .models import (
     Policy,
     Role,
     RoleMembership,
+    Sequence,
     Table,
     Trigger,
     View,
@@ -1136,6 +1138,413 @@ class CreateCompositeType(Change):
 
 
 # =============================================================================
+# Domain Changes
+# =============================================================================
+
+_NOT_VALID_SUFFIX = " NOT VALID"
+
+
+def _domain_ident(schema: str, name: str) -> str:
+    return f"{quote_ident(schema)}.{quote_ident(name)}"
+
+
+def _valid_check(definition: str) -> str:
+    """A CHECK definition without pg_get_constraintdef's NOT VALID marker."""
+    if definition.endswith(_NOT_VALID_SUFFIX):
+        return definition[: -len(_NOT_VALID_SUFFIX)]
+    return definition
+
+
+def _create_domain_sql(domain: Domain) -> str:
+    sql = f"CREATE DOMAIN {_domain_ident(domain.schema, domain.name)} AS {domain.base_type}"
+    if domain.collation:
+        sql += f" COLLATE {domain.collation}"
+    if domain.default is not None:
+        sql += f" DEFAULT {domain.default}"
+    if not domain.nullable:
+        sql += " NOT NULL"
+    for constraint in sorted(domain.constraints, key=lambda c: c.name):
+        sql += f" CONSTRAINT {quote_ident(constraint.name)} {_valid_check(constraint.definition)}"
+    return sql + ";"
+
+
+@dataclass
+class CreateDomain(Change):
+    """Create a domain with its default, NOT NULL and CHECK constraints."""
+
+    domain: Domain = field(
+        default_factory=lambda: Domain(schema="public", name="", base_type="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = self.domain.qualified_name
+        if not self.description:
+            self.description = f"Create domain {self.domain.qualified_name}"
+
+    def to_sql(self) -> str:
+        return _create_domain_sql(self.domain)
+
+
+@dataclass
+class DropDomain(Change):
+    """Drop a domain that is no longer declared.
+
+    Never CASCADE: a column still typed with the domain is dropped or retyped
+    by its own change, and the executor retries this drop until it has been.
+    """
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP DOMAIN IF EXISTS {_domain_ident(self.schema, self.name)};"
+
+
+@dataclass
+class DropAndCreateDomain(Change):
+    """Recreate a domain whose base type or collation changed.
+
+    The differ emits this only when nothing in the database uses the domain,
+    so the plain DROP cannot cascade into data.
+    """
+
+    domain: Domain = field(
+        default_factory=lambda: Domain(schema="public", name="", base_type="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = self.domain.qualified_name
+        if not self.description:
+            self.description = f"Drop and recreate domain {self.domain.qualified_name}"
+
+    def to_sql(self) -> str:
+        drop = f"DROP DOMAIN {_domain_ident(self.domain.schema, self.domain.name)};"
+        return f"{drop}\n{_create_domain_sql(self.domain)}"
+
+
+@dataclass
+class AlterDomainSetDefault(Change):
+    """Set a domain's default."""
+
+    schema: str = "public"
+    name: str = ""
+    default_value: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Set default on domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.name)} SET DEFAULT {self.default_value};"
+
+
+@dataclass
+class AlterDomainDropDefault(Change):
+    """Remove a domain's default."""
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop default on domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.name)} DROP DEFAULT;"
+
+
+@dataclass
+class AlterDomainSetNotNull(Change):
+    """Make a domain NOT NULL (offline: scans every column typed with it)."""
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.OFFLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Set NOT NULL on domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.name)} SET NOT NULL;"
+
+
+@dataclass
+class AlterDomainDropNotNull(Change):
+    """Allow NULL in a domain."""
+
+    schema: str = "public"
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.name}"
+        if not self.description:
+            self.description = f"Drop NOT NULL on domain {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.name)} DROP NOT NULL;"
+
+
+@dataclass
+class AddDomainConstraint(Change):
+    """Add a CHECK constraint to a domain, NOT VALID until validated."""
+
+    schema: str = "public"
+    domain: str = ""
+    constraint: Constraint = field(
+        default_factory=lambda: Constraint(name="", type="c", definition="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.domain}.{self.constraint.name}"
+        if not self.description:
+            self.description = f"Add constraint {self.constraint.name} to domain {self.schema}.{self.domain}"
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER DOMAIN {_domain_ident(self.schema, self.domain)} "
+            f"ADD CONSTRAINT {quote_ident(self.constraint.name)} "
+            f"{_valid_check(self.constraint.definition)}{_NOT_VALID_SUFFIX};"
+        )
+
+
+@dataclass
+class DropDomainConstraint(Change):
+    """Drop a CHECK constraint from a domain."""
+
+    schema: str = "public"
+    domain: str = ""
+    constraint_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.domain}.{self.constraint_name}"
+        if not self.description:
+            self.description = f"Drop constraint {self.constraint_name} from domain {self.schema}.{self.domain}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.domain)} DROP CONSTRAINT IF EXISTS {quote_ident(self.constraint_name)};"
+
+
+@dataclass
+class DropAndCreateDomainConstraint(Change):
+    """Replace a domain CHECK constraint whose definition changed."""
+
+    schema: str = "public"
+    domain: str = ""
+    constraint: Constraint = field(
+        default_factory=lambda: Constraint(name="", type="c", definition="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.domain}.{self.constraint.name}"
+        if not self.description:
+            self.description = f"Drop and recreate constraint {self.constraint.name} on domain {self.schema}.{self.domain}"
+
+    def to_sql(self) -> str:
+        target = _domain_ident(self.schema, self.domain)
+        name = quote_ident(self.constraint.name)
+        drop_sql = f"ALTER DOMAIN {target} DROP CONSTRAINT IF EXISTS {name}"
+        add_sql = f"ALTER DOMAIN {target} ADD CONSTRAINT {name} {_valid_check(self.constraint.definition)}{_NOT_VALID_SUFFIX}"
+        return do_block(f"BEGIN {drop_sql}; {add_sql}; END")
+
+
+@dataclass
+class ValidateDomainConstraint(Change):
+    """Validate a NOT VALID domain constraint against existing data."""
+
+    schema: str = "public"
+    domain: str = ""
+    constraint_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "DOMAIN"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.domain}.{self.constraint_name}"
+        if not self.description:
+            self.description = f"Validate constraint {self.constraint_name} on domain {self.schema}.{self.domain}"
+
+    def to_sql(self) -> str:
+        return f"ALTER DOMAIN {_domain_ident(self.schema, self.domain)} VALIDATE CONSTRAINT {quote_ident(self.constraint_name)};"
+
+
+# =============================================================================
+# Sequence Changes
+# =============================================================================
+
+
+SEQUENCE_TYPES = frozenset({"smallint", "integer", "bigint"})
+
+
+def _sequence_ident(seq: Sequence) -> str:
+    return f"{quote_ident(seq.schema)}.{quote_ident(seq.name)}"
+
+
+def _sequence_options_sql(seq: Sequence) -> str:
+    """Every option, spelled out: the catalog's values, not PostgreSQL's defaults.
+
+    Writing all of them keeps CREATE and ALTER independent of the defaults
+    (which depend on the type and the sign of INCREMENT) and makes an `AS`
+    change unable to move MINVALUE/MAXVALUE behind the declaration's back.
+    """
+    # The type comes from format_type() on the catalog or the plan database;
+    # a sequence can only be one of these, so anything else is refused rather
+    # than written into SQL.
+    if seq.data_type not in SEQUENCE_TYPES:
+        raise ValueError(
+            f"sequence {seq.qualified_name}: unexpected type {seq.data_type!r}"
+        )
+    cycle = "CYCLE" if seq.cycle else "NO CYCLE"
+    return (
+        f"AS {seq.data_type} INCREMENT BY {int(seq.increment)}"
+        f" MINVALUE {int(seq.min_value)} MAXVALUE {int(seq.max_value)}"
+        f" START WITH {int(seq.start)} CACHE {int(seq.cache)} {cycle}"
+    )
+
+
+@dataclass
+class CreateSequence(Change):
+    """Create a sequence. Ownership is a separate SetSequenceOwner change.
+
+    A table's `nextval()` default needs the sequence first, and OWNED BY needs
+    the table first, so the two cannot be one statement.
+    """
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            self.description = f"Create sequence {self.sequence.qualified_name}"
+
+    def to_sql(self) -> str:
+        return f"CREATE SEQUENCE {_sequence_ident(self.sequence)} {_sequence_options_sql(self.sequence)};"
+
+
+@dataclass
+class AlterSequence(Change):
+    """Converge a sequence's options in place.
+
+    Never RESTART: `START WITH` only changes the value a future
+    `ALTER SEQUENCE ... RESTART` would use, so the current value survives.
+    """
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            self.description = (
+                f"Alter options of sequence {self.sequence.qualified_name}"
+            )
+
+    def to_sql(self) -> str:
+        return f"ALTER SEQUENCE {_sequence_ident(self.sequence)} {_sequence_options_sql(self.sequence)};"
+
+
+@dataclass
+class SetSequenceOwner(Change):
+    """`ALTER SEQUENCE ... OWNED BY table.column` (or `OWNED BY NONE`)."""
+
+    sequence: Sequence = field(
+        default_factory=lambda: Sequence(schema="public", name="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = self.sequence.qualified_name
+        if not self.description:
+            owner = self.sequence.owned_by
+            target = ".".join(owner) if owner else "nothing"
+            self.description = (
+                f"Set sequence {self.sequence.qualified_name} owned by {target}"
+            )
+
+    def to_sql(self) -> str:
+        owner = self.sequence.owned_by
+        if owner is None:
+            target = "NONE"
+        else:
+            target = ".".join(quote_ident(part) for part in owner)
+        return f"ALTER SEQUENCE {_sequence_ident(self.sequence)} OWNED BY {target};"
+
+
+@dataclass
+class DropSequence(Change):
+    """Drop a sequence that is no longer declared.
+
+    No CASCADE: if a column default still calls nextval() on it, PostgreSQL
+    refuses and the run fails rather than silently dropping the default. The
+    differ orders this after the table changes, so a default being removed in
+    the same run is gone first. IF EXISTS because dropping the owning table or
+    column already dropped an owned sequence.
+    """
+
+    schema: str = "public"
+    sequence_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SEQUENCE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.sequence_name}"
+        if not self.description:
+            self.description = f"Drop sequence {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP SEQUENCE IF EXISTS {quote_ident(self.schema)}.{quote_ident(self.sequence_name)};"
+
+
+# =============================================================================
 # View Changes
 # =============================================================================
 
@@ -1565,6 +1974,8 @@ class GrantPrivilege(Change):
             return f"GRANT {self.grant.privilege} ({quote_ident(self.grant.column)}) ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         elif self.grant.object_type == "FUNCTION":
             return f"GRANT {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
+        elif self.grant.object_type == "SEQUENCE":
+            return f"GRANT {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
         else:
             return f"GRANT {self.grant.privilege} ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} TO {role_ident(self.grant.grantee)};"
 
@@ -1601,6 +2012,13 @@ class RevokePrivilege(Change):
             revoke_sql = f"REVOKE {self.grant.privilege} ON FUNCTION {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
             return do_block(
                 f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_function THEN NULL; END"
+            )
+        elif self.grant.object_type == "SEQUENCE":
+            # Wrap in DO block: the sequence may have been dropped in this
+            # batch, with its owning table or by DropSequence.
+            revoke_sql = f"REVOKE {self.grant.privilege} ON SEQUENCE {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)}"
+            return do_block(
+                f"BEGIN {revoke_sql}; EXCEPTION WHEN undefined_table THEN NULL; END"
             )
         else:
             return f"REVOKE {self.grant.privilege} ON {quote_ident(self.grant.schema)}.{quote_ident(self.grant.object_name)} FROM {role_ident(self.grant.grantee)};"

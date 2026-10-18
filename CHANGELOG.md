@@ -9,16 +9,11 @@ may change in minor releases.
 
 ### Added
 
-- Materialized views: created `WITH DATA` or `WITH NO DATA` as declared,
-  dropped when no longer declared, storage options (`WITH (fillfactor = 70)`)
-  converged in place. A changed query drops and re-creates the materialized
-  view; that rebuilds its data under a lock readers wait on, so it is offline.
-  The recreate rebuilds the declared indexes and replays the grants to managed
-  roles inside the same statement. Grants on materialized views are now
-  introspected (`information_schema` leaves them out).
-- A recreated view or materialized view takes the views and materialized
-  views that read from it down and builds them back from their declarations in
-  the same statement, instead of failing on `DROP`.
+### Changed
+
+- README: the plan database's privilege needs, the PostgreSQL 14 `public`
+  ownership caveat, a corrected Python example, and a comparison with other
+  tools.
 
 ### Fixed
 
@@ -27,6 +22,15 @@ may change in minor releases.
   a stack of views no longer depends on the order they were listed in.
 - No `REVOKE` is planned on a table, view or materialized view the same run
   drops; it used to fail on the missing relation and leave the run stuck.
+- `serial` and `bigserial` columns on a fresh database: the table's
+  `nextval()` default used to name a sequence that was never created.
+- A managed role that exists nowhere is a clear error naming the role, not a
+  raw `UndefinedObject` traceback from introspection.
+- `apply --dry-run` with pending `@migrate-before` blocks reports drops it
+  cannot rule out (a rename looks like drop plus add) as warnings, instead of
+  failing with a `@drop` error the real run would not raise.
+- A role without `CREATEDB` is told to create a plan database and pass
+  `--plan-database`, instead of a bare permission error.
 
 ## [0.1.0] - 2026-10-16
 
