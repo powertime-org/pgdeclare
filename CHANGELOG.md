@@ -9,6 +9,20 @@ may change in minor releases.
 
 ### Added
 
+- Range types (`CREATE TYPE ... AS RANGE`) in the managed schemas, with
+  their multirange: created with every option (subtype, operator class,
+  collation, canonical and subtype_diff functions, multirange name); dropped
+  and recreated on a change while nothing uses them, otherwise refused naming
+  the dependents; dropped when undeclared, after the columns using them.
+  Comments on them are managed.
+- Collations (`CREATE COLLATION`, libc, ICU and builtin providers) in the
+  managed schemas: created, recreated on a change while nothing uses them
+  (refused naming the dependents otherwise), dropped when undeclared after
+  everything using them. Comments on them are managed.
+- Column collations are compared and converged (`ALTER COLUMN ... TYPE ...
+  COLLATE`), and a new table or column is created with its declared
+  `COLLATE`, which used to be dropped.
+
 ### Changed
 
 - README: the plan database's privilege needs, the PostgreSQL 14 `public`

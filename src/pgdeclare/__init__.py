@@ -22,6 +22,7 @@ __version__ = "0.1.0"
 from .config import DEFAULT_CONFIG, PgDeclareConfig
 from .models import (
     ChangeCategory,
+    Collation,
     Column,
     Comment,
     Constraint,
@@ -33,6 +34,7 @@ from .models import (
     Index,
     MaterializedView,
     Policy,
+    RangeType,
     Role,
     RoleMembership,
     Schema,
@@ -108,6 +110,7 @@ __all__ = [
     "PgDeclareConfig",
     # Models
     "ChangeCategory",
+    "Collation",
     "Column",
     "Comment",
     "Constraint",
@@ -119,6 +122,7 @@ __all__ = [
     "Index",
     "MaterializedView",
     "Policy",
+    "RangeType",
     "Role",
     "RoleMembership",
     "Schema",

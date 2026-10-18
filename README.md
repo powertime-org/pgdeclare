@@ -199,11 +199,13 @@ Within the managed schemas:
 | Object | Create | Change | Drop |
 |--------|--------|--------|------|
 | Tables | yes | via columns and constraints | yes (`@drop` if it holds data) |
-| Columns | yes | type, NOT NULL, default, identity, generated expression | yes (`@drop` if it holds data) |
+| Columns | yes | type, collation, NOT NULL, default, identity, generated expression | yes (`@drop` if it holds data) |
 | Constraints (PK, FK, UNIQUE, CHECK, EXCLUDE) | yes | drop and re-add | yes |
 | Indexes (on tables and materialized views) | yes, `CONCURRENTLY` | drop and re-create | yes |
 | Enum types | yes | add values (in position) | no (values are never removed) |
 | Composite types | yes | no | no |
+| Range types (with their multirange) | yes, with every option (a shell type first when there is a canonical function) | drop and re-create while nothing uses the range or its multirange | yes, after the columns that use it (with its canonical function) |
+| Collations (libc, ICU, builtin) | yes | drop and re-create while nothing uses it | yes, after the columns, domains and ranges that use it |
 | Domains | yes | default, NOT NULL, CHECK constraints; drop and re-create on a base type or collation change while nothing uses it | yes, after the columns that use it |
 | Sequences (standalone and serial; not identity) | yes, with every option | `ALTER SEQUENCE` options (never `RESTART`; the current value is kept); `OWNED BY` | yes, without `CASCADE` (refused while a default still uses it) |
 | Views | yes | drop and re-create; `WITH (...)` options such as `security_invoker` | yes |
@@ -214,9 +216,9 @@ Within the managed schemas:
 | Grants to managed roles | tables, views, materialized views, columns, functions, sequences, schemas | revokes before grants | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
-| Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, indexes, constraints, triggers, policies, enum and composite types | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
+| Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, indexes, constraints, triggers, policies, enum, composite and range types, collations | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
 
-Not managed: extensions, comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: extensions, collation versions (`ALTER COLLATION ... REFRESH VERSION`), comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
 A comment the schema files do not declare is removed, including one added by hand. Comments are written in a phase of their own after the DDL and index builds, so an object dropped and recreated in the same run gets its comment back.
 

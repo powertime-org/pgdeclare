@@ -53,6 +53,7 @@ TRACKED_OBJECT_TYPES = {
     "SCHEMA",
     "TYPE",
     "SEQUENCE",
+    "COLLATION",
 }
 
 # Statement types that are additive/anonymous (not tracked for duplicates)
@@ -279,6 +280,10 @@ def _parse_statement_metadata(
         )
     elif stmt_upper.startswith("CREATE DOMAIN"):
         return _parse_create_domain(
+            raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
+        )
+    elif stmt_upper.startswith("CREATE COLLATION"):
+        return _parse_create_collation(
             raw_sql, sql_for_parsing, source_file, line_number, is_idempotent
         )
     elif stmt_upper.startswith("CREATE EXTENSION"):
@@ -672,8 +677,10 @@ def _parse_create_type(
                 name = stmt.typevar.relname
                 object_name = f"{schema}.{name}"
                 break
-            elif isinstance(stmt, ast.CreateEnumStmt):
-                # Enum type: CREATE TYPE name AS ENUM (...)
+            elif isinstance(stmt, (ast.CreateEnumStmt, ast.CreateRangeStmt)):
+                # Enum or range type: CREATE TYPE name AS ENUM | RANGE (...).
+                # A shell type (CREATE TYPE name;) stays unnamed, so declaring
+                # one before a range with a canonical function is no duplicate.
                 type_parts = []
                 for name_node in stmt.typeName or []:
                     if hasattr(name_node, "sval"):
@@ -729,6 +736,41 @@ def _parse_create_domain(
         raw_sql=raw_sql,
         statement_type="CREATE DOMAIN",
         object_type="TYPE",
+        object_name=object_name,
+        source_file=source_file,
+        line_number=line_number,
+        is_idempotent=is_idempotent,
+    )
+
+
+def _parse_create_collation(
+    raw_sql: str,
+    sql_for_parsing: str,
+    source_file: Optional[str],
+    line_number: int,
+    is_idempotent: bool,
+) -> ParsedStatement:
+    """Parse CREATE COLLATION statement using pglast AST."""
+    object_name = None
+
+    try:
+        tree = parse_sql(sql_for_parsing)
+        for raw_stmt in tree:
+            stmt = raw_stmt.stmt
+            if isinstance(stmt, ast.DefineStmt):
+                parts = [n.sval for n in stmt.defnames or () if hasattr(n, "sval")]
+                if len(parts) == 1:
+                    object_name = f"public.{parts[0]}"
+                elif len(parts) >= 2:
+                    object_name = f"{parts[-2]}.{parts[-1]}"
+                break
+    except Exception:
+        pass  # If pglast fails, PostgreSQL would fail too
+
+    return ParsedStatement(
+        raw_sql=raw_sql,
+        statement_type="CREATE COLLATION",
+        object_type="COLLATION",
         object_name=object_name,
         source_file=source_file,
         line_number=line_number,

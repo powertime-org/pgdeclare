@@ -15,6 +15,7 @@ from .quoting import quote_ident
 from .config import PgDeclareConfig, logger, resolve
 from .models import (
     Column,
+    Collation,
     Comment,
     CompositeType,
     Constraint,
@@ -26,6 +27,7 @@ from .models import (
     Index,
     MaterializedView,
     Policy,
+    RangeType,
     Role,
     RoleMembership,
     Schema,
@@ -99,6 +101,9 @@ def introspect_schema(
 
             domains = _query_domains(conn, schema, cfg.search_path_sql)
             result.domains.update(domains)
+
+            result.ranges.update(_query_ranges(conn, schema, cfg.search_path_sql))
+            result.collations.update(_query_collations(conn, schema))
 
             views = _query_views(conn, schema)
             result.views.update(views)
@@ -206,10 +211,17 @@ def _query_columns(
                 NOT a.attnotnull AS is_nullable,
                 pg_get_expr(d.adbin, d.adrelid) AS column_default,
                 a.attidentity AS identity_type,
-                a.attgenerated AS generated_kind
+                a.attgenerated AS generated_kind,
+                CASE
+                    WHEN a.attcollation <> 0 AND a.attcollation <> ty.typcollation
+                    THEN quote_ident(cn.nspname) || '.' || quote_ident(co.collname)
+                END AS collation
             FROM pg_attribute a
             JOIN pg_class c ON c.oid = a.attrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_type ty ON ty.oid = a.atttypid
+            LEFT JOIN pg_collation co ON co.oid = a.attcollation
+            LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
             LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
             WHERE c.relname = %s
               AND n.nspname = %s
@@ -253,6 +265,7 @@ def _query_columns(
                 default=default,
                 identity=identity,
                 generated=generated,
+                collation=row["collation"],
             )
             columns[col.name] = col
 
@@ -329,6 +342,13 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
                   SELECT 1 FROM pg_depend ext
                   WHERE ext.classid = 'pg_proc'::regclass AND ext.objid = p.oid
                     AND ext.deptype = 'e'
+              )
+              -- A range type's constructor functions are part of the type
+              -- (internal dependency): created and dropped with it.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend own
+                  WHERE own.classid = 'pg_proc'::regclass AND own.objid = p.oid
+                    AND own.refclassid = 'pg_type'::regclass AND own.deptype = 'i'
               )
             ORDER BY p.oid
             """,
@@ -676,6 +696,170 @@ def _query_domains(conn, schema: str, search_path: str = "public") -> dict[str, 
     return domains
 
 
+def _query_ranges(
+    conn, schema: str, search_path: str = "public"
+) -> dict[str, RangeType]:
+    """Query range types (typtype = 'r') from pg_range.
+
+    `search_path` is set first, as for columns, so the subtype is named the
+    way the SQL files wrote it. Options left at their default (the subtype's
+    default operator class and collation, no functions) come back as NULL.
+
+    Dependents cover the range, its multirange and both array types, minus
+    what the type itself owns: the constructor functions and the casts carry
+    an internal dependency on it and go away with it.
+    """
+    ranges: dict[str, RangeType] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SET search_path TO {search_path}")
+        cur.execute(
+            """
+            SELECT
+                t.typname AS range_name,
+                format_type(r.rngsubtype, NULL) AS subtype,
+                CASE WHEN NOT oc.opcdefault
+                    THEN quote_ident(ocn.nspname) || '.' || quote_ident(oc.opcname)
+                END AS subtype_opclass,
+                CASE
+                    WHEN r.rngcollation <> 0 AND r.rngcollation <> st.typcollation
+                    THEN quote_ident(cn.nspname) || '.' || quote_ident(co.collname)
+                END AS collation,
+                quote_ident(pcn.nspname) || '.' || quote_ident(pc.proname)
+                    AS canonical,
+                pcn.nspname || '.' || pc.proname || '('
+                    || pg_get_function_identity_arguments(pc.oid) || ')'
+                    AS canonical_signature,
+                quote_ident(pdn.nspname) || '.' || quote_ident(pd.proname)
+                    AS subtype_diff,
+                quote_ident(mn.nspname) || '.' || quote_ident(mt.typname)
+                    AS multirange_type_name,
+                ARRAY(
+                    SELECT DISTINCT pg_describe_object(d.classid, d.objid, d.objsubid)
+                    FROM pg_depend d
+                    WHERE d.refclassid = 'pg_type'::regclass
+                      AND d.refobjid IN (t.oid, t.typarray, mt.oid, mt.typarray)
+                      AND d.deptype = 'n'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_depend own
+                          WHERE own.classid = d.classid AND own.objid = d.objid
+                            AND own.refclassid = 'pg_type'::regclass
+                            AND own.refobjid IN (t.oid, mt.oid)
+                            AND own.deptype = 'i'
+                      )
+                    ORDER BY 1
+                ) AS dependents
+            FROM pg_range r
+            JOIN pg_type t ON t.oid = r.rngtypid
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            JOIN pg_type st ON st.oid = r.rngsubtype
+            JOIN pg_opclass oc ON oc.oid = r.rngsubopc
+            JOIN pg_namespace ocn ON ocn.oid = oc.opcnamespace
+            JOIN pg_type mt ON mt.oid = r.rngmultitypid
+            JOIN pg_namespace mn ON mn.oid = mt.typnamespace
+            LEFT JOIN pg_collation co ON co.oid = r.rngcollation
+            LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
+            LEFT JOIN pg_proc pc ON pc.oid = r.rngcanonical
+            LEFT JOIN pg_namespace pcn ON pcn.oid = pc.pronamespace
+            LEFT JOIN pg_proc pd ON pd.oid = r.rngsubdiff
+            LEFT JOIN pg_namespace pdn ON pdn.oid = pd.pronamespace
+            WHERE n.nspname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_type'::regclass AND ext.objid = t.oid
+                    AND ext.deptype = 'e'
+              )
+            ORDER BY t.typname
+            """,
+            (schema,),
+        )
+        for row in cur.fetchall():
+            range_type = RangeType(
+                schema=schema,
+                name=row["range_name"],
+                subtype=row["subtype"],
+                subtype_opclass=row["subtype_opclass"],
+                collation=row["collation"],
+                canonical=row["canonical"],
+                subtype_diff=row["subtype_diff"],
+                multirange_type_name=row["multirange_type_name"],
+                dependents=list(row["dependents"] or []),
+                canonical_signature=row["canonical_signature"],
+            )
+            ranges[range_type.qualified_name] = range_type
+
+    return ranges
+
+
+_COLLATION_PROVIDERS = {"c": "libc", "i": "icu", "b": "builtin"}
+
+
+def _query_collations(conn, schema: str) -> dict[str, Collation]:
+    """Query collations from pg_collation.
+
+    Where the locale lives moved between versions (`collcollate` for ICU on
+    14, `colliculocale` on 15 and 16, `colllocale` from 17), so the optional
+    columns are read through to_jsonb(), which yields NULL for a column the
+    server does not have.
+    """
+    collations: dict[str, Collation] = {}
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT
+                co.collname AS collation_name,
+                co.collprovider AS provider,
+                co.collisdeterministic AS deterministic,
+                co.collcollate::text AS lc_collate,
+                co.collctype::text AS lc_ctype,
+                COALESCE(
+                    to_jsonb(co) ->> 'colllocale',
+                    to_jsonb(co) ->> 'colliculocale',
+                    co.collcollate::text
+                ) AS locale,
+                to_jsonb(co) ->> 'collicurules' AS rules,
+                ARRAY(
+                    SELECT pg_describe_object(d.classid, d.objid, d.objsubid)
+                    FROM pg_depend d
+                    WHERE d.refclassid = 'pg_collation'::regclass
+                      AND d.refobjid = co.oid
+                      AND d.deptype = 'n'
+                    ORDER BY 1
+                ) AS dependents
+            FROM pg_collation co
+            JOIN pg_namespace n ON n.oid = co.collnamespace
+            WHERE n.nspname = %s
+              -- Objects an extension owns belong to the extension, not the schema files.
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_depend ext
+                  WHERE ext.classid = 'pg_collation'::regclass
+                    AND ext.objid = co.oid AND ext.deptype = 'e'
+              )
+            ORDER BY co.collname
+            """,
+            (schema,),
+        )
+        for row in cur.fetchall():
+            provider = _COLLATION_PROVIDERS.get(row["provider"]) or row["provider"]
+            libc = provider == "libc"
+            collation = Collation(
+                schema=schema,
+                name=row["collation_name"],
+                provider=provider,
+                locale=None if libc else row["locale"],
+                lc_collate=row["lc_collate"] if libc else None,
+                lc_ctype=row["lc_ctype"] if libc else None,
+                deterministic=row["deterministic"],
+                rules=row["rules"],
+                dependents=list(row["dependents"] or []),
+            )
+            collations[collation.qualified_name] = collation
+
+    return collations
+
+
 def _query_views(conn, schema: str) -> dict[str, View]:
     """Query views from pg_views, plus their reloptions from pg_class.
 
@@ -786,7 +970,15 @@ FROM pg_description d
 JOIN pg_type t ON d.classoid = 'pg_type'::regclass AND d.objoid = t.oid
 JOIN pg_namespace n ON n.oid = t.typnamespace
 WHERE n.nspname = %(schema)s
-  AND t.typtype IN ('e', 'c')
+  AND t.typtype IN ('e', 'c', 'r')
+
+UNION ALL
+SELECT 'COLLATION', co.collname, '', '', d.description
+FROM pg_description d
+JOIN pg_collation co
+  ON d.classoid = 'pg_collation'::regclass AND d.objoid = co.oid
+JOIN pg_namespace n ON n.oid = co.collnamespace
+WHERE n.nspname = %(schema)s
 """
 
 
