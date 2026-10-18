@@ -18,6 +18,8 @@ from .models import (
     Comment,
     CompositeType,
     Constraint,
+    DEFAULT_PRIVILEGE_OBJECT_TYPES,
+    DefaultPrivilege,
     Dependency,
     Domain,
     EnumType,
@@ -129,6 +131,10 @@ def introspect_schema(
         for role in existing_roles:
             schema_grants = _query_schema_grants(conn, role)
             result.grants.extend(schema_grants)
+
+        result.default_privileges = _query_default_privileges(
+            conn, schemas, existing_roles
+        )
 
         # Query memberships for managed roles
         result.role_memberships = _query_role_memberships(conn, managed_roles)
@@ -1391,6 +1397,78 @@ def _query_schema_grants(conn, grantee: str) -> list[Grant]:
                 )
             )
     return grants
+
+
+def _query_default_privileges(
+    conn, schemas: list[str], grantees: list[str]
+) -> list[DefaultPrivilege]:
+    """ALTER DEFAULT PRIVILEGES entries whose grantee is a managed role.
+
+    Entries are read for every schema-less (global) row and for rows in the
+    managed schemas, whoever the target role is.
+
+    A global row holds the whole default ACL for its object type, the built-in
+    one included: the target role's own privileges, and PUBLIC's EXECUTE or
+    USAGE on functions and types. PostgreSQL deletes the row once it equals
+    `acldefault()` again, so the built-in items are left out here. Otherwise a
+    target role that is managed would show its own owner privileges only while
+    some other default privilege kept the row alive, and removing that one
+    would revoke them. A schema row holds only what was granted in it, so it
+    is read as is.
+    """
+    if not grantees:
+        return []
+    privileges: list[DefaultPrivilege] = []
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # acldefault() spells a sequence 's'; pg_default_acl spells it 'S'.
+        cur.execute(
+            """
+            SELECT r.rolname AS target_role,
+                   n.nspname AS schema_name,
+                   d.defaclobjtype::text AS objtype,
+                   a.privilege_type,
+                   g.rolname AS grantee,
+                   a.is_grantable
+            FROM pg_default_acl d
+            JOIN pg_roles r ON r.oid = d.defaclrole
+            LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
+            CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+            JOIN pg_roles g ON g.oid = a.grantee
+            WHERE g.rolname = ANY(%s)
+              AND (d.defaclnamespace = 0 OR n.nspname = ANY(%s))
+              AND NOT (
+                d.defaclnamespace = 0
+                AND EXISTS (
+                  SELECT 1
+                  FROM aclexplode(acldefault(
+                    CASE d.defaclobjtype WHEN 'S' THEN 's' ELSE d.defaclobjtype END,
+                    d.defaclrole
+                  )) b
+                  WHERE b.grantee = a.grantee
+                    AND b.privilege_type = a.privilege_type
+                    AND b.is_grantable = a.is_grantable
+                )
+              )
+            ORDER BY 1, 2 NULLS FIRST, 3, 4, 5
+            """,
+            (list(grantees), list(schemas)),
+        )
+        for row in cur.fetchall():
+            object_type = DEFAULT_PRIVILEGE_OBJECT_TYPES.get(row["objtype"])
+            if object_type is None:
+                # An object type a newer server added; not modelled.
+                continue
+            privileges.append(
+                DefaultPrivilege(
+                    target_role=row["target_role"],
+                    schema=row["schema_name"],
+                    object_type=object_type,
+                    privilege=row["privilege_type"],
+                    grantee=row["grantee"],
+                    grantable=bool(row["is_grantable"]),
+                )
+            )
+    return privileges
 
 
 def _query_dependencies(conn, schemas: list[str]) -> list[Dependency]:

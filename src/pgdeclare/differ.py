@@ -65,10 +65,12 @@ from .changes import (
     DropView,
     EnableRLS,
     ForceRLS,
+    GrantDefaultPrivilege,
     GrantPrivilege,
     GrantRoleMembership,
     NoForceRLS,
     ReplaceFunction,
+    RevokeDefaultPrivilege,
     RevokePrivilege,
     RevokePublicExecute,
     RevokeRoleMembership,
@@ -132,6 +134,16 @@ def compute_diff(
     changes.extend(_diff_roles(desired, actual))
     changes.extend(_diff_role_memberships(desired, actual))
 
+    # Default privileges no longer declared are revoked before anything is
+    # created, and new ones granted after the object grants. An object created
+    # in this run then gets exactly the grants the diff gives it: the plan
+    # database built it with the declared defaults already in force (see
+    # schema_parser), so its grants are in the desired schema either way.
+    default_privilege_revokes, default_privilege_grants = _diff_default_privileges(
+        desired, actual
+    )
+    changes.extend(default_privilege_revokes)
+
     # Diff each object type
     # Order matters for dependency resolution:
     # - Enums before composite types (composite types may reference enums)
@@ -161,6 +173,7 @@ def compute_diff(
     changes.extend(_diff_policies(desired, actual))
     changes.extend(_diff_triggers(desired, actual))
     changes.extend(_diff_grants(desired, actual))
+    changes.extend(default_privilege_grants)
     changes = _skip_revokes_on_dropped_relations(changes)
 
     # Re-apply grants for objects being dropped and recreated.
@@ -1389,6 +1402,28 @@ def _diff_grants(desired: Schema, actual: Schema) -> list[Change]:
         changes.append(GrantPrivilege(grant=desired_by_key[key]))
 
     return changes
+
+
+def _diff_default_privileges(
+    desired: Schema, actual: Schema
+) -> tuple[list[Change], list[Change]]:
+    """Revokes and grants of ALTER DEFAULT PRIVILEGES entries.
+
+    Both sides hold only entries whose grantee is a managed role (see
+    introspection), so an entry for any other grantee is never touched. A
+    change of grant option revokes the privilege and grants it again.
+    """
+    desired_by_key = {p.key: p for p in desired.default_privileges}
+    actual_by_key = {p.key: p for p in actual.default_privileges}
+    revokes: list[Change] = [
+        RevokeDefaultPrivilege(entry=actual_by_key[key])
+        for key in sorted(actual_by_key.keys() - desired_by_key.keys())
+    ]
+    grants: list[Change] = [
+        GrantDefaultPrivilege(entry=desired_by_key[key])
+        for key in sorted(desired_by_key.keys() - actual_by_key.keys())
+    ]
+    return revokes, grants
 
 
 def _diff_roles(desired: Schema, actual: Schema) -> list[Change]:

@@ -16,6 +16,11 @@ may change in minor releases.
   functions they call, and re-created when one of those is dropped. Grants to
   managed roles use `ON PROCEDURE` for procedures, and `COMMENT ON PROCEDURE`
   and `COMMENT ON AGGREGATE` are managed.
+- Default privileges (`ALTER DEFAULT PRIVILEGES [FOR ROLE] [IN SCHEMA] GRANT
+  ... ON TABLES | SEQUENCES | FUNCTIONS | ROUTINES | TYPES | SCHEMAS`) granted
+  to managed roles, schema-less or in a managed schema: declaring grants,
+  removing revokes, a change converges. The plan database runs them before
+  the other statements, so every declared object they cover gets the grant.
 
 ### Changed
 

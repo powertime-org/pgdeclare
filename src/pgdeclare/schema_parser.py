@@ -18,11 +18,12 @@ from typing import Optional
 import psycopg2
 from psycopg2.extensions import make_dsn
 
-from .quoting import quote_ident
+from .quoting import quote_ident, role_ident
 from .config import PgDeclareConfig, logger, resolve
 from .introspection import introspect_schema
-from .models import Schema
+from .models import DEFAULT_PRIVILEGE_OBJECT_TYPES, Schema
 from .statement_parser import (
+    ALTER_DEFAULT_PRIVILEGES,
     ParsedStatement,
     parse_sql_content,
     collect_sql_files_recursive,
@@ -420,6 +421,8 @@ def _apply_to_plan_database(
                     cur.execute(f"GRANT {stock} ON SCHEMA public TO PUBLIC")
 
     if use_retry and statements:
+        _reset_default_privileges(plan_url)
+        statements = _load_default_privileges_first(plan_url, statements, cfg)
         # Use retry-until-stable execution
         logger.info(
             f"Executing {len(statements)} statements with retry-until-stable..."
@@ -443,6 +446,97 @@ def _apply_to_plan_database(
                     conn.rollback()
                     logger.error(f"Failed to apply schema to plan database: {e}")
                     raise
+
+
+# Run ahead of the ALTER DEFAULT PRIVILEGES statements, which need their roles
+# and schemas. SET is run again with the rest (a new session).
+_DEFAULT_PRIVILEGE_PREREQUISITES = frozenset({"CREATE ROLE", "CREATE SCHEMA"})
+
+
+def _load_default_privileges_first(
+    plan_url: str, statements: list[ParsedStatement], config: PgDeclareConfig
+) -> list[ParsedStatement]:
+    """Run the declared ALTER DEFAULT PRIVILEGES before every other object.
+
+    Default privileges act on objects created after them, so in file order a
+    table declared above the statement would miss the grant in the plan while
+    the live database, where the defaults are already in force, gives it. Run
+    first, they reach every declared object, as they do on a database that
+    has had them since its first apply, and the plan no longer depends on the
+    order the statements happen to load in.
+
+    Returns the statements still to run. One that cannot run yet (its role is
+    made by a DO block, say) stays in the list and loads with the rest.
+    """
+    first = [s for s in statements if s.statement_type == ALTER_DEFAULT_PRIVILEGES]
+    if not first:
+        return statements
+    first = [
+        s
+        for s in statements
+        if s.statement_type in _DEFAULT_PRIVILEGE_PREREQUISITES
+        or s.statement_type == "SET"
+    ] + first
+    result = execute_with_retry(plan_url, first, config=config)
+    if result.duplicates:
+        # Load everything in one pass, which reports the duplicates as usual.
+        return statements
+    done = {id(s) for s in first if s.statement_type != "SET"} - {
+        id(f.statement) for f in result.failed_statements
+    }
+    return [s for s in statements if id(s) not in done]
+
+
+def _reset_default_privileges(plan_url: str) -> None:
+    """Put every default ACL in the plan database back to the built-in one.
+
+    A plan database passed in by name persists between runs, and so do its
+    schema-less default privileges (those in a recreated schema go with it).
+    Left in place, a declaration removed from the files would still show in
+    the plan. A row this role cannot alter (it is no member of the target
+    role) is left alone.
+    """
+    with psycopg2.connect(plan_url) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.rolname, n.nspname, d.defaclobjtype::text,
+                       array_agg(DISTINCT coalesce(g.rolname, 'public'))
+                FROM pg_default_acl d
+                JOIN pg_roles r ON r.oid = d.defaclrole
+                LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
+                CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+                LEFT JOIN pg_roles g ON g.oid = a.grantee
+                GROUP BY 1, 2, 3
+                """
+            )
+            rows = cur.fetchall()
+            for role, schema, objtype, grantees in rows:
+                keyword = DEFAULT_PRIVILEGE_OBJECT_TYPES.get(objtype)
+                if keyword is None:
+                    continue
+                prefix = f"ALTER DEFAULT PRIVILEGES FOR ROLE {role_ident(role)}"
+                if schema is not None:
+                    prefix += f" IN SCHEMA {quote_ident(schema)}"
+                sql = [
+                    f"{prefix} REVOKE ALL ON {keyword} FROM {role_ident(g)}"
+                    for g in grantees
+                ]
+                if schema is None:
+                    # The built-in default: the owner's privileges, and PUBLIC
+                    # may execute functions and use types.
+                    sql.append(f"{prefix} GRANT ALL ON {keyword} TO {role_ident(role)}")
+                    if objtype in ("f", "T"):
+                        sql.append(f"{prefix} GRANT ALL ON {keyword} TO PUBLIC")
+                try:
+                    for statement in sql:
+                        cur.execute(statement)
+                except psycopg2.Error as exc:
+                    logger.info(
+                        f"Leaving default privileges for role {role} in the plan "
+                        f"database: {exc}"
+                    )
 
 
 def _replace_db_in_url(connection_string: str, new_db: str) -> str:
