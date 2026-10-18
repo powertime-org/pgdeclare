@@ -103,6 +103,7 @@ Options shared by both commands:
 | `--sql-dir DIR` | `sql` | SQL root; schema files live in `DIR/schemas/` |
 | `--schema NAME` | `public` | A schema to manage; repeat for several |
 | `--role NAME` | none | A role whose definition, memberships and grants are managed; repeatable |
+| `--manage-ownership` | off | Converge object owners the schema files state (see [What it manages](#what-it-manages)) |
 | `--ledger-table SCHEMA.TABLE` | `pgdeclare.applied_migrations` | Where executed blocks are recorded |
 | `--plan-database NAME` | `<db>_pgdeclare_plan_<random>` | Scratch database the declared schema is built in. Never the target database; an existing one must be owned by you and is left in place, otherwise it is created and dropped per run |
 | `-v`, `--verbose` | off | Log the engine's progress |
@@ -113,7 +114,7 @@ Options shared by both commands:
 
 Exit codes: `0` success or nothing to do, `1` error, `2` changes pending (`diff --exit-code` only).
 
-The CLI also creates the managed schemas in the target database and installs any `CREATE EXTENSION` your schema files declare, in both the plan and the target database. The library leaves both to the caller.
+The CLI also creates the managed schemas in the target database and installs any `CREATE EXTENSION` your schema files declare in the plan database; in the target, the diff creates them. The library leaves the managed schemas, and the plan database's extensions, to the caller.
 
 ### Python
 
@@ -178,6 +179,8 @@ SELECT 1;
 
 Columns are named `table.column` or `schema.table.column`; tables `table` or `schema.table`. Empty tables and columns can be dropped without one. `--force` overrides the check.
 
+An extension is never dropped just because its `CREATE EXTENSION` is gone (that would cascade to every column of its types); the run notes it instead. `-- @drop extension:NAME` consents to `DROP EXTENSION NAME`, which still fails while anything uses the extension.
+
 ### `DO` blocks
 
 Top-level `DO $$ ... $$;` blocks in the schema files run on every apply, after the diff. They must be idempotent.
@@ -221,14 +224,21 @@ Within the managed schemas:
 | Default privileges (`ALTER DEFAULT PRIVILEGES`) to managed roles | on tables, sequences, functions, types and schemas; for any target role (`FOR ROLE`, else the connecting role); schema-less or `IN SCHEMA` a managed schema | revoke and re-grant | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
+| Extensions (`CREATE EXTENSION`) | yes, with the `SCHEMA`, `VERSION` and `CASCADE` declared | `ALTER EXTENSION ... UPDATE TO` a declared version; `SET SCHEMA` to a declared schema | only with `@drop extension:NAME`; otherwise noted |
+| Foreign servers | yes, with `TYPE`, `VERSION` and options | `VERSION` and options in place (a new wrapper or `TYPE` is refused) | never dropped |
+| User mappings | yes, with options | options in place; a secret option the declaration omits is left alone | a managed role's mapping on a declared server |
+| Foreign tables | yes, with server, options, columns and column options | columns (type, NOT NULL, default, options) and options in one `ALTER FOREIGN TABLE`; a new server drops and re-creates | yes (no rows live locally, so no `@drop`) |
+| Owners (opt-in, `manage_ownership`) | `ALTER ... OWNER TO` | tables, foreign tables, views, materialized views, sequences, functions, types, domains, managed schemas | no |
 | Rewrite rules (`CREATE RULE`, on tables; never a view's `_RETURN` rule) | yes | `CREATE OR REPLACE RULE`; enabled state | yes |
 | Publications (database-level) | yes: tables, column lists and row filters (15+), `TABLES IN SCHEMA` (15+), `FOR ALL TABLES`, options | `ALTER PUBLICATION ... ADD` / `DROP` members and `SET (...)` options; a member with a new column list or row filter is dropped and added back; drop and re-create to switch `FOR ALL TABLES` | yes, when every table it publishes is managed (see below) |
 | Event triggers (database-level; superuser) | yes, with `WHEN TAG IN` | drop and re-create; enabled state with `ALTER EVENT TRIGGER` | yes, when its function is in a managed schema |
 | Comments (`COMMENT ON`) | tables, columns (of tables and views), views, functions, procedures, aggregates, indexes, constraints, triggers, policies, enum, composite and range types, collations | text; written again after the object is recreated | `IS NULL` when the declaration is removed |
 
-Not managed: extensions, partitions the schema files do not declare, operators, casts, subscriptions (they hold connection strings and secrets, and creating one starts replication), collation versions (`ALTER COLLATION ... REFRESH VERSION`), comments on schemas, domains, sequences, materialized views and other unmanaged objects, ownership, default privileges for grantees that are not managed roles (`PUBLIC` included, so `REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` is not) or that take away a target role's own built-in privileges, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
+Not managed: foreign data wrappers, partitions the schema files do not declare, operators, casts, subscriptions (they hold connection strings and secrets, and creating one starts replication), collation versions (`ALTER COLLATION ... REFRESH VERSION`), comments on schemas, domains, sequences, materialized views and other unmanaged objects, owners not stated in the schema files (or with `manage_ownership` off), default privileges for grantees that are not managed roles (`PUBLIC` included, so `REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` is not) or that take away a target role's own built-in privileges, and anything outside the managed schemas. Tables whose names start with `_` are ignored. Objects owned by an extension are never introspected.
 
 Partitions created at runtime (by pg_partman or a cron job, say) are never dropped. A live partition the schema files do not declare is left in place with everything on it, and `diff` and `apply` print a note naming it (`notes` in `diff --json`); to drop one, write the `DROP TABLE` in a `@migrate-before` block. An index on a partitioned table is created `ON ONLY` the parent, built `CONCURRENTLY` on each partition (the undeclared ones too) and attached, so no partition is locked for the build; a run that dies half way is finished by the next. Postgres has no `ALTER` that turns a table into a partitioned one, back, or changes a partition key: pgdeclare refuses those with an error, and the conversion goes in a `@migrate-before` block. A foreign key on a partitioned table is validated as it is added, which is offline, since PostgreSQL before 18 cannot add one `NOT VALID`.
+
+An owner is managed only when the schema files state it with `ALTER ... OWNER TO`, the owner is a managed role, and `manage_ownership` is on; the role that builds the plan cannot be stated as an owner, since everything it creates is already its own. An owned object's implicit privileges are not diffed as grants to its owner. Sequences linked to a column follow their table's owner.
 
 A comment the schema files do not declare is removed, including one added by hand. Comments are written in a phase of their own after the DDL and index builds, so an object dropped and recreated in the same run gets its comment back.
 
@@ -257,6 +267,7 @@ Everything project-specific is a field of the frozen `PgDeclareConfig`, passed t
 | `plan_recreate_schemas` | `("public",)` | Schemas dropped and recreated in the plan database before each build |
 | `externally_provisioned_schemas` | `()` | `CREATE SCHEMA` for these is skipped when building the plan |
 | `secdef_schemas` | `("public",)` | Schemas whose SECURITY DEFINER functions may be locked |
+| `manage_ownership` | `False` | Converge owners the schema files state with `ALTER ... OWNER TO` (a managed role only); others stay unmanaged |
 | `grant_public_on_created_schemas` | `False` | `GRANT ALL ... TO PUBLIC` on every schema the engine creates (`ensure_schemas`, the plan database). Off by default: anyone who can connect could create objects there |
 | `dry_run` | `False` | Global preview: nothing written, introspection returns an empty schema |
 | `lock` | `nullcontext` | Context-manager factory around every plan build |
@@ -265,7 +276,7 @@ Everything project-specific is a field of the frozen `PgDeclareConfig`, passed t
 | `report` | logger at INFO | Where user-facing progress lines go |
 | `on_migration_applied` | `None` | Called with `(block, connection_string)` after a block runs |
 
-The plan database must be on the same server as the target and must already exist; the library rebuilds `plan_recreate_schemas` in it on every run. `CREATE EXTENSION` statements in schema files are skipped when building the plan, so provision extensions in the plan database yourself (or list them in `bootstrap_sql_files`).
+The plan database must be on the same server as the target and must already exist; the library rebuilds `plan_recreate_schemas` in it on every run, and drops the foreign servers it can (with their user mappings) so a reused plan database keeps none that are no longer declared. `CREATE EXTENSION` statements in schema files are skipped when building the plan, so provision extensions in the plan database yourself (or list them in `bootstrap_sql_files`); the declarations are read from the files, and the diff creates them in the target.
 
 ## Safety
 
@@ -280,6 +291,7 @@ The plan database must be on the same server as the target and must already exis
 - **Transactions.** Enum changes commit first (Postgres requires it); the rest of the DDL runs in one transaction with savepoints, so a stuck run changes nothing. Index builds run `CONCURRENTLY` afterwards; an invalid index left by a failed build is dropped and retried.
 - **Names are data.** Every identifier written into SQL is quoted with its embedded quotes doubled, every literal escaped, and `DO` blocks use a dollar tag their body cannot contain, so an object name chosen by a less privileged role cannot inject SQL into the migrator's session.
 - **Passwords are not shown.** A role password declared in the schema files is executed but masked as `PASSWORD '***'` in `diff`, `diff --json`, dry-run output and logs (`Change.to_display_sql()`). Roles are cluster-wide, so building the plan database on the same server creates declared roles there too.
+- **User-mapping options are not shown.** Their values may hold a password, so every option value except `user` and `password_required` is masked as `'***'` in the same places, and in the statements `--prove` reports; plan descriptions name the options, never their values. A secret option the declaration does not set (a password provisioned by hand, say) is left as it is on the target.
 - **Convergence check.** After applying, the database is diffed again. Anything left over fails the run, because one run must reach the declared schema.
 
 ## Supported PostgreSQL versions

@@ -23,10 +23,14 @@ from .models import (
     Domain,
     EnumType,
     EventTrigger,
+    Extension,
+    ForeignServer,
+    ForeignTable,
     Function,
     Grant,
     Index,
     MaterializedView,
+    ObjectOwner,
     Policy,
     RangeType,
     Publication,
@@ -37,9 +41,13 @@ from .models import (
     Sequence,
     Table,
     Trigger,
+    UserMapping,
     View,
     routine_args_sql,
     routine_keyword,
+    alter_fdw_options_sql,
+    fdw_options_sql,
+    option_names_changed,
 )
 
 
@@ -3316,3 +3324,460 @@ class ReplacePublicationTable(Change):
         )
         body = _drop_publication_table_body(self.name, self.table)
         return do_block(f"BEGIN {body} EXECUTE {quote_literal(add)}; END")
+
+
+# =============================================================================
+# Extension Changes
+# =============================================================================
+
+
+@dataclass
+class CreateExtension(Change):
+    """`CREATE EXTENSION`, with the schema and version the declaration names."""
+
+    extension: Extension = field(default_factory=lambda: Extension(name=""))
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EXTENSION"
+
+    def __post_init__(self):
+        self.object_name = self.extension.name
+        if not self.description:
+            self.description = f"Create extension {self.extension.name}"
+
+    def to_sql(self) -> str:
+        ext = self.extension
+        sql = f"CREATE EXTENSION IF NOT EXISTS {quote_ident(ext.name)}"
+        if ext.schema is not None:
+            sql += f" WITH SCHEMA {quote_ident(ext.schema)}"
+        if ext.version is not None:
+            sql += f" VERSION {quote_literal(ext.version)}"
+        if ext.cascade:
+            sql += " CASCADE"
+        return sql + ";"
+
+
+@dataclass
+class AlterExtensionUpdate(Change):
+    """`ALTER EXTENSION ... UPDATE TO` the declared version."""
+
+    name: str = ""
+    version: str = ""
+    current_version: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EXTENSION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = (
+                f"Update extension {self.name} from {self.current_version} "
+                f"to {self.version}"
+            )
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER EXTENSION {quote_ident(self.name)} "
+            f"UPDATE TO {quote_literal(self.version)};"
+        )
+
+
+@dataclass
+class AlterExtensionSchema(Change):
+    """`ALTER EXTENSION ... SET SCHEMA` (relocatable extensions only)."""
+
+    name: str = ""
+    schema: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EXTENSION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = f"Move extension {self.name} to schema {self.schema}"
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER EXTENSION {quote_ident(self.name)} "
+            f"SET SCHEMA {quote_ident(self.schema)};"
+        )
+
+
+@dataclass
+class DropExtension(Change):
+    """Drop an extension a `-- @drop extension:NAME` directive consents to.
+
+    Never CASCADE: while a column, function or view still uses one of the
+    extension's objects, PostgreSQL refuses, and the run fails rather than
+    dropping data along with it.
+    """
+
+    name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "EXTENSION"
+
+    def __post_init__(self):
+        self.object_name = self.name
+        if not self.description:
+            self.description = (
+                f"Drop extension {self.name} (@drop extension:{self.name})"
+            )
+
+    def to_sql(self) -> str:
+        return f"DROP EXTENSION IF EXISTS {quote_ident(self.name)};"
+
+
+# =============================================================================
+# Foreign Data Changes
+# =============================================================================
+
+
+def _server_ident(name: str) -> str:
+    return quote_ident(name)
+
+
+@dataclass
+class CreateForeignServer(Change):
+    """`CREATE SERVER ... FOREIGN DATA WRAPPER ... OPTIONS (...)`."""
+
+    server: ForeignServer = field(
+        default_factory=lambda: ForeignServer(name="", fdw="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SERVER"
+
+    def __post_init__(self):
+        self.object_name = self.server.name
+        if not self.description:
+            self.description = (
+                f"Create server {self.server.name} (foreign data wrapper "
+                f"{self.server.fdw})"
+            )
+
+    def to_sql(self) -> str:
+        srv = self.server
+        sql = f"CREATE SERVER {_server_ident(srv.name)}"
+        if srv.type is not None:
+            sql += f" TYPE {quote_literal(srv.type)}"
+        if srv.version is not None:
+            sql += f" VERSION {quote_literal(srv.version)}"
+        sql += f" FOREIGN DATA WRAPPER {quote_ident(srv.fdw)}"
+        options = fdw_options_sql(srv.options)
+        if options:
+            sql += f" {options}"
+        return sql + ";"
+
+
+@dataclass
+class AlterForeignServer(Change):
+    """`ALTER SERVER ... [VERSION ...] OPTIONS (ADD/SET/DROP ...)`."""
+
+    server: ForeignServer = field(
+        default_factory=lambda: ForeignServer(name="", fdw="")
+    )
+    current_options: dict[str, str] = field(default_factory=dict)
+    # Write VERSION: the declaration names one the server does not have.
+    set_version: bool = False
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "SERVER"
+
+    def __post_init__(self):
+        self.object_name = self.server.name
+        if not self.description:
+            what: list[str] = []
+            if self.set_version:
+                what.append("version")
+            if alter_fdw_options_sql(self.server.options, self.current_options):
+                what.append("options")
+            self.description = (
+                f"Alter {' and '.join(what) or 'nothing'} of server {self.server.name}"
+            )
+
+    def to_sql(self) -> str:
+        sql = f"ALTER SERVER {_server_ident(self.server.name)}"
+        if self.set_version and self.server.version is not None:
+            sql += f" VERSION {quote_literal(self.server.version)}"
+        options = alter_fdw_options_sql(self.server.options, self.current_options)
+        if options:
+            sql += f" {options}"
+        return sql + ";"
+
+
+@dataclass
+class CreateUserMapping(Change):
+    """`CREATE USER MAPPING FOR ... SERVER ... OPTIONS (...)`.
+
+    Options may hold a password, so the display SQL masks every value but
+    the ones listed in USER_MAPPING_PUBLIC_OPTIONS.
+    """
+
+    mapping: UserMapping = field(
+        default_factory=lambda: UserMapping(server="", user="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "USER MAPPING"
+
+    def __post_init__(self):
+        self.object_name = f"{self.mapping.user}@{self.mapping.server}"
+        if not self.description:
+            self.description = f"Create user mapping for {self.mapping.label}"
+
+    def to_sql(self) -> str:
+        return self._sql(mask=False)
+
+    def to_display_sql(self) -> str:
+        return self._sql(mask=True)
+
+    def _sql(self, mask: bool) -> str:
+        m = self.mapping
+        sql = f"CREATE USER MAPPING FOR {m.user_sql} SERVER {_server_ident(m.server)}"
+        masked = m.secret_options if mask else frozenset()
+        options = fdw_options_sql(m.options or {}, masked)
+        if options:
+            sql += f" {options}"
+        return sql + ";"
+
+
+@dataclass
+class AlterUserMapping(Change):
+    """`ALTER USER MAPPING ... OPTIONS (ADD/SET/DROP ...)`, values masked for display."""
+
+    mapping: UserMapping = field(
+        default_factory=lambda: UserMapping(server="", user="")
+    )
+    current_options: dict[str, str] = field(default_factory=dict)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "USER MAPPING"
+
+    def __post_init__(self):
+        self.object_name = f"{self.mapping.user}@{self.mapping.server}"
+        if not self.description:
+            names = option_names_changed(
+                self.mapping.options or {}, self.current_options
+            )
+            self.description = (
+                f"Alter options ({', '.join(names)}) of user mapping for "
+                f"{self.mapping.label}"
+            )
+
+    def to_sql(self) -> str:
+        return self._sql(mask=False)
+
+    def to_display_sql(self) -> str:
+        return self._sql(mask=True)
+
+    def _sql(self, mask: bool) -> str:
+        m = self.mapping
+        masked = m.secret_options if mask else frozenset()
+        options = alter_fdw_options_sql(m.options or {}, self.current_options, masked)
+        return (
+            f"ALTER USER MAPPING FOR {m.user_sql} SERVER {_server_ident(m.server)} "
+            f"{options};"
+        )
+
+
+@dataclass
+class DropUserMapping(Change):
+    """Drop a managed role's user mapping that is no longer declared."""
+
+    mapping: UserMapping = field(
+        default_factory=lambda: UserMapping(server="", user="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "USER MAPPING"
+
+    def __post_init__(self):
+        self.object_name = f"{self.mapping.user}@{self.mapping.server}"
+        if not self.description:
+            self.description = f"Drop user mapping for {self.mapping.label}"
+
+    def to_sql(self) -> str:
+        m = self.mapping
+        return f"DROP USER MAPPING IF EXISTS FOR {m.user_sql} SERVER {_server_ident(m.server)};"
+
+
+def _foreign_table_ident(schema: str, name: str) -> str:
+    return f"{quote_ident(schema)}.{quote_ident(name)}"
+
+
+def foreign_column_sql(column: Column, options: Optional[dict[str, str]]) -> str:
+    """One column of a CREATE FOREIGN TABLE or an ADD COLUMN."""
+    sql = f"{quote_ident(column.name)} {column.type}"
+    rendered = fdw_options_sql(options or {})
+    if rendered:
+        sql += f" {rendered}"
+    if not column.nullable:
+        sql += " NOT NULL"
+    if column.generated:
+        sql += f" GENERATED ALWAYS AS ({column.generated}) STORED"
+    elif column.default:
+        sql += f" DEFAULT {column.default}"
+    return sql
+
+
+def _create_foreign_table_sql(table: ForeignTable) -> str:
+    """`CREATE FOREIGN TABLE ... SERVER ... OPTIONS (...)` (no trailing `;`)."""
+    columns = ",\n".join(
+        f"    {foreign_column_sql(col, table.column_options.get(col.name))}"
+        for col in table.columns.values()
+    )
+    sql = (
+        f"CREATE FOREIGN TABLE {_foreign_table_ident(table.schema, table.name)} "
+        f"(\n{columns}\n) SERVER {_server_ident(table.server)}"
+    )
+    options = fdw_options_sql(table.options)
+    if options:
+        sql += f" {options}"
+    return sql
+
+
+@dataclass
+class CreateForeignTable(Change):
+    """Create a foreign table with its columns, server and options."""
+
+    table: ForeignTable = field(
+        default_factory=lambda: ForeignTable(schema="public", name="", server="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "FOREIGN TABLE"
+
+    def __post_init__(self):
+        self.object_name = self.table.qualified_name
+        if not self.description:
+            self.description = (
+                f"Create foreign table {self.table.qualified_name} "
+                f"on server {self.table.server}"
+            )
+
+    def to_sql(self) -> str:
+        return _create_foreign_table_sql(self.table) + ";"
+
+
+@dataclass
+class AlterForeignTable(Change):
+    """One `ALTER FOREIGN TABLE` carrying every column and option action.
+
+    A foreign table holds no rows locally, so adding, dropping and retyping
+    columns only changes the catalog; none of it needs `--offline` or `@drop`.
+    `actions` are rendered, quoted SQL fragments built by the differ.
+    """
+
+    schema: str = "public"
+    table_name: str = ""
+    actions: list[str] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "FOREIGN TABLE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table_name}"
+        if not self.description:
+            self.description = f"Alter foreign table {self.object_name}"
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER FOREIGN TABLE {_foreign_table_ident(self.schema, self.table_name)} "
+            + ", ".join(self.actions)
+            + ";"
+        )
+
+
+@dataclass
+class DropForeignTable(Change):
+    """Drop an undeclared foreign table. No rows live locally, so no `@drop`.
+
+    No CASCADE: a view still reading from it makes PostgreSQL refuse, which
+    the executor retries while that view is dropped in the same run.
+    """
+
+    schema: str = "public"
+    table_name: str = ""
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "FOREIGN TABLE"
+
+    def __post_init__(self):
+        self.object_name = f"{self.schema}.{self.table_name}"
+        if not self.description:
+            self.description = f"Drop foreign table {self.object_name}"
+
+    def to_sql(self) -> str:
+        return f"DROP FOREIGN TABLE IF EXISTS {_foreign_table_ident(self.schema, self.table_name)};"
+
+
+@dataclass
+class DropAndCreateForeignTable(Change):
+    """Recreate a foreign table whose server changed (there is no ALTER for it).
+
+    The drop, the create and the replayed grants are one DO block, for the
+    reason DropAndCreateView gives.
+    """
+
+    table: ForeignTable = field(
+        default_factory=lambda: ForeignTable(schema="public", name="", server="")
+    )
+    grants: list[Grant] = field(default_factory=list)
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "FOREIGN TABLE"
+
+    def __post_init__(self):
+        self.object_name = self.table.qualified_name
+        if not self.description:
+            self.description = (
+                f"Drop and recreate foreign table {self.table.qualified_name} "
+                f"on server {self.table.server}"
+            )
+
+    def to_sql(self) -> str:
+        t = self.table
+        inner = (
+            f"DROP FOREIGN TABLE IF EXISTS {_foreign_table_ident(t.schema, t.name)};"
+        )
+        inner += _execute_sql(_create_foreign_table_sql(t))
+        inner += _replay_grants_sql(self.grants)
+        return do_block(f"BEGIN {inner} END")
+
+
+# =============================================================================
+# Ownership Changes
+# =============================================================================
+
+
+@dataclass
+class AlterOwner(Change):
+    """`ALTER <kind> ... OWNER TO role`, for an owner the schema files state.
+
+    The executor runs these after the DDL and index phases, with the comments,
+    so an object created or recreated in this run already exists in its final
+    form (a recreate resets the owner to the migrating role).
+    """
+
+    owner: ObjectOwner = field(
+        default_factory=lambda: ObjectOwner(kind="TABLE", schema="", name="", owner="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "OWNER"
+
+    def __post_init__(self):
+        self.object_name = self.owner.key
+        if not self.description:
+            kind, _, target = self.owner.key.partition(":")
+            self.description = (
+                f"Set owner of {kind.lower()} {target} to {self.owner.owner}"
+            )
+
+    def to_sql(self) -> str:
+        return (
+            f"ALTER {self.owner.target_sql} OWNER TO {quote_ident(self.owner.owner)};"
+        )

@@ -966,6 +966,203 @@ class Comment:
         return self.key == other.key and self.text == other.text
 
 
+def parse_options(raw: Optional[list[str]]) -> dict[str, str]:
+    """A catalog `OPTIONS` array (`{name=value,...}`) as a dict, in order."""
+    options: dict[str, str] = {}
+    for item in raw or []:
+        name, _, value = item.partition("=")
+        options[name] = value
+    return options
+
+
+def fdw_options_sql(
+    options: dict[str, str], masked: frozenset[str] = frozenset()
+) -> str:
+    """`OPTIONS (name 'value', ...)`, or `""` when there are none.
+
+    The value of every option named in `masked` is written as `'***'`.
+    """
+    if not options:
+        return ""
+    parts = [
+        f"{quote_ident(name)} {quote_literal('***' if name in masked else value)}"
+        for name, value in options.items()
+    ]
+    return f"OPTIONS ({', '.join(parts)})"
+
+
+def alter_fdw_options_sql(
+    desired: dict[str, str],
+    actual: dict[str, str],
+    masked: frozenset[str] = frozenset(),
+) -> str:
+    """`OPTIONS (ADD ..., SET ..., DROP ...)` turning `actual` into `desired`.
+
+    Returns `""` when the two are equal. Values of options in `masked` are
+    written as `'***'`.
+    """
+    parts: list[str] = []
+    for name, value in desired.items():
+        shown = quote_literal("***" if name in masked else value)
+        if name not in actual:
+            parts.append(f"ADD {quote_ident(name)} {shown}")
+        elif actual[name] != value:
+            parts.append(f"SET {quote_ident(name)} {shown}")
+    for name in actual:
+        if name not in desired:
+            parts.append(f"DROP {quote_ident(name)}")
+    if not parts:
+        return ""
+    return f"OPTIONS ({', '.join(parts)})"
+
+
+def option_names_changed(desired: dict[str, str], actual: dict[str, str]) -> list[str]:
+    """Names of the options that differ, for plan descriptions (never values)."""
+    names = {n for n in desired if actual.get(n) != desired[n]}
+    names |= {n for n in actual if n not in desired}
+    return sorted(names)
+
+
+@dataclass
+class Extension:
+    """An extension declared with `CREATE EXTENSION`, or installed in a database.
+
+    On the declared side `schema` and `version` are None unless the statement
+    names them (`WITH SCHEMA`, `VERSION`): an unstated one is not compared, so
+    a database on an older version of an extension is not updated behind the
+    declaration's back. On the introspected side both are always set.
+    """
+
+    name: str
+    schema: Optional[str] = None
+    version: Optional[str] = None
+    cascade: bool = False
+
+
+@dataclass
+class ForeignServer:
+    """A foreign server (`CREATE SERVER ... FOREIGN DATA WRAPPER ...`)."""
+
+    name: str
+    fdw: str
+    type: Optional[str] = None
+    version: Optional[str] = None
+    options: dict[str, str] = field(default_factory=dict)
+
+
+# User-mapping options whose values are not secret. Every other option (a
+# `password` above all) is masked in plan output and logs, and left alone on
+# the target when the declaration does not set it, so a password provisioned by
+# hand outside the schema files survives.
+USER_MAPPING_PUBLIC_OPTIONS = frozenset({"user", "password_required"})
+
+
+@dataclass
+class UserMapping:
+    """A user mapping (`CREATE USER MAPPING FOR user SERVER server`).
+
+    `user` is the role name, or `public` for `FOR PUBLIC`. `options` is None
+    when the connecting role is not allowed to read them (pg_user_mappings
+    hides them); then they are not compared.
+    """
+
+    server: str
+    user: str
+    options: Optional[dict[str, str]] = field(default_factory=dict)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.server, self.user)
+
+    @property
+    def secret_options(self) -> frozenset[str]:
+        """Names of the options whose values are masked for display."""
+        return frozenset(
+            n for n in (self.options or {}) if n not in USER_MAPPING_PUBLIC_OPTIONS
+        )
+
+    @property
+    def user_sql(self) -> str:
+        """The mapped user as written after FOR: `PUBLIC` or a quoted role."""
+        return "PUBLIC" if self.user == "public" else quote_ident(self.user)
+
+    @property
+    def label(self) -> str:
+        return f"{self.user} on server {self.server}"
+
+
+@dataclass
+class ForeignTable:
+    """A foreign table (relkind 'f') in a managed schema.
+
+    `column_options` holds each column's `OPTIONS (...)` (postgres_fdw's
+    `column_name`, say), keyed by column name; columns without options are
+    absent.
+    """
+
+    schema: str
+    name: str
+    server: str
+    columns: dict[str, Column] = field(default_factory=dict)
+    options: dict[str, str] = field(default_factory=dict)
+    column_options: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+# The keyword `ALTER <kind> ... OWNER TO` takes for each owner kind.
+OWNER_KINDS = frozenset(
+    {
+        "TABLE",
+        "FOREIGN TABLE",
+        "VIEW",
+        "MATERIALIZED VIEW",
+        "SEQUENCE",
+        "FUNCTION",
+        "TYPE",
+        "DOMAIN",
+        "SCHEMA",
+    }
+)
+
+
+@dataclass
+class ObjectOwner:
+    """The owner of a managed object (`pg_class.relowner` and friends).
+
+    `kind` is one of OWNER_KINDS. A schema has its name in `name` and an
+    empty `schema`; a function carries its identity arguments in `args`.
+    """
+
+    kind: str
+    schema: str
+    name: str
+    owner: str
+    args: str = ""
+
+    @property
+    def key(self) -> str:
+        if self.kind == "SCHEMA":
+            return f"SCHEMA:{self.name}"
+        if self.kind == "FUNCTION":
+            return f"FUNCTION:{self.schema}.{self.name}({self.args})"
+        return f"{self.kind}:{self.schema}.{self.name}"
+
+    @property
+    def target_sql(self) -> str:
+        """The object as written after `ALTER`, every name quoted."""
+        if self.kind not in OWNER_KINDS:
+            raise ValueError(f"unexpected owner kind {self.kind!r}")
+        if self.kind == "SCHEMA":
+            return f"SCHEMA {quote_ident(self.name)}"
+        qualified = f"{quote_ident(self.schema)}.{quote_ident(self.name)}"
+        if self.kind == "FUNCTION":
+            return f"FUNCTION {qualified}({self.args})"
+        return f"{self.kind} {qualified}"
+
+
 @dataclass
 class Dependency:
     """Object dependency from pg_depend."""
@@ -1024,6 +1221,24 @@ class Schema:
     # the differ decides which of them it may touch.
     publications: dict[str, Publication] = field(default_factory=dict)  # key = name
     event_triggers: dict[str, EventTrigger] = field(default_factory=dict)  # key = name
+    # Extensions: on the declared side, the CREATE EXTENSION statements of the
+    # schema files; on the live side, every installed extension.
+    extensions: dict[str, Extension] = field(default_factory=dict)  # key = name
+    # Extensions a `-- @drop extension:NAME` directive consents to dropping.
+    extension_drops: set[str] = field(default_factory=set)
+    foreign_servers: dict[str, ForeignServer] = field(
+        default_factory=dict
+    )  # key = server name
+    user_mappings: dict[tuple[str, str], UserMapping] = field(
+        default_factory=dict
+    )  # key = (server, user)
+    foreign_tables: dict[str, ForeignTable] = field(
+        default_factory=dict
+    )  # key = schema.table
+    # Owners, filled only with `PgDeclareConfig.manage_ownership`. On the
+    # declared side only owners the schema files state (a managed role other
+    # than the role building the plan) are kept.
+    owners: dict[str, ObjectOwner] = field(default_factory=dict)  # key = .key
 
     def get_table(self, schema: str, name: str) -> Optional[Table]:
         """Get table by schema and name."""
@@ -1083,6 +1298,29 @@ class Schema:
         if kind == "COLLATION":
             return relation in self.collations
         return False
+
+    def has_owner_target(self, owner: ObjectOwner) -> bool:
+        """Whether the object `owner` describes is one this schema models."""
+        relation = f"{owner.schema}.{owner.name}"
+        kind = owner.kind
+        if kind == "TABLE":
+            return relation in self.tables
+        if kind == "FOREIGN TABLE":
+            return relation in self.foreign_tables
+        if kind == "VIEW":
+            return relation in self.views
+        if kind == "MATERIALIZED VIEW":
+            return relation in self.materialized_views
+        if kind == "SEQUENCE":
+            return relation in self.sequences
+        if kind == "FUNCTION":
+            return f"{relation}({owner.args})" in self.functions
+        if kind == "TYPE":
+            return relation in self.enums or relation in self.composite_types
+        if kind == "DOMAIN":
+            return relation in self.domains
+        # Schemas: the caller only asks about managed ones.
+        return kind == "SCHEMA"
 
     def get_role(self, name: str) -> Optional[Role]:
         """Get role by name."""

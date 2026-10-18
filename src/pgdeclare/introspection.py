@@ -26,10 +26,14 @@ from .models import (
     Domain,
     EnumType,
     EventTrigger,
+    Extension,
+    ForeignServer,
+    ForeignTable,
     Function,
     Grant,
     Index,
     MaterializedView,
+    ObjectOwner,
     Policy,
     RangeType,
     Publication,
@@ -41,7 +45,9 @@ from .models import (
     Sequence,
     Table,
     Trigger,
+    UserMapping,
     View,
+    parse_options,
 )
 
 
@@ -123,6 +129,10 @@ def introspect_schema(
             sequences = _query_sequences(conn, schema)
             result.sequences.update(sequences)
 
+            result.foreign_tables.update(
+                _query_foreign_tables(conn, schema, cfg.search_path_sql)
+            )
+
             for role in existing_roles:
                 grants = _query_grants(conn, schema, role)
                 result.grants.extend(grants)
@@ -134,6 +144,17 @@ def introspect_schema(
             for comment in _query_comments(conn, schema):
                 if result.has_comment_target(comment):
                     result.comments[comment.key] = comment
+
+        # Database-wide objects: extensions, foreign servers, user mappings.
+        result.extensions = _query_extensions(conn)
+        result.foreign_servers = _query_foreign_servers(conn)
+        result.user_mappings = _query_user_mappings(conn)
+
+        if cfg.manage_ownership:
+            # Like comments: only owners of objects introspected above.
+            for owner in _query_owners(conn, schemas):
+                if result.has_owner_target(owner):
+                    result.owners[owner.key] = owner
 
         # Query dependencies (cross-schema)
         result.dependencies = _query_dependencies(conn, schemas)
@@ -2098,3 +2119,237 @@ def _query_role_memberships(conn, role_names: list[str]) -> list[RoleMembership]
             memberships.append(membership)
 
     return memberships
+
+
+# Objects an extension owns are part of the extension, never the schema files.
+_NOT_EXTENSION_MEMBER = """
+    NOT EXISTS (
+        SELECT 1 FROM pg_depend ext
+        WHERE ext.classid = '{catalog}'::regclass AND ext.objid = {oid}
+          AND ext.deptype = 'e'
+    )
+"""
+
+
+def _query_extensions(conn) -> dict[str, Extension]:
+    """Every extension installed in the database, with its schema and version."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT e.extname, n.nspname, e.extversion
+            FROM pg_extension e
+            JOIN pg_namespace n ON n.oid = e.extnamespace
+            ORDER BY e.extname
+            """
+        )
+        return {
+            row["extname"]: Extension(
+                name=row["extname"], schema=row["nspname"], version=row["extversion"]
+            )
+            for row in cur.fetchall()
+        }
+
+
+def _query_foreign_servers(conn) -> dict[str, ForeignServer]:
+    """Foreign servers, other than those an extension owns."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT s.srvname, w.fdwname, s.srvtype, s.srvversion, s.srvoptions
+            FROM pg_foreign_server s
+            JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw
+            WHERE {_NOT_EXTENSION_MEMBER.format(catalog="pg_foreign_server", oid="s.oid")}
+            ORDER BY s.srvname
+            """
+        )
+        return {
+            row["srvname"]: ForeignServer(
+                name=row["srvname"],
+                fdw=row["fdwname"],
+                type=row["srvtype"],
+                version=row["srvversion"],
+                options=parse_options(row["srvoptions"]),
+            )
+            for row in cur.fetchall()
+        }
+
+
+def _query_user_mappings(conn) -> dict[tuple[str, str], UserMapping]:
+    """User mappings on the servers `_query_foreign_servers` reads.
+
+    pg_user_mappings hides the options from a role that is neither the mapped
+    user nor allowed to use the server's owner (nor a superuser). Those
+    mappings come back with `options=None`, using the view's own visibility
+    rule, so that hidden options are not mistaken for none.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                um.srvname,
+                um.usename,
+                um.umoptions,
+                (
+                    (um.umuser <> 0 AND um.usename = current_user
+                     AND (pg_has_role(s.srvowner, 'USAGE')
+                          OR has_server_privilege(s.oid, 'USAGE')))
+                    OR (um.umuser = 0 AND pg_has_role(s.srvowner, 'USAGE'))
+                    OR COALESCE(
+                        (SELECT rolsuper FROM pg_roles WHERE rolname = current_user),
+                        false
+                    )
+                ) AS options_visible
+            FROM pg_user_mappings um
+            JOIN pg_foreign_server s ON s.oid = um.srvid
+            WHERE {_NOT_EXTENSION_MEMBER.format(catalog="pg_foreign_server", oid="s.oid")}
+            ORDER BY um.srvname, um.usename
+            """
+        )
+        mappings: dict[tuple[str, str], UserMapping] = {}
+        for row in cur.fetchall():
+            mapping = UserMapping(
+                server=row["srvname"],
+                user=row["usename"],
+                options=(
+                    parse_options(row["umoptions"]) if row["options_visible"] else None
+                ),
+            )
+            mappings[mapping.key] = mapping
+        return mappings
+
+
+def _query_foreign_tables(
+    conn, schema: str, search_path: str = "public"
+) -> dict[str, ForeignTable]:
+    """Foreign tables in `schema`, with their columns and options."""
+    tables: dict[str, ForeignTable] = {}
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SET search_path TO {search_path}")
+        cur.execute(
+            f"""
+            SELECT c.oid, c.relname, s.srvname, ft.ftoptions
+            FROM pg_foreign_table ft
+            JOIN pg_class c ON c.oid = ft.ftrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_foreign_server s ON s.oid = ft.ftserver
+            WHERE n.nspname = %s
+              AND c.relkind = 'f'
+              AND NOT c.relname ~ '^_'
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_class", oid="c.oid")}
+            ORDER BY c.relname
+            """,
+            (schema,),
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            table = ForeignTable(
+                schema=schema,
+                name=row["relname"],
+                server=row["srvname"],
+                options=parse_options(row["ftoptions"]),
+            )
+            cur.execute(
+                """
+                SELECT
+                    a.attname,
+                    format_type(a.atttypid, a.atttypmod) AS data_type,
+                    NOT a.attnotnull AS is_nullable,
+                    pg_get_expr(d.adbin, d.adrelid) AS column_default,
+                    a.attgenerated AS generated_kind,
+                    a.attfdwoptions
+                FROM pg_attribute a
+                LEFT JOIN pg_attrdef d
+                  ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                WHERE a.attrelid = %s AND a.attnum > 0 AND NOT a.attisdropped
+                ORDER BY a.attnum
+                """,
+                (row["oid"],),
+            )
+            for col in cur.fetchall():
+                default = col["column_default"]
+                generated = None
+                if (col["generated_kind"] or "") == "s":
+                    generated, default = default, None
+                table.columns[col["attname"]] = Column(
+                    name=col["attname"],
+                    type=col["data_type"],
+                    nullable=col["is_nullable"],
+                    default=default,
+                    generated=generated,
+                )
+                if col["attfdwoptions"]:
+                    table.column_options[col["attname"]] = parse_options(
+                        col["attfdwoptions"]
+                    )
+            tables[table.qualified_name] = table
+    return tables
+
+
+def _query_owners(conn, schemas: list[str]) -> list[ObjectOwner]:
+    """Owners of the relations, functions, types and schemas in `schemas`.
+
+    Sequences linked to a column (serial, OWNED BY) are left out: their owner
+    follows the table's, and PostgreSQL refuses to change it on its own.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            SELECT
+                CASE c.relkind
+                    WHEN 'r' THEN 'TABLE'
+                    WHEN 'p' THEN 'TABLE'
+                    WHEN 'f' THEN 'FOREIGN TABLE'
+                    WHEN 'v' THEN 'VIEW'
+                    WHEN 'm' THEN 'MATERIALIZED VIEW'
+                    WHEN 'S' THEN 'SEQUENCE'
+                END AS kind,
+                n.nspname AS schema,
+                c.relname AS name,
+                '' AS args,
+                pg_get_userbyid(c.relowner) AS owner
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = ANY(%(schemas)s)
+              AND c.relkind IN ('r', 'p', 'f', 'v', 'm', 'S')
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_class", oid="c.oid")}
+              AND NOT (c.relkind = 'S' AND EXISTS (
+                  SELECT 1 FROM pg_depend d
+                  WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                    AND d.refclassid = 'pg_class'::regclass
+                    AND d.deptype IN ('a', 'i')
+              ))
+            UNION ALL
+            SELECT 'FUNCTION', n.nspname, p.proname,
+                   pg_get_function_identity_arguments(p.oid),
+                   pg_get_userbyid(p.proowner)
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = ANY(%(schemas)s)
+              AND p.prokind = 'f'
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_proc", oid="p.oid")}
+            UNION ALL
+            SELECT CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END,
+                   n.nspname, t.typname, '', pg_get_userbyid(t.typowner)
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            LEFT JOIN pg_class c ON c.oid = t.typrelid
+            WHERE n.nspname = ANY(%(schemas)s)
+              AND (t.typtype IN ('e', 'd') OR (t.typtype = 'c' AND c.relkind = 'c'))
+              AND {_NOT_EXTENSION_MEMBER.format(catalog="pg_type", oid="t.oid")}
+            UNION ALL
+            SELECT 'SCHEMA', '', n.nspname, '', pg_get_userbyid(n.nspowner)
+            FROM pg_namespace n
+            WHERE n.nspname = ANY(%(schemas)s)
+            """,
+            {"schemas": list(schemas)},
+        )
+        return [
+            ObjectOwner(
+                kind=row["kind"],
+                schema=row["schema"],
+                name=row["name"],
+                owner=row["owner"],
+                args=row["args"],
+            )
+            for row in cur.fetchall()
+        ]

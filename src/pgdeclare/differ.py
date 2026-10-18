@@ -26,8 +26,14 @@ from .changes import (
     AlterEventTriggerEnabled,
     AlterPublicationOptions,
     AlterRuleEnabled,
+    AlterExtensionSchema,
+    AlterExtensionUpdate,
+    AlterForeignServer,
+    AlterForeignTable,
+    AlterOwner,
     AlterRole,
     AlterSequence,
+    AlterUserMapping,
     AlterViewOptions,
     AttachPartition,
     Change,
@@ -36,6 +42,9 @@ from .changes import (
     CreateDomain,
     CreateEnum,
     CreateEventTrigger,
+    CreateExtension,
+    CreateForeignServer,
+    CreateForeignTable,
     CreateFunction,
     CreateIndex,
     CreateMaterializedView,
@@ -49,6 +58,7 @@ from .changes import (
     CreateShellType,
     CreateTable,
     CreateTrigger,
+    CreateUserMapping,
     CreateView,
     DEFERRED_CONSTRAINT_TYPES,
     DisableRLS,
@@ -58,6 +68,7 @@ from .changes import (
     DetachPartition,
     DropAndCreateDomain,
     DropAndCreateDomainConstraint,
+    DropAndCreateForeignTable,
     DropAndCreateFunction,
     DropAndCreateMaterializedView,
     DropAndCreatePolicy,
@@ -71,6 +82,8 @@ from .changes import (
     DropDomain,
     DropDomainConstraint,
     DropEventTrigger,
+    DropExtension,
+    DropForeignTable,
     DropFunction,
     DropIdentity,
     DropIndex,
@@ -84,6 +97,7 @@ from .changes import (
     DropSequence,
     DropTable,
     DropTrigger,
+    DropUserMapping,
     DropView,
     EnableRLS,
     ForceRLS,
@@ -103,6 +117,7 @@ from .changes import (
     SetNotNull,
     ValidateConstraint,
     dependents_note,
+    foreign_column_sql,
     ValidateDomainConstraint,
     grant_replay_note,
     index_rebuild_note,
@@ -114,6 +129,7 @@ from .models import (
     Column,
     Comment,
     Domain,
+    ForeignTable,
     Function,
     Grant,
     Index,
@@ -122,7 +138,9 @@ from .models import (
     Publication,
     Schema,
     Table,
+    USER_MAPPING_PUBLIC_OPTIONS,
     View,
+    alter_fdw_options_sql,
 )
 
 
@@ -163,6 +181,23 @@ def compute_diff(
         t.parent_key for t in actual.tables.values() if t.partition_bound == "DEFAULT"
     }
     actual = _without_undeclared_partitions(desired, actual)
+    # An owner's privileges are implicit, but read back as grants to it. Where
+    # the schema files state the owner, those are the owner's, not grants to
+    # diff: `_diff_owners` moves them with the object.
+    owner_grants = _stated_owner_grants(desired)
+    if owner_grants:
+        desired = dataclass_replace(
+            desired,
+            grants=[
+                g for g in desired.grants if _grant_owner_key(g) not in owner_grants
+            ],
+        )
+        actual = dataclass_replace(
+            actual,
+            grants=[
+                g for g in actual.grants if _grant_owner_key(g) not in owner_grants
+            ],
+        )
 
     # Diff roles first (cluster-wide, needed before schemas)
     changes.extend(_diff_roles(desired, actual))
@@ -177,6 +212,12 @@ def compute_diff(
         desired, actual
     )
     changes.extend(default_privilege_revokes)
+
+    # Extensions, then foreign servers and user mappings: types, functions and
+    # foreign tables need them. All are database-wide, not per schema.
+    changes.extend(_diff_extensions(desired, actual))
+    changes.extend(_diff_foreign_servers(desired, actual))
+    changes.extend(_diff_user_mappings(desired, actual))
 
     # Diff each object type
     # Order matters for dependency resolution:
@@ -212,6 +253,7 @@ def compute_diff(
             parents_with_default=parents_with_default,
         )
     )
+    changes.extend(_diff_foreign_tables(desired, actual, managed_schemas=schemas))
     changes.extend(_diff_views(desired, actual))
     changes.extend(_diff_materialized_views(desired, actual))
     changes.extend(sequences_after)
@@ -219,6 +261,7 @@ def compute_diff(
     changes.extend(_drop_ranges(desired, actual))
     changes.extend(_drop_domains(desired, actual))
     changes.extend(collations_after)
+    changes.extend(_drop_extensions(desired, actual))
     changes.extend(_diff_indexes(desired, actual))
     changes.extend(_diff_policies(desired, actual))
     changes.extend(_diff_triggers(desired, actual))
@@ -255,7 +298,10 @@ def compute_diff(
         tuple[str, str],
         list[
             Union[
-                DropAndCreateView, DropAndCreateFunction, DropAndCreateMaterializedView
+                DropAndCreateView,
+                DropAndCreateFunction,
+                DropAndCreateMaterializedView,
+                DropAndCreateForeignTable,
             ]
         ],
     ] = {}
@@ -266,11 +312,13 @@ def compute_diff(
             recreations.setdefault((c.function.schema, c.function.name), []).append(c)
         elif isinstance(c, DropAndCreateMaterializedView):
             recreations.setdefault((c.matview.schema, c.matview.name), []).append(c)
+        elif isinstance(c, DropAndCreateForeignTable):
+            recreations.setdefault((c.table.schema, c.table.name), []).append(c)
     if recreations:
         for grant in desired.grants:
             for recreate in recreations.get((grant.schema, grant.object_name), []):
                 if isinstance(
-                    recreate, DropAndCreateMaterializedView
+                    recreate, (DropAndCreateMaterializedView, DropAndCreateForeignTable)
                 ) and not _is_relation_grant(grant):
                     continue
                 recreate.grants.append(grant)
@@ -335,6 +383,10 @@ def compute_diff(
                 )
             )
     changes.extend(validation_changes)
+
+    # Owners, like comments, after everything else: a recreate resets the
+    # owner, so the diff needs the full change list (dependents included).
+    changes.extend(_diff_owners(desired, actual, changes))
 
     # Comments last: a recreate this run wipes the object's comment, so the
     # diff needs the full change list to know which ones to write again.
@@ -434,7 +486,7 @@ def _skip_revokes_on_dropped_relations(changes: list[Change]) -> list[Change]:
             dropped.add((c.schema, c.matview_name))
         elif isinstance(c, DropView):
             dropped.add((c.schema, c.view_name))
-        elif isinstance(c, DropTable):
+        elif isinstance(c, (DropTable, DropForeignTable)):
             dropped.add((c.schema, c.table_name))
     if not dropped:
         return changes
@@ -2211,3 +2263,278 @@ def split_index_operations(
     index_changes.sort(key=lambda c: 0 if isinstance(c, DropIndex) else 1)
 
     return ddl_changes, index_changes
+
+
+# =============================================================================
+# Extensions, foreign data, ownership
+# =============================================================================
+
+# Installed in every database by initdb; never worth a note.
+_BUILTIN_EXTENSIONS = frozenset({"plpgsql"})
+
+
+def _diff_extensions(desired: Schema, actual: Schema) -> list[Change]:
+    """Create declared extensions; converge a stated version or schema.
+
+    An unstated version or schema is not compared. Undeclared extensions are
+    never dropped here: see `_drop_extensions` and `undeclared_extensions`.
+    """
+    changes: list[Change] = []
+    for name, ext in desired.extensions.items():
+        current = actual.extensions.get(name)
+        if current is None:
+            changes.append(CreateExtension(extension=ext))
+            continue
+        if ext.version is not None and ext.version != current.version:
+            changes.append(
+                AlterExtensionUpdate(
+                    name=name,
+                    version=ext.version,
+                    current_version=current.version or "",
+                )
+            )
+        if ext.schema is not None and ext.schema != current.schema:
+            changes.append(AlterExtensionSchema(name=name, schema=ext.schema))
+    return changes
+
+
+def _drop_extensions(desired: Schema, actual: Schema) -> list[Change]:
+    """Drop the undeclared extensions a `@drop extension:NAME` directive names."""
+    return [
+        DropExtension(name=name)
+        for name in sorted(actual.extensions)
+        if name not in desired.extensions and name in desired.extension_drops
+    ]
+
+
+def undeclared_extensions(desired: Schema, actual: Schema) -> list[str]:
+    """Installed extensions the schema files neither declare nor consent to drop.
+
+    They are left in place (dropping one cascades to every column of its
+    types) and reported, so a forgotten declaration is visible.
+    """
+    return [
+        name
+        for name in sorted(actual.extensions)
+        if name not in desired.extensions
+        and name not in desired.extension_drops
+        and name not in _BUILTIN_EXTENSIONS
+    ]
+
+
+def _diff_foreign_servers(desired: Schema, actual: Schema) -> list[Change]:
+    """Create declared foreign servers and converge their version and options.
+
+    Undeclared servers are never dropped: other schemas' foreign tables and
+    user mappings may depend on them. The wrapper and TYPE have no ALTER, and
+    recreating the server would cascade to its mappings and foreign tables,
+    so a change to either is refused.
+    """
+    changes: list[Change] = []
+    for name, srv in desired.foreign_servers.items():
+        current = actual.foreign_servers.get(name)
+        if current is None:
+            changes.append(CreateForeignServer(server=srv))
+            continue
+        if srv.fdw != current.fdw or srv.type != current.type:
+            raise ValueError(
+                f"cannot change the foreign data wrapper or TYPE of server "
+                f"{quote_ident(name)} ({current.fdw}, {current.type!r} -> "
+                f"{srv.fdw}, {srv.type!r}): PostgreSQL has no ALTER for them, "
+                "and recreating the server drops its user mappings and foreign "
+                "tables. Recreate it in an explicit @migrate-before block."
+            )
+        set_version = srv.version is not None and srv.version != current.version
+        if set_version or srv.options != current.options:
+            changes.append(
+                AlterForeignServer(
+                    server=srv,
+                    current_options=dict(current.options),
+                    set_version=set_version,
+                )
+            )
+    return changes
+
+
+def _diff_user_mappings(desired: Schema, actual: Schema) -> list[Change]:
+    """Create and converge declared user mappings.
+
+    A secret option (anything but USER_MAPPING_PUBLIC_OPTIONS) the declaration
+    does not set is left alone, so a password provisioned outside the schema
+    files survives. An undeclared mapping is dropped only when it is a managed
+    role's on a declared server; anything else is not this schema's business.
+    """
+    changes: list[Change] = []
+    managed_roles = set(desired.roles)
+    for key, mapping in desired.user_mappings.items():
+        current = actual.user_mappings.get(key)
+        if current is None:
+            changes.append(CreateUserMapping(mapping=mapping))
+            continue
+        if mapping.options is None or current.options is None:
+            continue  # Options not readable on one side: not compared.
+        compared = {
+            name: value
+            for name, value in current.options.items()
+            if name in mapping.options or name in USER_MAPPING_PUBLIC_OPTIONS
+        }
+        if mapping.options != compared:
+            changes.append(AlterUserMapping(mapping=mapping, current_options=compared))
+    for key, current in actual.user_mappings.items():
+        if (
+            key not in desired.user_mappings
+            and current.server in desired.foreign_servers
+            and current.user in managed_roles
+        ):
+            changes.append(DropUserMapping(mapping=current))
+    return changes
+
+
+def _diff_foreign_tables(
+    desired: Schema, actual: Schema, managed_schemas: list[str] | None = None
+) -> list[Change]:
+    """Create, alter and drop foreign tables.
+
+    A foreign table keeps no rows locally, so column changes are catalog-only
+    and a drop needs no `@drop`. A changed server has no ALTER: the table is
+    recreated, its grants replayed in the same statement.
+    """
+    changes: list[Change] = []
+    for key, table in desired.foreign_tables.items():
+        current = actual.foreign_tables.get(key)
+        if current is None:
+            changes.append(CreateForeignTable(table=table))
+        elif table.server != current.server:
+            changes.append(DropAndCreateForeignTable(table=table))
+        else:
+            actions = _foreign_table_actions(table, current, managed_schemas)
+            if actions:
+                changes.append(
+                    AlterForeignTable(
+                        schema=table.schema, table_name=table.name, actions=actions
+                    )
+                )
+    for key, table in actual.foreign_tables.items():
+        if key not in desired.foreign_tables:
+            changes.append(DropForeignTable(schema=table.schema, table_name=table.name))
+    return changes
+
+
+def _foreign_table_actions(
+    desired: ForeignTable, actual: ForeignTable, managed_schemas: list[str] | None
+) -> list[str]:
+    """The `ALTER FOREIGN TABLE` actions turning `actual` into `desired`."""
+    actions: list[str] = []
+    for name in actual.columns:
+        if name not in desired.columns:
+            actions.append(f"DROP COLUMN {quote_ident(name)}")
+    for name, column in desired.columns.items():
+        if name not in actual.columns:
+            actions.append(
+                "ADD COLUMN "
+                + foreign_column_sql(column, desired.column_options.get(name))
+            )
+    for name, column in desired.columns.items():
+        current = actual.columns.get(name)
+        if current is None:
+            continue
+        ident = quote_ident(name)
+        if column.generated != current.generated:
+            raise ValueError(
+                f"cannot change the generation expression of foreign table column "
+                f"{quote_ident(desired.schema)}.{quote_ident(desired.name)}.{ident}; "
+                "drop and re-add the column in an explicit @migrate-before block."
+            )
+        if _normalize_type(column.type, managed_schemas) != _normalize_type(
+            current.type, managed_schemas
+        ):
+            actions.append(f"ALTER COLUMN {ident} TYPE {column.type}")
+        if column.nullable != current.nullable:
+            verb = "DROP" if column.nullable else "SET"
+            actions.append(f"ALTER COLUMN {ident} {verb} NOT NULL")
+        if _normalize_default(column.default) != _normalize_default(current.default):
+            if column.default is None:
+                actions.append(f"ALTER COLUMN {ident} DROP DEFAULT")
+            else:
+                actions.append(f"ALTER COLUMN {ident} SET DEFAULT {column.default}")
+        column_options = alter_fdw_options_sql(
+            desired.column_options.get(name, {}), actual.column_options.get(name, {})
+        )
+        if column_options:
+            actions.append(f"ALTER COLUMN {ident} {column_options}")
+    table_options = alter_fdw_options_sql(desired.options, actual.options)
+    if table_options:
+        actions.append(table_options)
+    return actions
+
+
+def _owner_keys_rebuilt(changes: list[Change]) -> set[str]:
+    """Owner keys of the objects this run creates or drops and recreates.
+
+    A fresh object belongs to the migrating role, whatever the live owner was.
+    """
+    keys: set[str] = set()
+
+    def mark(kind: str, schema: str, name: str, args: str = "") -> None:
+        if kind == "FUNCTION":
+            keys.add(f"FUNCTION:{schema}.{name}({args})")
+        else:
+            keys.add(f"{kind}:{schema}.{name}")
+
+    for c in changes:
+        if isinstance(c, CreateTable):
+            mark("TABLE", c.table.schema, c.table.name)
+        elif isinstance(c, (CreateForeignTable, DropAndCreateForeignTable)):
+            mark("FOREIGN TABLE", c.table.schema, c.table.name)
+        elif isinstance(c, (CreateView, DropAndCreateView)):
+            mark("VIEW", c.view.schema, c.view.name)
+        elif isinstance(c, (CreateMaterializedView, DropAndCreateMaterializedView)):
+            mark("MATERIALIZED VIEW", c.matview.schema, c.matview.name)
+        elif isinstance(c, CreateSequence):
+            mark("SEQUENCE", c.sequence.schema, c.sequence.name)
+        elif isinstance(c, (CreateFunction, DropAndCreateFunction)):
+            f = c.function
+            mark("FUNCTION", f.schema, f.name, f.args)
+        elif isinstance(c, CreateEnum):
+            mark("TYPE", c.enum.schema, c.enum.name)
+        elif isinstance(c, CreateCompositeType):
+            mark("TYPE", c.composite_type.schema, c.composite_type.name)
+        elif isinstance(c, (CreateDomain, DropAndCreateDomain)):
+            mark("DOMAIN", c.domain.schema, c.domain.name)
+        if isinstance(c, (DropAndCreateView, DropAndCreateMaterializedView)):
+            for dep in c.dependents:
+                if dep.relation is not None:
+                    kind = "MATERIALIZED VIEW" if dep.kind == "m" else "VIEW"
+                    mark(kind, dep.schema, dep.name)
+    return keys
+
+
+def _diff_owners(
+    desired: Schema, actual: Schema, changes: list[Change]
+) -> list[Change]:
+    """`ALTER ... OWNER TO` for every stated owner the target does not have.
+
+    `desired.owners` holds only owners the schema files state (see
+    `PgDeclareConfig.manage_ownership`), so nothing else is touched. An object
+    built fresh in this run gets its owner written whatever the live one was.
+    """
+    rebuilt = _owner_keys_rebuilt(changes)
+    result: list[Change] = []
+    for key in sorted(desired.owners):
+        wanted = desired.owners[key]
+        current = actual.owners.get(key)
+        if current is None or current.owner != wanted.owner or key in rebuilt:
+            result.append(AlterOwner(owner=wanted))
+    return result
+
+
+def _stated_owner_grants(desired: Schema) -> set[tuple[str, str, str]]:
+    """`(schema, object name, owner)` for every owner the schema files state."""
+    return {
+        (o.name, o.name, o.owner) if o.kind == "SCHEMA" else (o.schema, o.name, o.owner)
+        for o in desired.owners.values()
+    }
+
+
+def _grant_owner_key(grant: Grant) -> tuple[str, str, str]:
+    return (grant.schema, grant.object_name, grant.grantee)

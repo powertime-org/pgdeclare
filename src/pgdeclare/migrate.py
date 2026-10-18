@@ -13,7 +13,7 @@ from typing import Callable, Optional
 
 from .changes import Change
 from .config import PgDeclareConfig, logger, resolve
-from .differ import compute_diff, partition_notes
+from .differ import compute_diff, partition_notes, undeclared_extensions
 from .drop_directive import format_drop_errors, validate_drops_runtime
 from .executor import execute_migration, format_changes_summary
 from .introspection import check_table_has_data, introspect_schema
@@ -343,6 +343,14 @@ def run_declared_schema(
         migration_blocks=migration_blocks,
         fresh_install=is_fresh_install,
     )
+    for name in undeclared_extensions(desired, actual):
+        say(
+            style(
+                "yellow",
+                f"Note: extension {name} is installed but not declared; it is "
+                f"left in place (consent to dropping it with -- @drop extension:{name})",
+            )
+        )
     if skip_cluster_changes:
         result.skipped_cluster_changes = [c for c in changes if is_cluster_change(c)]
         changes = [c for c in changes if not is_cluster_change(c)]

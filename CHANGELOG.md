@@ -55,6 +55,24 @@ may change in minor releases.
   each partition and attached to an `ON ONLY` parent index. Converting a table
   to or from partitioned, or changing its partition key, is refused with an
   error pointing to `@migrate-before`.
+- Foreign data: foreign tables in the managed schemas (created, altered with
+  one `ALTER FOREIGN TABLE`, recreated on a new server, dropped when
+  undeclared), foreign servers and user mappings (created and their options
+  converged; servers are never dropped, a managed role's undeclared mapping on
+  a declared server is). User-mapping option values other than `user` and
+  `password_required` are masked in `diff`, JSON, dry-run, prove output and
+  logs, and a secret option the declaration omits is left alone.
+- Extensions are modelled: declared ones are created with their schema,
+  version and `CASCADE`, a declared version is reached with `ALTER EXTENSION
+  ... UPDATE TO`, and an undeclared extension is reported as a note rather
+  than dropped, unless a `-- @drop extension:NAME` directive consents. The CLI
+  no longer installs declared extensions in the target before the run; the
+  diff does, so `diff` shows them.
+- Opt-in ownership (`manage_ownership`, `--manage-ownership`): an owner the
+  schema files state with `ALTER ... OWNER TO`, when it is a managed role, is
+  converged on tables, foreign tables, views, materialized views, sequences,
+  functions, types, domains and the managed schemas, including after a
+  recreate.
 
 ### Changed
 
