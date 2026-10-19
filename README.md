@@ -14,7 +14,7 @@ A diff cannot infer everything, such as a rename or a backfill. For those you wr
 
 ![The schema files are built into a scratch plan database and introspected. Pending @migrate-before blocks run on the live database, which is then introspected. The two are diffed, the difference is applied, @migrate-after and DO blocks run, and a second diff must come back empty.](https://raw.githubusercontent.com/powertime-org/pgdeclare/main/docs/images/pipeline.svg)
 
-Status: **0.1.1.** The engine has run the production schema of [Powertime](https://powertime.org) since it went into service on 10 December 2025. Backwards compatibility may not be preserved until 1.0.
+Status: **0.1.2.** The engine has run the production schema of [Powertime](https://powertime.org) since it went into service on 10 December 2025. Backwards compatibility may not be preserved until 1.0.
 
 ## Design choices
 

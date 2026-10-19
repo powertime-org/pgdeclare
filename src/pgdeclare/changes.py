@@ -2172,6 +2172,41 @@ class CreateView(Change):
 
 
 @dataclass
+class ReplaceView(Change):
+    """Change an existing view's query in place with CREATE OR REPLACE VIEW.
+
+    The path for a definition change that keeps every existing output column
+    (same names, types and collations, in order; new ones may only be
+    appended). The view keeps its OID, so its ACL, comments, owner and the
+    views, materialized views and SQL functions reading from it all stay as
+    they are: nothing is dropped, so nothing needs rebuilding.
+    """
+
+    view: View = field(
+        default_factory=lambda: View(schema="public", name="", definition="")
+    )
+    category: ChangeCategory = ChangeCategory.ONLINE
+    description: str = ""
+    object_type: str = "VIEW"
+
+    def __post_init__(self):
+        self.object_name = self.view.qualified_name
+        if not self.description:
+            self.description = f"Replace view {self.view.name}" + view_options_note(
+                self.view
+            )
+
+    def to_sql(self) -> str:
+        # CREATE OR REPLACE VIEW replaces the reloptions with the WITH clause
+        # (none clears them), so the declared options converge in the same
+        # statement.
+        return (
+            f"CREATE OR REPLACE VIEW {quote_ident(self.view.schema)}.{quote_ident(self.view.name)}"
+            f"{self.view.options_clause} AS {self.view.definition}"
+        )
+
+
+@dataclass
 class DropView(Change):
     """Drop a view."""
 

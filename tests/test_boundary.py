@@ -114,4 +114,4 @@ def test_the_default_config_is_neutral():
 def test_the_public_api_is_exported():
     for name in pgdeclare.__all__:
         assert hasattr(pgdeclare, name), name
-    assert pgdeclare.__version__ == "0.1.1"
+    assert pgdeclare.__version__ == "0.1.2"

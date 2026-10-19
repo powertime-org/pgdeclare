@@ -111,6 +111,7 @@ from .changes import (
     RevokePublicExecute,
     ReplacePublicationTable,
     RevokeRoleMembership,
+    ReplaceView,
     SetComment,
     SetDefault,
     SetSequenceOwner,
@@ -642,6 +643,7 @@ def _carry_recreate_dependents(
                 (
                     AlterViewOptions,
                     AlterMaterializedViewOptions,
+                    ReplaceView,
                 ),
             )
             and c.object_name in folded
@@ -1958,10 +1960,15 @@ def _diff_views(desired: Schema, actual: Schema) -> list[Change]:
         if key not in actual.views:
             changes.append(CreateView(view=view))
         elif view.definition.strip() != actual.views[key].definition.strip():
-            # Use DropAndCreateView to handle column order/type changes
-            # that CREATE OR REPLACE VIEW can't handle. The recreate carries the
-            # declared WITH (...) options itself.
-            changes.append(DropAndCreateView(view=view))
+            if _view_replaceable(actual.views[key], view):
+                # Same leading columns: replace in place, so the view keeps its
+                # ACL and the relations reading from it are left alone.
+                changes.append(ReplaceView(view=view))
+            else:
+                # A column renamed, retyped, reordered or removed: CREATE OR
+                # REPLACE VIEW refuses those, so drop and recreate. The
+                # recreate carries the declared WITH (...) options itself.
+                changes.append(DropAndCreateView(view=view))
         elif view.reloptions != actual.views[key].reloptions:
             # Definition already matches, only the security mode drifted (say,
             # `security_invoker` was declared but never written). ALTER VIEW
@@ -1979,6 +1986,18 @@ def _diff_views(desired: Schema, actual: Schema) -> list[Change]:
             changes.append(DropView(schema=view.schema, view_name=view.name))
 
     return changes
+
+
+def _view_replaceable(current: View, declared: View) -> bool:
+    """Whether CREATE OR REPLACE VIEW can turn `current` into `declared`.
+
+    PostgreSQL accepts it when the new query keeps every existing output
+    column with the same name, type and collation, in the same position, and
+    only appends new ones. Unknown columns (an empty list) never qualify.
+    """
+    if not current.columns or not declared.columns:
+        return False
+    return declared.columns[: len(current.columns)] == current.columns
 
 
 def _diff_materialized_views(desired: Schema, actual: Schema) -> list[Change]:

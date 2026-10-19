@@ -5,6 +5,19 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [0.1.2] - 2026-10-19
+
+### Changed
+
+- A view whose query changes while every existing output column keeps its
+  name, type and collation (new columns may be appended) is now replaced in
+  place with `CREATE OR REPLACE VIEW`, online, instead of dropped and
+  re-created. The view keeps its OID, so its grants, comments and owner stay,
+  and the views, materialized views and SQL functions reading from it are not
+  dropped and rebuilt. A materialized view reading from it keeps its data
+  until it is refreshed. A renamed, retyped, reordered or removed column still
+  drops and re-creates the view with its dependents.
+
 ## [0.1.1] - 2026-10-18
 
 ### Added
@@ -192,6 +205,7 @@ First real release: a schema engine proven in production, extracted and made gen
 
 Placeholder release to reserve the name on PyPI. No functionality.
 
+[0.1.2]: https://github.com/powertime-org/pgdeclare/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/powertime-org/pgdeclare/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/powertime-org/pgdeclare/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/powertime-org/pgdeclare/releases/tag/v0.0.1
