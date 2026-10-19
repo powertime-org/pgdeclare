@@ -1,7 +1,8 @@
 name: ci
 
+# The main ruleset requires every check here and an up-to-date branch,
+# so a run on main after the merge would only repeat the PR run.
 on:
-  push:
   pull_request:
 
 permissions:
