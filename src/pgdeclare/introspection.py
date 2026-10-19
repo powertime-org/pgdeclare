@@ -1278,7 +1278,19 @@ def _query_views(conn, schema: str) -> dict[str, View]:
             SELECT
                 v.viewname AS view_name,
                 v.definition AS view_definition,
-                c.reloptions AS reloptions
+                c.reloptions AS reloptions,
+                ARRAY(
+                    SELECT quote_ident(a.attname) || ' '
+                        || format_type(a.atttypid, a.atttypmod)
+                        || CASE WHEN a.attcollation <> 0
+                                 AND a.attcollation <> t.typcollation
+                            THEN ' COLLATE ' || a.attcollation::regcollation::text
+                            ELSE '' END
+                    FROM pg_attribute AS a
+                    JOIN pg_type AS t ON t.oid = a.atttypid
+                    WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                    ORDER BY a.attnum
+                ) AS columns
             FROM pg_views AS v
             JOIN pg_namespace AS n ON n.nspname = v.schemaname
             JOIN pg_class AS c
@@ -1303,6 +1315,7 @@ def _query_views(conn, schema: str) -> dict[str, View]:
                 name=row["view_name"],
                 definition=row["view_definition"] or "",
                 reloptions=list(row["reloptions"] or []),
+                columns=list(row["columns"] or []),
             )
             views[view.qualified_name] = view
 

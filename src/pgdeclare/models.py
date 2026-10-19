@@ -693,6 +693,12 @@ class View:
     # views owned by a BYPASSRLS superuser mean RLS on the base tables never
     # applies to anything read through the view, so this failed open.
     reloptions: list[str] = field(default_factory=list)
+    # Output columns as `name type [COLLATE collation]`, in order, from the
+    # catalog. Not part of equality (the definition already decides drift):
+    # they decide whether a changed definition can be applied with
+    # CREATE OR REPLACE VIEW, which keeps the view, its ACL and the views
+    # reading from it, or has to drop and recreate. Empty means unknown.
+    columns: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         self.reloptions = normalize_view_reloptions(self.reloptions)

@@ -464,7 +464,36 @@ class TestMaterializedViewDependencies:
         env.apply()
         _admin(env.url, "INSERT INTO t VALUES (1, 10, 5)")
 
+        mid = _rows(env.url, "SELECT 'mid'::regclass::oid")
+
+        # An appended column is replaced in place (online): the matview reading
+        # from the view is left as it is, data included, as after any change to
+        # what it reads. Refreshing it is the application's call.
         env.declare(LAYERED.replace("SELECT id, a FROM t", "SELECT id, a, b FROM t"))
+        env.apply()
+
+        assert _rows(env.url, "SELECT 'mid'::regclass::oid") == mid
+        assert _rows(env.url, "SELECT id, a FROM top_v") == []
+        _admin(env.url, "REFRESH MATERIALIZED VIEW mid")
+        assert _rows(env.url, "SELECT id, a FROM top_v") == [(1, 10)]
+        assert env.indexes("mid") == ["mid_a_idx"]
+        assert env.can_select("mid") is True
+        assert env.can_select("top_v") is True
+        assert env.residual() == []
+
+    def test_recreating_the_view_under_a_matview(self, env):
+        env.declare(LAYERED)
+        env.apply()
+        _admin(env.url, "INSERT INTO t VALUES (1, 10, 5)")
+
+        # A retyped column cannot be replaced in place: the view is recreated,
+        # which rebuilds the matview reading from it (offline).
+        env.declare(
+            LAYERED.replace("SELECT id, a FROM t", "SELECT id, a::bigint AS a FROM t")
+        )
+        (change,) = env.residual()
+        assert isinstance(change, DropAndCreateView)
+        assert change.category == ChangeCategory.OFFLINE
         env.apply(offline=True)
 
         assert _rows(env.url, "SELECT id, a FROM top_v") == [(1, 10)]
