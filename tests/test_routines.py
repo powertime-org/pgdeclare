@@ -407,14 +407,16 @@ class TestRoutineRoundTrip:
             .replace("'SELECT a + b'", "'SELECT x + y'")
         )
         # The new procedure signature competes with the old one for a call
-        # of two arguments, so the swap is offline.
+        # of two arguments, and `step`'s renamed parameters break a call
+        # naming the old ones, so both swaps are offline.
         offline = [
             c
             for c in _plan(sql_dir, recreated, target_url, plan_db)
             if c.category.value == "offline"
         ]
-        assert [c.object_name for c in offline] == [
-            "public.book(IN amount bigint, INOUT booked bigint)"
+        assert sorted(c.object_name for c in offline) == [
+            "public.book(IN amount bigint, INOUT booked bigint)",
+            "public.step(x integer, y integer)",
         ]
         _apply(sql_dir, recreated, target_url, plan_db, offline=True)
         routines = _routines(target_url)

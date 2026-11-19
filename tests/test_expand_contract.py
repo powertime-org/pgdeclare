@@ -92,12 +92,14 @@ class TestSignatureChanges:
         assert [type(c) for c in changes] == [DropAndCreateFunction]
         assert changes[0].category == ChangeCategory.OFFLINE
 
-    def test_renamed_parameters_stay_one_online_statement(self):
+    def test_renamed_parameters_are_one_offline_statement(self):
+        # A call in named notation (`total(a => 1)`) fails once `a` is gone.
         old = _fn("total", "a int", "integer", 1, 1)
         new = _fn("total", "amount int", "integer", 1, 1)
         changes = compute_diff(_schema(new), _schema(old))
         assert [type(c) for c in changes] == [DropAndCreateFunction]
-        assert changes[0].category == ChangeCategory.ONLINE
+        assert changes[0].category == ChangeCategory.OFFLINE
+        assert "naming the old parameters" in changes[0].description
         assert not changes[0].contract
 
     def test_an_unknown_call_shape_counts_as_overlapping(self):
@@ -200,6 +202,27 @@ OLD_CALLS = "SELECT account(gen_random_uuid(), gen_random_uuid()), total(1), gon
 
 
 class TestDeployWhileTheOldVersionServes:
+    def test_renamed_parameters_are_refused_online(self, tmp_path, databases):
+        target, plan = databases
+        sql_dir = tmp_path / "sql"
+        _declare(sql_dir, V1)
+        apply_declared_schema(target, sql_dir, plan, config=QUIET)
+
+        _declare(
+            sql_dir,
+            V1.replace(
+                "total(a int) RETURNS int LANGUAGE sql AS 'SELECT a'",
+                "total(amount int) RETURNS int LANGUAGE sql AS 'SELECT amount'",
+            ),
+        )
+        with pytest.raises(Exception, match="Migration execution failed"):
+            apply_declared_schema(target, sql_dir, plan, expand_only=True, config=QUIET)
+        # The serving version's named call still resolves.
+        assert _run(target, "SELECT total(a => 4)") == [(4,)]
+
+        apply_declared_schema(target, sql_dir, plan, offline=True, config=QUIET)
+        assert _run(target, "SELECT total(amount => 4)") == [(4,)]
+
     def test_a_new_default_parameter_is_refused_online(self, tmp_path, databases):
         target, plan = databases
         sql_dir = tmp_path / "sql"

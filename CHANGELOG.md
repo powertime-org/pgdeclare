@@ -5,6 +5,15 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [0.2.1] - 2026-11-19
+
+### Changed
+
+- A change of a routine's parameter names alone is now offline. The drop and
+  re-create is still one statement, but a call that names the old
+  parameters (`f(p_old => 1)`) fails from then on, so an application still
+  using them must be stopped.
+
 ## [0.2.0] - 2026-11-19
 
 ### Added
