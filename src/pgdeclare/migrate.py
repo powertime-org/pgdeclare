@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .changes import Change
+from .contract import breaking_blocks
 from .config import PgDeclareConfig, logger, resolve
 from .differ import compute_diff, partition_notes, undeclared_extensions
 from .drop_directive import format_drop_errors, validate_drops_runtime
@@ -25,7 +26,7 @@ from .ledger import (
     mark_blocks_applied,
     parse_migration_blocks,
 )
-from .models import Schema
+from .models import ChangeCategory, Schema
 from .schema_parser import build_desired_schema, execute_do_blocks, parse_do_blocks
 
 # Roles and role memberships are cluster-wide: applying them in one database
@@ -38,6 +39,15 @@ def is_cluster_change(change: Change) -> bool:
     return change.object_type in CLUSTER_OBJECT_TYPES
 
 
+def is_held_back(change: Change) -> bool:
+    """True for a change an `expand_only` run leaves for the run after.
+
+    Only an online contract change: one the differ already made offline (it
+    could not wait) is refused by the offline check like any other.
+    """
+    return change.contract and change.category == ChangeCategory.ONLINE
+
+
 @dataclass
 class SchemaRunResult:
     """What one run of the pipeline did (or, on a dry run, planned)."""
@@ -46,12 +56,18 @@ class SchemaRunResult:
     changes: list[Change] = field(default_factory=list)
     executed_sql: list[str] = field(default_factory=list)
     skipped_cluster_changes: list[Change] = field(default_factory=list)
+    # With `expand_only`: the contract changes left for the run after.
+    held_back: list[Change] = field(default_factory=list)
     migration_blocks: list[MigrationBlock] = field(default_factory=list)
     fresh_install: bool = False
 
 
 class SchemaConvergenceError(Exception):
     """A schema run applied its changes and still did not reach the declared schema."""
+
+
+class ExpandRefusedError(Exception):
+    """An `expand_only` run found a pending inline migration it cannot hold back."""
 
 
 def compute_residual_changes(
@@ -61,13 +77,15 @@ def compute_residual_changes(
     config: Optional[PgDeclareConfig] = None,
     *,
     skip_cluster_changes: bool = False,
+    expand_only: bool = False,
 ) -> list[Change]:
     """Re-diff `desired` against the database, after changes have been applied.
 
     The list is empty when the run converged. Anything in it is a declaration
     the run failed to reach, which only the *next* diff would otherwise report.
     With `skip_cluster_changes`, role-level changes are left out (a rehearsal
-    on a clone does not apply them).
+    on a clone does not apply them). With `expand_only`, so are the contract
+    changes an expand run holds back on purpose.
     """
     cfg = resolve(config)
     residual_actual = introspect_schema(
@@ -85,6 +103,8 @@ def compute_residual_changes(
     )
     if skip_cluster_changes:
         residual = [c for c in residual if not is_cluster_change(c)]
+    if expand_only:
+        residual = [c for c in residual if not is_held_back(c)]
     return residual
 
 
@@ -96,6 +116,7 @@ def assert_schema_converged(
     config: Optional[PgDeclareConfig] = None,
     *,
     skip_cluster_changes: bool = False,
+    expand_only: bool = False,
 ) -> None:
     """Fail the run if a second diff would still find work to do."""
     cfg = resolve(config)
@@ -106,6 +127,7 @@ def assert_schema_converged(
         locked_functions,
         cfg,
         skip_cluster_changes=skip_cluster_changes,
+        expand_only=expand_only,
     )
 
     if not residual:
@@ -164,6 +186,7 @@ def apply_declared_schema(
     force: bool = False,
     dry_run: bool = False,
     expect_converged: bool = False,
+    expand_only: bool = False,
     prove: bool = False,
     prepare_clone: Optional[Callable[[str], None]] = None,
     locked_functions: Optional[set[str]] = None,
@@ -192,6 +215,12 @@ def apply_declared_schema(
             inline block, no ledger row, no DDL, no DO block. Only the plan
             database is rebuilt.
         expect_converged: Any difference fails the run before anything is applied
+        expand_only: The expand half of an expand/contract deploy, run while
+            the previous version of the application still serves: contract
+            changes (a routine it may still call, dropped or replaced by a new
+            signature) are left in place for a later run without this flag,
+            made once that version has stopped. The convergence check allows
+            exactly those.
         prove: With `dry_run`, rehearse the real run on a throwaway clone of
             the database instead of previewing it (see
             `pgdeclare.prove.prove_declared_schema`). Needs `dry_run=True`.
@@ -217,6 +246,7 @@ def apply_declared_schema(
             plan_db_name,
             offline=offline,
             force=force,
+            expand_only=expand_only,
             prepare=prepare_clone,
             locked_functions=locked_functions,
             config=config,
@@ -230,6 +260,7 @@ def apply_declared_schema(
         force=force,
         dry_run=dry_run,
         expect_converged=expect_converged,
+        expand_only=expand_only,
         locked_functions=locked_functions,
         config=config,
     )
@@ -245,6 +276,7 @@ def run_declared_schema(
     dry_run: bool = False,
     expect_converged: bool = False,
     skip_cluster_changes: bool = False,
+    expand_only: bool = False,
     locked_functions: Optional[set[str]] = None,
     config: Optional[PgDeclareConfig] = None,
 ) -> SchemaRunResult:
@@ -292,6 +324,20 @@ def run_declared_schema(
         logger.info("Processing inline migrations...")
         pre_blocks = [b for b in migration_blocks if b.phase == "before"]
         post_blocks = [b for b in migration_blocks if b.phase == "after"]
+        if expand_only:
+            # Before any block runs: a block is SQL run as written, so one
+            # that takes away what the serving version uses cannot be held
+            # back past the diff that may rely on it. It runs offline.
+            breaking = breaking_blocks(
+                migration_blocks, get_applied_migrations(connection_string, cfg)
+            )
+            if breaking:
+                raise ExpandRefusedError(
+                    "expand-only: pending inline migrations take away what the "
+                    "application still serving may use, so this migration "
+                    "must run offline:\n"
+                    + "\n".join(f"  - {b.describe()}" for b in breaking)
+                )
         if dry_run:
             applied = get_applied_migrations(connection_string, cfg)
             report_pending_migration_blocks(migration_blocks, applied, force=force)
@@ -354,6 +400,16 @@ def run_declared_schema(
     if skip_cluster_changes:
         result.skipped_cluster_changes = [c for c in changes if is_cluster_change(c)]
         changes = [c for c in changes if not is_cluster_change(c)]
+    if expand_only:
+        result.held_back = [c for c in changes if is_held_back(c)]
+        changes = [c for c in changes if not is_held_back(c)]
+        for c in result.held_back:
+            say(
+                style(
+                    "yellow",
+                    f"Held back for the contract run: {c.description}",
+                )
+            )
     result.changes = changes
 
     if not changes:
@@ -468,5 +524,6 @@ def run_declared_schema(
             locked_functions=locked_functions,
             config=cfg,
             skip_cluster_changes=skip_cluster_changes,
+            expand_only=expand_only,
         )
     return result

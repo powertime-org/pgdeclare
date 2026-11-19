@@ -87,6 +87,11 @@ class Change(ABC):
     requires_drop_directive: bool = False
     object_type: str = ""
     object_name: str = ""
+    # The contract half of an expand/contract deploy: a change the previous
+    # version of the application may still depend on while it serves (today:
+    # dropping a routine it may still call). A run with `expand_only` holds
+    # it back; the run after the old version has stopped applies it.
+    contract: bool = False
 
     @abstractmethod
     def to_sql(self) -> str:

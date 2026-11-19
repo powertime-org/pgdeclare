@@ -15,7 +15,7 @@ Options shared by both commands:
 | `--plan-database NAME` | `<db>_pgdeclare_plan_<random>` | Scratch database the declared schema is built in. Never the target database; an existing one must be owned by you and is left in place, otherwise it is created and dropped per run |
 | `-v`, `--verbose` | off | Log the engine's progress |
 
-`apply` also takes `--dry-run`, `--offline` (allow changes that lock or rewrite tables) and `--force` (bypass `@drop` checks, re-run edited blocks, continue despite non-convergence).
+`apply` also takes `--dry-run`, `--offline` (allow changes that lock or rewrite tables), `--expand-only` (hold back the contract changes, drops of routines the running application may still call, for a later run; see [Safety](safety.md)) and `--force` (bypass `@drop` checks, re-run edited blocks, continue despite non-convergence).
 
 `diff --prove` and `apply --dry-run --prove` also rehearse the real run on a throwaway clone of the target, inline migrations included (see [Safety](safety.md#safety)). With `diff --json` the result is under a `prove` key. A failed proof exits `1` with the reason.
 

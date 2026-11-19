@@ -277,6 +277,8 @@ def compute_diff(
     changes.extend(default_privilege_grants)
     changes = _skip_revokes_on_dropped_relations(changes)
     changes = _skip_canonical_function_drops(changes, actual)
+    _drop_now_what_other_drops_need(changes, actual)
+    _hold_revokes_with_their_routine(changes)
 
     # Re-apply grants for objects being dropped and recreated.
     #
@@ -1301,6 +1303,11 @@ def _diff_constraints(
     return changes
 
 
+def _same_call_types(a: Function, b: Function) -> bool:
+    """Whether two routines take the same input types (only names differ)."""
+    return a.call_shape_known and b.call_shape_known and a.arg_types == b.arg_types
+
+
 def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
     """Diff functions between desired and actual schemas."""
     changes: list[Change] = []
@@ -1328,19 +1335,44 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
                     rename_source = existing
                     break
 
-            if rename_source:
-                # Parameter names changed - use DropAndCreateFunction with the OLD args
-                # to ensure proper DROP before CREATE
-                functions_to_drop_for_rename.add(rename_source.signature)
-                changes.append(
-                    DropAndCreateFunction(
-                        function=func,
-                        old_args=rename_source.args,  # Pass old args for correct DROP
-                        old_kind=rename_source.kind,
-                    )
-                )
-            else:
+            if rename_source is None:
                 changes.append(CreateFunction(function=func))
+            elif not _same_call_types(func, rename_source) and not (
+                func.call_arity_overlaps(rename_source)
+            ):
+                # A new signature no call to the old one can reach: the new
+                # overload is created beside the old, and the old one is an
+                # undeclared routine like any other, dropped as a contract
+                # change below. An application still calling the old
+                # signature keeps working until it has been replaced.
+                changes.append(CreateFunction(function=func))
+            else:
+                # The old signature has to go in the same statement, with the
+                # OLD args so the DROP names what is there. When only the
+                # parameter names changed the identity is the same, so the
+                # two cannot coexist, and a call by position still resolves.
+                # Otherwise the overloads would compete for some call (a new
+                # DEFAULT that lets a call of the old length match both is
+                # the usual case: "function ... is not unique"), and an
+                # application still calling the old signature fails from the
+                # DROP on: that can only run with the application stopped.
+                functions_to_drop_for_rename.add(rename_source.signature)
+                same_identity = _same_call_types(func, rename_source)
+                change = DropAndCreateFunction(
+                    function=func,
+                    old_args=rename_source.args,  # Pass old args for correct DROP
+                    old_kind=rename_source.kind,
+                )
+                if not same_identity:
+                    change.category = ChangeCategory.OFFLINE
+                    change.description = (
+                        f"Drop {rename_source.keyword.lower()} "
+                        f"{rename_source.signature} and create "
+                        f"{func.signature} (offline: a call to the old "
+                        f"signature fails once it is dropped, and the two "
+                        f"cannot coexist because a call could match both)"
+                    )
+                changes.append(change)
         elif func.definition_hash != actual.functions[key].definition_hash:
             # A changed return type or kind requires DROP + CREATE: CREATE OR
             # REPLACE refuses both.
@@ -1383,12 +1415,15 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
     # Functions to drop (excluding those handled by parameter rename above)
     for key, func in actual.functions.items():
         if key not in desired.functions and key not in functions_to_drop_for_rename:
+            # A contract change: the application that is serving may still
+            # call it, so an expand run keeps it for the run after.
             changes.append(
                 DropFunction(
                     schema=func.schema,
                     name=func.name,
                     args=func.args,
                     kind=func.kind,
+                    contract=True,
                 )
             )
 
@@ -1935,6 +1970,64 @@ def _skip_canonical_function_drops(
             and f"{c.schema}.{c.name}({c.args})" in signatures
         )
     ]
+
+
+def _drop_now_what_other_drops_need(changes: list[Change], actual: Schema) -> None:
+    """Make a routine drop that another drop needs a drop of this run.
+
+    A routine depends on the types its signature names: a dropped view's or
+    domain's or range's (these drops run without CASCADE). If an expand run
+    held the routine back, that other drop would fail on it. So the routine
+    goes in the same run, and since the application that is serving may still
+    call it, that run is offline. A routine whose definition does not even
+    mention the object's name cannot depend on it; one that does may, so the
+    test errs towards offline.
+    """
+    names: set[str] = set()
+    for c in changes:
+        if isinstance(c, DropView):
+            names.add(c.view_name.lower())
+        elif isinstance(c, DropMaterializedView):
+            names.add(c.matview_name.lower())
+        elif isinstance(c, (DropDomain, DropRangeType)):
+            names.add(c.name.lower())
+    if not names:
+        return
+    for c in changes:
+        if not (isinstance(c, DropFunction) and c.contract):
+            continue
+        old = actual.functions.get(f"{c.schema}.{c.name}({c.args})")
+        text = (old.full_definition if old else c.args).lower()
+        needed = sorted(n for n in names if n in text)
+        if needed:
+            c.contract = False
+            c.category = ChangeCategory.OFFLINE
+            c.description += (
+                f" (offline: dropped with {', '.join(needed)}, which it may "
+                f"depend on, while the application may still call it)"
+            )
+
+
+def _hold_revokes_with_their_routine(changes: list[Change]) -> None:
+    """A revoke on a routine dropped as a contract change is one too.
+
+    Revoking the serving application's EXECUTE breaks its calls exactly as
+    the drop would, so an expand run holds both back.
+    """
+    held = {
+        (c.schema, c.name, c.args)
+        for c in changes
+        if isinstance(c, DropFunction) and c.contract
+    }
+    if not held:
+        return
+    for c in changes:
+        if (
+            isinstance(c, RevokePrivilege)
+            and c.grant.object_type in ("FUNCTION", "PROCEDURE")
+            and (c.grant.schema, c.grant.object_name, c.grant.args) in held
+        ):
+            c.contract = True
 
 
 def _drop_domains(desired: Schema, actual: Schema) -> list[Change]:

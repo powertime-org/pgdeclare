@@ -17,7 +17,7 @@ file layout, bootstrap SQL, locking, failure classification) comes in through
 embeds it.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 from .config import DEFAULT_CONFIG, PgDeclareConfig
 from .models import (
@@ -94,7 +94,9 @@ from .ledger import (
     parse_migration_blocks_from_content,
     parse_migration_blocks_from_git,
 )
+from .contract import BreakingBlock, breaking_blocks, breaking_statements
 from .migrate import (
+    ExpandRefusedError,
     SchemaConvergenceError,
     apply_declared_schema,
     assert_schema_converged,
@@ -183,11 +185,16 @@ __all__ = [
     "parse_migration_blocks_from_content",
     "parse_migration_blocks_from_git",
     # Pipeline
+    "ExpandRefusedError",
     "SchemaConvergenceError",
     "apply_declared_schema",
     "assert_schema_converged",
     "compute_residual_changes",
     "report_pending_migration_blocks",
+    # Expand/contract: inline migrations an expand run refuses
+    "BreakingBlock",
+    "breaking_blocks",
+    "breaking_statements",
     # Prove: rehearse a run on a throwaway clone
     "LedgerEntry",
     "ProveError",

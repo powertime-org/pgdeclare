@@ -238,6 +238,7 @@ def prove_declared_schema(
     *,
     offline: bool = False,
     force: bool = False,
+    expand_only: bool = False,
     prepare: Optional[Callable[[str], None]] = None,
     locked_functions: Optional[set[str]] = None,
     config: Optional[PgDeclareConfig] = None,
@@ -259,6 +260,7 @@ def prove_declared_schema(
             declared schema is built in it, and the clone is created and
             dropped through a connection to it
         offline: As for `apply_declared_schema`
+        expand_only: As for `apply_declared_schema`
         force: As for `apply_declared_schema`; the rehearsal still fails on
             residual changes and unexplained row loss
         prepare: Called with the clone's connection string before the run,
@@ -308,6 +310,7 @@ def prove_declared_schema(
                 offline=offline,
                 force=force,
                 skip_cluster_changes=True,
+                expand_only=expand_only,
                 locked_functions=locked_functions,
                 config=run_cfg,
             )
@@ -336,6 +339,7 @@ def prove_declared_schema(
             locked_functions,
             run_cfg,
             skip_cluster_changes=True,
+            expand_only=expand_only,
         )
         drop_directives: set[str] = set()
         for block in run.migration_blocks:

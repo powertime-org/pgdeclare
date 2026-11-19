@@ -1,7 +1,7 @@
 """The `pgdeclare` command line: a thin convenience over the library.
 
     pgdeclare diff  [--json] [--exit-code] [--prove]
-    pgdeclare apply [--dry-run [--prove]] [--offline] [--force]
+    pgdeclare apply [--dry-run [--prove]] [--offline] [--expand-only] [--force]
 
 Both build the declared schema in a scratch "plan" database on the same server
 (created on demand and dropped afterwards, unless `--plan-database` names one
@@ -359,6 +359,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
                 offline=args.offline,
                 force=args.force,
                 dry_run=args.dry_run,
+                expand_only=args.expand_only,
                 prove=args.prove,
                 prepare_clone=_clone_preparer(cfg),
                 config=cfg,
@@ -459,6 +460,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="bypass @drop checks, re-run edited blocks, ignore non-convergence",
+    )
+    apply.add_argument(
+        "--expand-only",
+        action="store_true",
+        help="the expand half of an expand/contract deploy: keep the routines "
+        "the running application may still call (dropped, or replaced by a new "
+        "signature) for a later run without this flag",
     )
     apply.add_argument(
         "--prove",
