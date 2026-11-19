@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [0.2.2] - 2026-11-19
+
+### Changed
+
+- A signature change that only appends parameters with defaults is online
+  again. The old and new forms still cannot coexist, but the drop and
+  re-create is one statement, and every call of the old form, by position or
+  by name, resolves to the new one. Any other change whose forms compete for
+  a call (new types at the same count, an old default taken away, a new
+  return type or renamed parameters) stays offline.
+
 ## [0.2.1] - 2026-11-19
 
 ### Changed

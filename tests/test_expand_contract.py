@@ -63,17 +63,63 @@ def _schema(*functions: Function, **kw) -> Schema:
 
 
 class TestSignatureChanges:
-    def test_a_new_default_parameter_is_offline(self):
-        # The 2026-11-19 incident: a third parameter with a DEFAULT. A call
-        # with two arguments matches both overloads, so they cannot coexist,
-        # and the old one cannot be dropped while anything calls it.
+    def test_appended_default_parameters_are_one_online_statement(self):
+        # A third parameter with a DEFAULT: the two forms cannot coexist (a
+        # call with two arguments matches both), but swapped in one statement
+        # every call of the old form resolves to the new one.
         old = _fn("account", "a uuid, s uuid", "uuid, uuid", 2, 2)
         new = _fn("account", "a uuid, s uuid, ip text", "uuid, uuid, text", 2, 3)
         changes = compute_diff(_schema(new), _schema(old))
         assert [type(c) for c in changes] == [DropAndCreateFunction]
-        assert changes[0].category == ChangeCategory.OFFLINE
-        assert "offline" in changes[0].description
+        assert changes[0].category == ChangeCategory.ONLINE
+        swap = changes[0]
+        assert isinstance(swap, DropAndCreateFunction)
+        assert swap.old_args == "a uuid, s uuid"
+        assert "online" in changes[0].description
         assert not is_held_back(changes[0])
+
+    def test_appended_defaults_keep_earlier_defaults_optional(self):
+        old = _fn("f", "a int, b int", "integer, integer", 1, 2)
+        new = _fn("f", "a int, b int, c int", "integer, integer, integer", 1, 3)
+        changes = compute_diff(_schema(new), _schema(old))
+        assert changes[0].category == ChangeCategory.ONLINE
+
+    @pytest.mark.parametrize(
+        "old,new",
+        [
+            # An old default dropped: a one-argument call no longer resolves.
+            (
+                _fn("f", "a int, b int", "integer, integer", 1, 2),
+                _fn("f", "a int, b int, c int", "integer, integer, integer", 2, 3),
+            ),
+            # An old parameter renamed: a call naming it fails.
+            (
+                _fn("f", "a int", "integer", 1, 1),
+                _fn("f", "x int, b int", "integer, integer", 1, 2),
+            ),
+            # Same count, new types: competes, and resolves to neither.
+            (
+                _fn("f", "a int", "integer", 1, 1),
+                _fn("f", "a text, b int", "text, integer", 1, 2),
+            ),
+            # A new return type: the old caller reads a different answer.
+            (
+                _fn("f", "a int", "integer", 1, 1, body="RETURNS int AS '1'"),
+                _fn(
+                    "f",
+                    "a int, b int",
+                    "integer, integer",
+                    1,
+                    2,
+                    body="RETURNS text AS '1'",
+                ),
+            ),
+        ],
+    )
+    def test_other_competing_signatures_stay_offline(self, old, new):
+        changes = compute_diff(_schema(new), _schema(old))
+        assert [type(c) for c in changes] == [DropAndCreateFunction]
+        assert changes[0].category == ChangeCategory.OFFLINE
 
     def test_a_signature_no_old_call_reaches_is_created_beside_the_old(self):
         old = _fn("total", "a int", "integer", 1, 1)
@@ -223,7 +269,7 @@ class TestDeployWhileTheOldVersionServes:
         apply_declared_schema(target, sql_dir, plan, offline=True, config=QUIET)
         assert _run(target, "SELECT total(amount => 4)") == [(4,)]
 
-    def test_a_new_default_parameter_is_refused_online(self, tmp_path, databases):
+    def test_a_new_default_parameter_swaps_online(self, tmp_path, databases):
         target, plan = databases
         sql_dir = tmp_path / "sql"
         _declare(sql_dir, V1)
@@ -236,16 +282,21 @@ class TestDeployWhileTheOldVersionServes:
                 "account(a uuid, s uuid, ip text DEFAULT NULL)",
             ),
         )
-        # Before the fix this dropped account(uuid, uuid) online, and every
-        # call the serving version made failed "does not exist".
-        with pytest.raises(Exception, match="Migration execution failed"):
-            apply_declared_schema(target, sql_dir, plan, expand_only=True, config=QUIET)
+        # One statement drops account(uuid, uuid) and creates the new form,
+        # so no moment has neither (the 2026-11-19 incident, a hand DROP
+        # committed before the CREATE) or both ("is not unique").
+        apply_declared_schema(target, sql_dir, plan, expand_only=True, config=QUIET)
+        # The serving version's calls, by position and by name, still resolve.
         assert _run(target, OLD_CALLS) == [(1, 1, 3)]
-
-        apply_declared_schema(target, sql_dir, plan, offline=True, config=QUIET)
+        assert _run(
+            target, "SELECT account(a => gen_random_uuid(), s => gen_random_uuid())"
+        ) == [(1,)]
         assert _run(
             target, "SELECT account(gen_random_uuid(), gen_random_uuid(), 'x')"
         ) == [(1,)]
+        apply_declared_schema(
+            target, sql_dir, plan, expect_converged=True, config=QUIET
+        )
 
     def test_expand_keeps_old_calls_working_and_contract_drops(
         self, tmp_path, databases
