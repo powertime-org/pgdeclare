@@ -1350,28 +1350,32 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
                 # The old signature has to go in the same statement, with the
                 # OLD args so the DROP names what is there. When only the
                 # parameter names changed the identity is the same, so the
-                # two cannot coexist, and a call by position still resolves.
+                # two cannot coexist, and a call that names the old
+                # parameters (`p_old => ...`) fails from the DROP on.
                 # Otherwise the overloads would compete for some call (a new
                 # DEFAULT that lets a call of the old length match both is
-                # the usual case: "function ... is not unique"), and an
-                # application still calling the old signature fails from the
-                # DROP on: that can only run with the application stopped.
+                # the usual case: "function ... is not unique"), and a call
+                # to the old signature fails from the DROP on. Either way an
+                # application still calling the old form breaks: offline.
                 functions_to_drop_for_rename.add(rename_source.signature)
-                same_identity = _same_call_types(func, rename_source)
                 change = DropAndCreateFunction(
                     function=func,
                     old_args=rename_source.args,  # Pass old args for correct DROP
                     old_kind=rename_source.kind,
+                    category=ChangeCategory.OFFLINE,
                 )
-                if not same_identity:
-                    change.category = ChangeCategory.OFFLINE
-                    change.description = (
-                        f"Drop {rename_source.keyword.lower()} "
-                        f"{rename_source.signature} and create "
-                        f"{func.signature} (offline: a call to the old "
-                        f"signature fails once it is dropped, and the two "
-                        f"cannot coexist because a call could match both)"
-                    )
+                why = (
+                    "a call naming the old parameters fails once it is dropped"
+                    if _same_call_types(func, rename_source)
+                    else "a call to the old signature fails once it is "
+                    "dropped, and the two cannot coexist because a call "
+                    "could match both"
+                )
+                change.description = (
+                    f"Drop {rename_source.keyword.lower()} "
+                    f"{rename_source.signature} and create "
+                    f"{func.signature} (offline: {why})"
+                )
                 changes.append(change)
         elif func.definition_hash != actual.functions[key].definition_hash:
             # A changed return type or kind requires DROP + CREATE: CREATE OR
