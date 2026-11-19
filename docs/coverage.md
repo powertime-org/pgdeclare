@@ -17,22 +17,22 @@ Within the managed schemas:
 | Range types (with their multirange) | yes, with every option (a shell type first when there is a canonical function) | drop and re-create while nothing uses the range or its multirange | yes, after the columns that use it (with its canonical function) |
 | Collations (libc, ICU, builtin) | yes | drop and re-create while nothing uses it | yes, after the columns, domains and ranges that use it |
 | Domains | yes | default, NOT NULL, CHECK constraints; drop and re-create on a base type or collation change while nothing uses it | yes, after the columns that use it |
-| Sequences (standalone and serial; not identity) | yes, with every option | `ALTER SEQUENCE` options (never `RESTART`; the current value is kept); `OWNED BY` | yes, without `CASCADE` (refused while a default still uses it) |
-| Views | yes | `CREATE OR REPLACE VIEW` in place when every existing column keeps its name, type and collation (new ones appended); otherwise drop and re-create; `WITH (...)` options such as `security_invoker` | yes |
-| Materialized views | yes, `WITH DATA` or `WITH NO DATA` as declared | query: drop and re-create (offline, rebuilds the data); storage options in place | yes |
+| Sequences (standalone and serial; not identity) | yes, with every option | `ALTER SEQUENCE` options (never `RESTART`; the current value is kept); `OWNED BY` | yes, without `CASCADE` (refused while a default still uses it); a contract change |
+| Views | yes | `CREATE OR REPLACE VIEW` in place when every existing column keeps its name, type and collation (new ones appended); otherwise drop and re-create; `WITH (...)` options such as `security_invoker` | yes (a contract change, offline when it cannot wait) |
+| Materialized views | yes, `WITH DATA` or `WITH NO DATA` as declared | query: drop and re-create (offline, rebuilds the data); storage options in place | yes (a contract change, offline when it cannot wait) |
 | Functions | yes | replace; a new signature no old call can reach is created beside the old one, which is then dropped (a contract change); one that competes with the old for a call (a new `DEFAULT`, same arity) drops and re-creates offline; renamed parameters re-create offline too (a call naming the old ones fails) | yes (a contract change) |
 | Procedures and window functions | yes | as functions; drop and re-create when the kind changes | yes |
 | Aggregates (normal, ordered-set, hypothetical-set) | yes, after the functions they call | `CREATE OR REPLACE AGGREGATE`; drop and re-create when the result type or kind changes, or when a function it calls is dropped | yes |
 | Triggers | yes | drop and re-create | yes |
 | Row level security | enable, force, and policies | policies drop and re-create | yes |
-| Grants to managed roles | tables, views, materialized views, columns, functions, procedures, aggregates, sequences, schemas | revokes before grants | yes |
+| Grants to managed roles | tables, views, materialized views, columns, functions, procedures, aggregates, sequences, schemas | a table-level revoke grants the declared column grants back in the same statement | yes (on tables, views, columns, sequences and schemas a contract change) |
 | Default privileges (`ALTER DEFAULT PRIVILEGES`) to managed roles | on tables, sequences, functions, types and schemas; for any target role (`FOR ROLE`, else the connecting role); schema-less or `IN SCHEMA` a managed schema | revoke and re-grant | yes |
 | Managed roles | yes | attributes | never dropped |
 | Role memberships | yes | admin option | yes |
 | Extensions (`CREATE EXTENSION`) | yes, with the `SCHEMA`, `VERSION` and `CASCADE` declared | `ALTER EXTENSION ... UPDATE TO` a declared version; `SET SCHEMA` to a declared schema | only with `@drop extension:NAME`; otherwise noted |
 | Foreign servers | yes, with `TYPE`, `VERSION` and options | `VERSION` and options in place (a new wrapper or `TYPE` is refused) | never dropped |
 | User mappings | yes, with options | options in place; a secret option the declaration omits is left alone | a managed role's mapping on a declared server |
-| Foreign tables | yes, with server, options, columns and column options | columns (type, NOT NULL, default, options) and options in one `ALTER FOREIGN TABLE`; a new server drops and re-creates | yes (no rows live locally, so no `@drop`) |
+| Foreign tables | yes, with server, options, columns and column options | columns (type, NOT NULL, default, options) and options in one `ALTER FOREIGN TABLE`; a new server drops and re-creates | yes (no rows live locally, so no `@drop`; a contract change) |
 | Owners (opt-in, `manage_ownership`) | `ALTER ... OWNER TO` | tables (partitioned ones too), foreign tables, views, materialized views, sequences, functions, procedures, aggregates, enum, composite and range types, domains, collations, managed schemas | no |
 | Rewrite rules (`CREATE RULE`, on tables; never a view's `_RETURN` rule) | yes | `CREATE OR REPLACE RULE`; enabled state | yes |
 | Publications (database-level) | yes: tables, column lists and row filters (15+), `TABLES IN SCHEMA` (15+), `FOR ALL TABLES`, options | `ALTER PUBLICATION ... ADD` / `DROP` members and `SET (...)` options; a member with a new column list or row filter is dropped and added back; drop and re-create to switch `FOR ALL TABLES` | yes, when every table it publishes is managed (see below) |

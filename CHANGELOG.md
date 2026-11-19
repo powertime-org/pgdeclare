@@ -5,6 +5,35 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [0.3.0] - 2026-11-19
+
+### Changed
+
+- Expand/contract covers what a query reads, not only routines. Dropping an
+  undeclared view, materialized view, sequence or foreign table, and revoking
+  a privilege on a table, view, column, sequence or schema, is now a
+  contract change: `apply --expand-only` holds it back, so the version still
+  serving keeps reading the relation, calling `nextval()` and running with
+  its privileges until the run after it has stopped.
+- A relation drop that cannot wait goes in the same run, offline: when the
+  schema files declare another relation under its name, when a view it reads
+  from is recreated in the run, or when its query names what the run drops,
+  recreates or retypes (and what depends on such a drop goes with it). A
+  routine and the view whose row type it returns now wait together instead of
+  both going offline.
+- A table-level revoke grants the declared column-level grants of the same
+  privilege back in the same statement (`RevokePrivilege.regrant_columns`), and
+  those grants leave the plan as separate changes. The contract run's revoke
+  would otherwise strip the column grants the expand run wrote, and the run
+  after a table-wide grant narrowed to some columns no longer depends on the
+  revoke running first.
+
+### Fixed
+
+- A relation declared under the name of an undeclared relation of another
+  kind (a view becoming a table) no longer fails `relation already exists`:
+  the create is retried once the old relation is dropped.
+
 ## [0.2.1] - 2026-11-19
 
 ### Changed
