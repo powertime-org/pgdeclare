@@ -1308,6 +1308,32 @@ def _same_call_types(a: Function, b: Function) -> bool:
     return a.call_shape_known and b.call_shape_known and a.arg_types == b.arg_types
 
 
+def _appends_defaulted_parameters(new: Function, old: Function) -> bool:
+    """Whether `new` is `old` with trailing parameters that all have defaults.
+
+    Every call the old form accepts, by position or by name, then resolves to
+    the new one: the old parameters keep their names, types and order, the
+    added ones fill in from their defaults, and no call loses a default it
+    relied on (the new form needs no more arguments than the old). With the
+    same kind and return clause, re-creating it in one statement is invisible
+    to an application still calling the old form.
+    """
+    if not (new.call_shape_known and old.call_shape_known):
+        return False
+    if new.max_call_args is None or old.max_call_args is None:
+        return False  # VARIADIC: leave it to the overlap rule
+    assert new.min_call_args is not None and old.min_call_args is not None
+    if new.kind != old.kind or new.kind != "f":
+        return False
+    if new.get_return_clause() != old.get_return_clause():
+        return False
+    if old.args and not new.args.startswith(old.args + ", "):
+        return False
+    return (
+        new.max_call_args > old.max_call_args and new.min_call_args <= old.min_call_args
+    )
+
+
 def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
     """Diff functions between desired and actual schemas."""
     changes: list[Change] = []
@@ -1358,6 +1384,24 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
                 # to the old signature fails from the DROP on. Either way an
                 # application still calling the old form breaks: offline.
                 functions_to_drop_for_rename.add(rename_source.signature)
+                if _appends_defaulted_parameters(func, rename_source):
+                    # Old and new would compete side by side, but swapped in
+                    # one statement there is no moment with both or neither,
+                    # and every old call resolves to the new form: online.
+                    change = DropAndCreateFunction(
+                        function=func,
+                        old_args=rename_source.args,
+                        old_kind=rename_source.kind,
+                    )
+                    change.description = (
+                        f"Drop {rename_source.keyword.lower()} "
+                        f"{rename_source.signature} and create "
+                        f"{func.signature} (online: it only appends "
+                        f"parameters with defaults, so every old call "
+                        f"resolves to it)"
+                    )
+                    changes.append(change)
+                    continue
                 change = DropAndCreateFunction(
                     function=func,
                     old_args=rename_source.args,  # Pass old args for correct DROP
