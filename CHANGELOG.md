@@ -5,6 +5,18 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [0.3.1] - 2026-11-19
+
+### Changed
+
+- A routine re-created because its result or its kind changes (a new
+  `RETURNS` type or `TABLE` columns, an aggregate's result, a procedure that
+  becomes a function, a window function that becomes a plain one) is now
+  offline. The drop and re-create is still one statement, but a plan the
+  serving application cached for a call to the old form fails ("cached plan
+  must not change result type"), and a call of the old kind no longer works.
+  A new body alone stays an online `CREATE OR REPLACE`.
+
 ## [0.3.0] - 2026-11-19
 
 ### Changed

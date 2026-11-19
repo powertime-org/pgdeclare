@@ -29,6 +29,7 @@ from pgdeclare import (
 from pgdeclare.changes import (
     AlterColumnType,
     CreateFunction,
+    ReplaceFunction,
     DropAndCreateFunction,
     DropAndCreateView,
     DropDomain,
@@ -172,6 +173,28 @@ class TestSignatureChanges:
         changes = compute_diff(_schema(new), _schema(old))
         assert [type(c) for c in changes] == [DropAndCreateFunction]
         assert changes[0].category == ChangeCategory.OFFLINE
+
+
+class TestResultChanges:
+    def test_a_new_result_is_offline(self):
+        # Same identity, so one statement, but a plan the serving version
+        # cached for the old result fails: "cached plan must not change
+        # result type".
+        old = _fn("f", "a int", "integer", 1, 1, body="RETURNS TABLE (x int) AS '1'")
+        new = _fn(
+            "f", "a int", "integer", 1, 1, body="RETURNS TABLE (x int, y int) AS '1'"
+        )
+        changes = compute_diff(_schema(new), _schema(old))
+        assert [type(c) for c in changes] == [DropAndCreateFunction]
+        assert changes[0].category == ChangeCategory.OFFLINE
+        assert "result changes" in changes[0].description
+
+    def test_a_new_body_stays_online(self):
+        old = _fn("f", "a int", "integer", 1, 1, body="RETURNS int AS '1'")
+        new = _fn("f", "a int", "integer", 1, 1, body="RETURNS int AS '2'")
+        changes = compute_diff(_schema(new), _schema(old))
+        assert [type(c) for c in changes] == [ReplaceFunction]
+        assert changes[0].category == ChangeCategory.ONLINE
 
 
 class TestDroppedRoutines:
@@ -492,6 +515,39 @@ class TestDeployWhileTheOldVersionServes:
         apply_declared_schema(
             target, sql_dir, plan, expect_converged=True, config=QUIET
         )
+
+    def test_a_new_result_is_refused_online(self, tmp_path, databases):
+        target, plan = databases
+        sql_dir = tmp_path / "sql"
+        _declare(sql_dir, V1)
+        apply_declared_schema(target, sql_dir, plan, config=QUIET)
+
+        # What a serving connection holds: a plan cached for the old result.
+        conn = psycopg2.connect(target)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("PREPARE old_total AS SELECT * FROM total(1)")
+                cur.execute("EXECUTE old_total")
+                _declare(
+                    sql_dir,
+                    V1.replace(
+                        "total(a int) RETURNS int LANGUAGE sql AS 'SELECT a'",
+                        "total(a int) RETURNS bigint LANGUAGE sql AS 'SELECT a'",
+                    ),
+                )
+                with pytest.raises(Exception, match="Migration execution failed"):
+                    apply_declared_schema(
+                        target, sql_dir, plan, expand_only=True, config=QUIET
+                    )
+                cur.execute("EXECUTE old_total")  # untouched: still answers
+                assert cur.fetchall() == [(1,)]
+
+                apply_declared_schema(target, sql_dir, plan, offline=True, config=QUIET)
+                with pytest.raises(psycopg2.Error, match="cached plan"):
+                    cur.execute("EXECUTE old_total")
+        finally:
+            conn.close()
 
     def test_expand_keeps_old_calls_working_and_contract_drops(
         self, tmp_path, databases

@@ -260,7 +260,8 @@ def _apply(sql_dir: Path, target_url: str, plan_db: str, content: str) -> None:
     """Apply `content`, then prove a fresh diff against it is empty."""
     config = PgDeclareConfig(report=lambda _line: None)
     _write(sql_dir, content)
-    apply_declared_schema(target_url, sql_dir, plan_db, config=config)
+    # Recreating what a comment is on can be offline (a new result type).
+    apply_declared_schema(target_url, sql_dir, plan_db, offline=True, config=config)
     desired = build_desired_schema(sql_dir, target_url, plan_db, config=config)
     actual = introspect_schema(target_url, config=config)
     assert compute_diff(desired, actual, schemas=["public"]) == []

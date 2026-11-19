@@ -407,8 +407,10 @@ class TestRoutineRoundTrip:
             .replace("'SELECT a + b'", "'SELECT x + y'")
         )
         # The new procedure signature competes with the old one for a call
-        # of two arguments, and `step`'s renamed parameters break a call
-        # naming the old ones, so both swaps are offline.
+        # of two arguments, `step`'s renamed parameters break a call naming
+        # the old ones, `tally`'s new result breaks a plan cached for the old
+        # one, and a procedure that becomes a function is called differently:
+        # all four swaps are offline.
         offline = [
             c
             for c in _plan(sql_dir, recreated, target_url, plan_db)
@@ -416,7 +418,9 @@ class TestRoutineRoundTrip:
         ]
         assert sorted(c.object_name for c in offline) == [
             "public.book(IN amount bigint, INOUT booked bigint)",
+            'public.odd "proc"()',
             "public.step(x integer, y integer)",
+            "public.tally()",
         ]
         _apply(sql_dir, recreated, target_url, plan_db, offline=True)
         routines = _routines(target_url)
@@ -459,9 +463,10 @@ class TestRoutineRoundTrip:
         assert _routines(target_url) == [("row_no", "w", "")]
         assert _pending(sql_dir, target_url, plan_db) == []
 
-        # A window function cannot be replaced by a plain one.
+        # A window function cannot be replaced by a plain one, and a call
+        # with OVER fails once it is: offline.
         plain = "CREATE FUNCTION row_no() RETURNS bigint LANGUAGE sql AS 'SELECT 1::bigint';"
-        _apply(sql_dir, plain, target_url, plan_db)
+        _apply(sql_dir, plain, target_url, plan_db, offline=True)
         assert _routines(target_url) == [("row_no", "f", "")]
         assert _pending(sql_dir, target_url, plan_db) == []
 
@@ -516,16 +521,18 @@ class TestRoutineGrants:
         assert privileges() == [("tally",), ("work",)]
         assert _pending(sql_dir, target_url, plan_db, config) == []
 
-        # A new result type recreates the aggregate: the grant is replayed.
+        # A new result type recreates the aggregate (offline): the grant is
+        # replayed.
         changed = granted.replace(
             "CREATE AGGREGATE tally(*) (SFUNC = int8inc, STYPE = int8, INITCOND = '0');",
             "CREATE AGGREGATE tally(*) (SFUNC = int4inc, STYPE = int4, INITCOND = '0');",
         )
-        _apply(sql_dir, changed, target_url, plan_db, config)
+        _apply(sql_dir, changed, target_url, plan_db, config, offline=True)
         assert privileges() == [("tally",), ("work",)]
         assert _pending(sql_dir, target_url, plan_db, config) == []
 
-        _apply(sql_dir, base, target_url, plan_db, config)
+        # Back to the base's result type: offline again.
+        _apply(sql_dir, base, target_url, plan_db, config, offline=True)
         assert privileges() == []
         assert _pending(sql_dir, target_url, plan_db, config) == []
 
