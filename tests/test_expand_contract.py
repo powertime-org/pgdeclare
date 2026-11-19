@@ -72,7 +72,9 @@ class TestSignatureChanges:
         changes = compute_diff(_schema(new), _schema(old))
         assert [type(c) for c in changes] == [DropAndCreateFunction]
         assert changes[0].category == ChangeCategory.ONLINE
-        assert changes[0].old_args == "a uuid, s uuid"
+        swap = changes[0]
+        assert isinstance(swap, DropAndCreateFunction)
+        assert swap.old_args == "a uuid, s uuid"
         assert "online" in changes[0].description
         assert not is_held_back(changes[0])
 
