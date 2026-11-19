@@ -464,9 +464,10 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument(
         "--expand-only",
         action="store_true",
-        help="the expand half of an expand/contract deploy: keep the routines "
-        "the running application may still call (dropped, or replaced by a new "
-        "signature) for a later run without this flag",
+        help="the expand half of an expand/contract deploy: keep what the "
+        "running application may still use (routines dropped or replaced by a "
+        "new signature, views, materialized views, sequences and foreign tables "
+        "dropped, privileges revoked) for a later run without this flag",
     )
     apply.add_argument(
         "--prove",

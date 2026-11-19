@@ -27,9 +27,14 @@ from .changes import (
     AlterOwner,
     Change,
     CreateEnum,
+    CreateForeignTable,
     CreateIndex,
+    CreateMaterializedView,
     CreatePartitionedIndex,
     CreateRole,
+    CreateSequence,
+    CreateTable,
+    CreateView,
     SetComment,
     DropCollation,
     DropDomain,
@@ -70,6 +75,19 @@ RETRY_WHILE_DEPENDED_ON = (
     DropCollation,
     DropExtension,
     DropForeignTable,
+)
+
+# duplicate_table. Retryable for the creates of a relation: a relation of
+# another kind that held the name (a view declared again as a table, say) is
+# dropped by another change in the same run, which the differ orders after the
+# create, and the create succeeds once it has.
+DUPLICATE_RELATION_ERROR_CODE = "42P07"
+RETRY_WHILE_NAME_TAKEN = (
+    CreateTable,
+    CreateView,
+    CreateMaterializedView,
+    CreateSequence,
+    CreateForeignTable,
 )
 
 # Changes run in the final phase, after the DDL and index phases: comments, and
@@ -414,9 +432,16 @@ def _execute_with_retry_savepoints(
                     continue
 
                 # Check if this is a dependency error (retryable)
-                if error_code in DEPENDENCY_ERROR_CODES or (
-                    error_code == DEPENDENT_OBJECTS_ERROR_CODE
-                    and isinstance(change, RETRY_WHILE_DEPENDED_ON)
+                if (
+                    error_code in DEPENDENCY_ERROR_CODES
+                    or (
+                        error_code == DEPENDENT_OBJECTS_ERROR_CODE
+                        and isinstance(change, RETRY_WHILE_DEPENDED_ON)
+                    )
+                    or (
+                        error_code == DUPLICATE_RELATION_ERROR_CODE
+                        and isinstance(change, RETRY_WHILE_NAME_TAKEN)
+                    )
                 ):
                     # Defer for retry
                     deferred.append(

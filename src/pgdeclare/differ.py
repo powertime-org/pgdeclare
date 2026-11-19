@@ -6,6 +6,7 @@ a list of Change objects needed to synchronize them.
 """
 
 from dataclasses import replace as dataclass_replace
+import re
 from typing import Any, Callable, Optional, Union
 
 from .changes import (
@@ -277,7 +278,14 @@ def compute_diff(
     changes.extend(default_privilege_grants)
     changes = _skip_revokes_on_dropped_relations(changes)
     changes = _skip_canonical_function_drops(changes, actual)
-    _drop_now_what_other_drops_need(changes, actual)
+    _hold_relation_drops(changes)
+    changes = _hold_relation_revokes(changes, desired)
+    # Whether a relation drop can wait depends on which routine drops go now,
+    # and the other way round, so settle both together.
+    while _drop_now_what_relations_need(
+        changes, desired, actual
+    ) | _drop_now_what_other_drops_need(changes, actual):
+        pass
     _hold_revokes_with_their_routine(changes)
 
     # Re-apply grants for objects being dropped and recreated.
@@ -2020,27 +2028,31 @@ def _skip_canonical_function_drops(
     ]
 
 
-def _drop_now_what_other_drops_need(changes: list[Change], actual: Schema) -> None:
+def _drop_now_what_other_drops_need(changes: list[Change], actual: Schema) -> bool:
     """Make a routine drop that another drop needs a drop of this run.
 
     A routine depends on the types its signature names: a dropped view's or
     domain's or range's (these drops run without CASCADE). If an expand run
-    held the routine back, that other drop would fail on it. So the routine
-    goes in the same run, and since the application that is serving may still
-    call it, that run is offline. A routine whose definition does not even
-    mention the object's name cannot depend on it; one that does may, so the
-    test errs towards offline.
+    held the routine back while the other drop went now, that drop would fail
+    on it. So the routine goes in the same run, and since the application that
+    is serving may still call it, that run is offline. A routine whose
+    definition does not even mention the object's name cannot depend on it;
+    one that does may, so the test errs towards offline. A view held back as a
+    contract change waits with the routine, so it forces nothing.
+
+    Returns whether it moved a routine drop to this run.
     """
     names: set[str] = set()
     for c in changes:
-        if isinstance(c, DropView):
+        if isinstance(c, DropView) and not c.contract:
             names.add(c.view_name.lower())
-        elif isinstance(c, DropMaterializedView):
+        elif isinstance(c, DropMaterializedView) and not c.contract:
             names.add(c.matview_name.lower())
         elif isinstance(c, (DropDomain, DropRangeType)):
             names.add(c.name.lower())
     if not names:
-        return
+        return False
+    moved = False
     for c in changes:
         if not (isinstance(c, DropFunction) and c.contract):
             continue
@@ -2054,6 +2066,218 @@ def _drop_now_what_other_drops_need(changes: list[Change], actual: Schema) -> No
                 f" (offline: dropped with {', '.join(needed)}, which it may "
                 f"depend on, while the application may still call it)"
             )
+            moved = True
+    return moved
+
+
+# Drops of relations a query names. The application that is serving may still
+# read them, so an expand run holds them back for the run after.
+_RelationDrop = Union[DropView, DropMaterializedView, DropSequence, DropForeignTable]
+
+
+def _relation_drop_name(c: _RelationDrop) -> str:
+    if isinstance(c, DropView):
+        return c.view_name
+    if isinstance(c, DropMaterializedView):
+        return c.matview_name
+    if isinstance(c, DropSequence):
+        return c.sequence_name
+    return c.table_name
+
+
+def _hold_relation_drops(changes: list[Change]) -> None:
+    """A view, materialized view, sequence or foreign table no longer declared
+    is dropped as a contract change.
+
+    The application that is serving may still read the relation or call
+    nextval() on the sequence; dropping it breaks every such query until the
+    new version takes over. `_drop_now_what_relations_need` then moves back to
+    this run, offline, each drop that cannot wait.
+    """
+    for c in changes:
+        if (
+            isinstance(
+                c, (DropView, DropMaterializedView, DropSequence, DropForeignTable)
+            )
+            and c.category == ChangeCategory.ONLINE
+        ):
+            c.contract = True
+
+
+def _mentions(text: str, name: str) -> bool:
+    return (
+        re.search(rf"(?<![\w$]){re.escape(name)}(?![\w$])", text, re.IGNORECASE)
+        is not None
+    )
+
+
+def _names_taken_now(changes: list[Change]) -> set[str]:
+    """Names of what this run drops, recreates or retypes, as a query names them.
+
+    A view reading one of them holds a dependency that makes the change fail
+    (DROP and ALTER COLUMN TYPE refuse while a view uses the object) or, for a
+    routine re-created with CASCADE, takes the view along.
+    """
+    names: set[str] = set()
+    for c in changes:
+        if c.contract:
+            continue
+        if isinstance(c, (DropView, DropMaterializedView, DropForeignTable)):
+            names.add(_relation_drop_name(c))
+        elif isinstance(c, DropTable):
+            names.add(c.table_name)
+        elif isinstance(c, (DropColumn, AlterColumnType)):
+            names.add(c.table)
+        elif isinstance(c, (DropFunction, DropDomain, DropRangeType)):
+            names.add(c.name)
+        elif isinstance(c, DropAndCreateFunction):
+            names.add(c.function.name)
+        elif isinstance(c, DropAndCreateDomain):
+            names.add(c.domain.name)
+        elif isinstance(c, DropAndCreateRangeType):
+            names.add(c.range_type.name)
+        elif isinstance(c, DropAndCreateForeignTable):
+            names.add(c.table.name)
+    return {n.lower() for n in names}
+
+
+def _declared_relation_names(desired: Schema) -> set[str]:
+    """`schema.name` of every declared object that lives in pg_class."""
+    found: set[str] = set()
+    for objects in (
+        desired.tables,
+        desired.views,
+        desired.materialized_views,
+        desired.sequences,
+        desired.foreign_tables,
+        desired.composite_types,
+        desired.indexes,
+    ):
+        for obj in objects.values():
+            found.add(f"{obj.schema}.{obj.name}")
+    return found
+
+
+def _drop_now_what_relations_need(
+    changes: list[Change], desired: Schema, actual: Schema
+) -> bool:
+    """Move a held-back relation drop to this run, offline, when it cannot wait.
+
+    It cannot wait when:
+
+    - the schema files declare another relation under its name, which this
+      run creates and which would collide with it;
+    - this run drops and recreates a view or materialized view it reads from,
+      directly or not: the recreate drops it on the way;
+    - it is a view or materialized view whose query names what this run
+      drops, recreates or retypes (or what another drop moved to this run
+      reads from): that change fails on it, or takes it along. Like the
+      routine rule, a name in the query errs towards offline.
+
+    Each one then goes now, and the serving application may still read it,
+    so the run is offline. Returns whether it moved any.
+    """
+    held = [
+        c
+        for c in changes
+        if isinstance(
+            c, (DropView, DropMaterializedView, DropSequence, DropForeignTable)
+        )
+        and c.contract
+    ]
+    if not held:
+        return False
+    declared = _declared_relation_names(desired)
+    taken = _names_taken_now(changes)
+    recreated_dependents: set[str] = set()
+    for c in changes:
+        if isinstance(c, DropAndCreateView):
+            root = c.view.qualified_name
+        elif isinstance(c, DropAndCreateMaterializedView):
+            root = c.matview.qualified_name
+        else:
+            continue
+        recreated_dependents.update(
+            _relation_dependent_order(root, actual.relation_dependents)
+        )
+
+    moved = False
+    for c in held:
+        name = _relation_drop_name(c)
+        qualified = f"{c.schema}.{name}"
+        reason = ""
+        if qualified in declared:
+            reason = f"{qualified} is declared again as another kind of relation"
+        elif qualified in recreated_dependents:
+            reason = "a view it reads from is recreated in this run"
+        elif isinstance(c, (DropView, DropMaterializedView)):
+            relation = actual.views.get(qualified) or actual.materialized_views.get(
+                qualified
+            )
+            definition = relation.definition if relation is not None else ""
+            needed = sorted(n for n in taken if _mentions(definition, n))
+            if needed:
+                reason = (
+                    f"it reads {', '.join(needed)}, which this run drops or changes"
+                )
+        if reason:
+            c.contract = False
+            c.category = ChangeCategory.OFFLINE
+            c.description += (
+                f" (offline: {reason}, while the application may still read it)"
+            )
+            moved = True
+    return moved
+
+
+# Grants on these are what the serving application's queries run on.
+_HELD_REVOKE_OBJECTS = frozenset({"TABLE", "COLUMN", "SEQUENCE", "SCHEMA"})
+
+
+def _hold_relation_revokes(changes: list[Change], desired: Schema) -> list[Change]:
+    """A revoke on a table, view, column, sequence or schema is a contract change.
+
+    The serving application's queries fail without the privilege exactly as
+    they would without the object. A table-level REVOKE also strips every
+    column-level grant of that privilege on the table, so the revoke grants
+    the declared ones again in the same statement, and their own GRANTs leave
+    the plan: while the table-wide grant stands they add nothing (and the
+    catalog reports them as part of it), and once it goes they come back with
+    the revoke, in whichever run that is.
+    """
+    folded: set[str] = set()
+    for c in changes:
+        if (
+            isinstance(c, RevokePrivilege)
+            and c.grant.object_type in _HELD_REVOKE_OBJECTS
+        ):
+            c.contract = True
+            if c.grant.object_type == "TABLE" and not c.grant.column:
+                c.regrant_columns = sorted(
+                    (
+                        g
+                        for g in desired.grants
+                        if g.column
+                        and g.schema == c.grant.schema
+                        and g.object_name == c.grant.object_name
+                        and g.privilege == c.grant.privilege
+                        and g.grantee == c.grant.grantee
+                    ),
+                    key=lambda g: g.key,
+                )
+                folded.update(g.key for g in c.regrant_columns)
+                if c.regrant_columns:
+                    c.description += (
+                        f" (re-granting it on {len(c.regrant_columns)} "
+                        f"declared column(s), which the revoke strips)"
+                    )
+    if not folded:
+        return changes
+    return [
+        c
+        for c in changes
+        if not (isinstance(c, GrantPrivilege) and c.grant.key in folded)
+    ]
 
 
 def _hold_revokes_with_their_routine(changes: list[Change]) -> None:

@@ -1933,13 +1933,13 @@ class TestGrantChanges:
         assert "REVOKE DELETE" in sql
         assert "FROM app_user" in sql
 
-    def test_table_revoke_precedes_column_grants(self):
-        """Table-wide INSERT narrowed to per-column INSERT revokes first.
+    def test_table_revoke_grants_the_columns_back_in_one_statement(self):
+        """Table-wide INSERT narrowed to per-column INSERT is one statement.
 
         PostgreSQL's table-level REVOKE also removes the column-level grants of
-        the same privilege, so emitting the column GRANTs before the table
-        REVOKE would wipe them and the run would never converge. The executor
-        runs changes in list order.
+        the same privilege, so a column GRANT run before it would be wiped and
+        the run would never converge. The revoke therefore grants the declared
+        columns again itself, after revoking, whichever run applies it.
         """
 
         def g(column=None):
@@ -1961,13 +1961,17 @@ class TestGrantChanges:
             if isinstance(c, (GrantPrivilege, RevokePrivilege))
         ]
 
-        assert [type(c) for c in changes] == [
-            RevokePrivilege,
-            GrantPrivilege,
-            GrantPrivilege,
-            GrantPrivilege,
+        assert [type(c) for c in changes] == [RevokePrivilege]
+        revoke = changes[0]
+        assert isinstance(revoke, RevokePrivilege)
+        assert revoke.grant.column is None
+        assert [r.column for r in revoke.regrant_columns] == [
+            "as_owner",
+            "note",
+            "team_id",
         ]
-        assert changes[0].grant.column is None
+        sql = revoke.to_sql()
+        assert sql.index("REVOKE INSERT") < sql.index('GRANT INSERT ("as_owner")')
 
 
 class TestFunctionPublicExecute:

@@ -27,15 +27,33 @@ from pgdeclare import (
     compute_diff,
 )
 from pgdeclare.changes import (
+    AlterColumnType,
     CreateFunction,
     DropAndCreateFunction,
+    DropAndCreateView,
+    DropDomain,
+    DropForeignTable,
     DropFunction,
+    DropMaterializedView,
+    DropSequence,
     DropView,
     RevokePrivilege,
 )
 from pgdeclare.ledger import MigrationBlock
 from pgdeclare.migrate import is_held_back
-from pgdeclare.models import ChangeCategory, Function, Grant, Schema, View
+from pgdeclare.models import (
+    ChangeCategory,
+    Column,
+    Domain,
+    ForeignTable,
+    Function,
+    Grant,
+    MaterializedView,
+    Schema,
+    Sequence,
+    Table,
+    View,
+)
 
 
 def _fn(
@@ -172,19 +190,196 @@ class TestDroppedRoutines:
         assert len(revokes) == 1 and is_held_back(revokes[0])
 
     def test_a_routine_another_drop_needs_goes_now_and_offline(self):
-        # DROP VIEW runs without CASCADE, so it would fail on a function
-        # returning its row type that an expand run had held back.
+        # DROP DOMAIN runs without CASCADE, so it would fail on a function
+        # taking the domain that an expand run had held back.
+        domain = Domain(schema="public", name="cents", base_type="integer")
+        gone = _fn("gone", "a cents", "cents", 1, 1)
+        kept = _fn("kept", "", "", 0, 0)
+        changes = compute_diff(
+            _schema(kept), _schema(gone, kept, domains={"public.cents": domain})
+        )
+        assert any(isinstance(c, DropDomain) for c in changes)
+        drop = next(c for c in changes if isinstance(c, DropFunction))
+        assert drop.category == ChangeCategory.OFFLINE
+        assert not drop.contract
+        assert "cents" in drop.description
+
+    def test_a_routine_and_the_view_it_returns_wait_together(self):
         view = View(schema="public", name="report", definition="SELECT 1 AS x")
         gone = _fn("gone", "", "", 0, 0, body="RETURNS SETOF report")
         kept = _fn("kept", "", "", 0, 0)
         changes = compute_diff(
             _schema(kept), _schema(gone, kept, views={"public.report": view})
         )
-        assert any(isinstance(c, DropView) for c in changes)
-        drop = next(c for c in changes if isinstance(c, DropFunction))
+        drops = [c for c in changes if isinstance(c, (DropView, DropFunction))]
+        assert len(drops) == 2 and all(is_held_back(c) for c in drops)
+
+
+def _view(name: str, definition: str) -> View:
+    return View(schema="public", name=name, definition=definition)
+
+
+def _table(name: str, **columns: str) -> Table:
+    return Table(
+        schema="public",
+        name=name,
+        columns={c: Column(c, t, True) for c, t in columns.items()},
+    )
+
+
+class TestDroppedRelations:
+    """Views, materialized views, sequences and foreign tables a query names."""
+
+    def test_undeclared_relations_are_contract_drops(self):
+        actual = Schema(
+            views={"public.v": _view("v", "SELECT 1 AS x")},
+            materialized_views={
+                "public.m": MaterializedView("public", "m", "SELECT 1 AS x")
+            },
+            sequences={"public.s": Sequence("public", "s")},
+            foreign_tables={
+                "public.f": ForeignTable("public", "f", server="remote", columns={})
+            },
+        )
+        changes = compute_diff(Schema(), actual)
+        drops = {
+            type(c): c
+            for c in changes
+            if isinstance(
+                c, (DropView, DropMaterializedView, DropSequence, DropForeignTable)
+            )
+        }
+        assert set(drops) == {
+            DropView,
+            DropMaterializedView,
+            DropSequence,
+            DropForeignTable,
+        }
+        assert all(c.category == ChangeCategory.ONLINE for c in drops.values())
+        assert all(is_held_back(c) for c in drops.values())
+
+    def test_a_name_declared_again_as_a_table_cannot_wait(self):
+        # CREATE TABLE v would collide with the view an expand run kept.
+        actual = Schema(views={"public.v": _view("v", "SELECT 1 AS x")})
+        desired = Schema(tables={"public.v": _table("v", x="integer")})
+        drop = next(c for c in compute_diff(desired, actual) if isinstance(c, DropView))
         assert drop.category == ChangeCategory.OFFLINE
-        assert not drop.contract
-        assert "report" in drop.description
+        assert not drop.contract and not is_held_back(drop)
+        assert "declared again" in drop.description
+
+    def test_a_view_reading_a_retyped_column_cannot_wait(self):
+        # ALTER COLUMN TYPE refuses while a view uses the column.
+        actual = Schema(
+            tables={"public.t": _table("t", a="integer")},
+            views={"public.v": _view("v", " SELECT t.a\n   FROM t;")},
+        )
+        desired = Schema(tables={"public.t": _table("t", a="bigint")})
+        changes = compute_diff(desired, actual)
+        assert any(isinstance(c, AlterColumnType) for c in changes)
+        drop = next(c for c in changes if isinstance(c, DropView))
+        assert drop.category == ChangeCategory.OFFLINE
+        assert "it reads t" in drop.description
+
+    def test_a_view_reading_another_table_waits(self):
+        actual = Schema(
+            tables={
+                "public.t": _table("t", a="integer"),
+                "public.tt": _table("tt", a="integer"),
+            },
+            views={"public.v": _view("v", " SELECT tt.a\n   FROM tt;")},
+        )
+        desired = Schema(
+            tables={
+                "public.t": _table("t", a="bigint"),
+                "public.tt": _table("tt", a="integer"),
+            }
+        )
+        drop = next(c for c in compute_diff(desired, actual) if isinstance(c, DropView))
+        assert is_held_back(drop)
+
+    def test_a_view_on_a_recreated_view_cannot_wait(self):
+        # The recreate drops what reads from it on the way.
+        base = View("public", "base", "SELECT 1 AS x", columns=["x integer"])
+        actual = Schema(
+            views={
+                "public.base": base,
+                "public.top": _view("top", "SELECT x FROM base"),
+            },
+            relation_dependents={"public.base": ["public.top"]},
+        )
+        desired = Schema(
+            views={
+                "public.base": View(
+                    "public", "base", "SELECT 'a'::text AS y", columns=["y text"]
+                )
+            }
+        )
+        changes = compute_diff(desired, actual)
+        assert any(isinstance(c, DropAndCreateView) for c in changes)
+        drop = next(c for c in changes if isinstance(c, DropView))
+        assert drop.category == ChangeCategory.OFFLINE
+        assert "recreated" in drop.description
+        assert not any(is_held_back(c) for c in changes)
+
+    def test_dependents_of_a_view_that_goes_now_go_too(self):
+        # `low` collides with a new table, so it goes now; `high` reads it,
+        # and DROP VIEW low would fail on it.
+        actual = Schema(
+            views={
+                "public.low": _view("low", "SELECT 1 AS x"),
+                "public.high": _view("high", " SELECT low.x\n   FROM low;"),
+            },
+            relation_dependents={"public.low": ["public.high"]},
+        )
+        desired = Schema(tables={"public.low": _table("low", x="integer")})
+        drops = [c for c in compute_diff(desired, actual) if isinstance(c, DropView)]
+        assert len(drops) == 2
+        assert all(c.category == ChangeCategory.OFFLINE for c in drops)
+
+
+class TestRevokedRelationGrants:
+    @pytest.mark.parametrize(
+        "grant",
+        [
+            Grant("TABLE", "t", "public", "SELECT", "app"),
+            Grant("COLUMN", "t", "public", "SELECT", "app", column="a"),
+            Grant("SEQUENCE", "s", "public", "USAGE", "app"),
+            Grant("SCHEMA", "public", "public", "USAGE", "app"),
+        ],
+    )
+    def test_a_revoke_is_a_contract_change(self, grant):
+        actual = Schema(
+            tables={"public.t": _table("t", a="integer")},
+            sequences={"public.s": Sequence("public", "s")},
+            grants=[grant],
+        )
+        desired = Schema(
+            tables={"public.t": _table("t", a="integer")},
+            sequences={"public.s": Sequence("public", "s")},
+        )
+        changes = compute_diff(desired, actual)
+        assert [type(c) for c in changes] == [RevokePrivilege]
+        assert is_held_back(changes[0])
+
+    def test_a_table_revoke_regrants_the_declared_columns(self):
+        # Moving a role from table-wide SELECT to SELECT (a): the contract
+        # run's REVOKE strips the column grant the expand run already wrote.
+        table = _table("t", a="integer", b="integer")
+        column = Grant("COLUMN", "t", "public", "SELECT", "app", column="a")
+        actual = Schema(
+            tables={"public.t": table},
+            grants=[Grant("TABLE", "t", "public", "SELECT", "app")],
+        )
+        desired = Schema(tables={"public.t": table}, grants=[column])
+        changes = compute_diff(desired, actual)
+        # One statement: an expand run, under the table-wide grant, has no
+        # use for the column grant (the catalog reports it as part of that).
+        assert [type(c) for c in changes] == [RevokePrivilege]
+        revoke = changes[0]
+        assert isinstance(revoke, RevokePrivilege) and is_held_back(revoke)
+        assert revoke.regrant_columns == [column]
+        sql = revoke.to_sql()
+        assert sql.index("REVOKE SELECT") < sql.index('GRANT SELECT ("a")')
 
 
 # =============================================================================
@@ -439,3 +634,97 @@ class TestExpandRefusesBreakingBlocks:
         sql_dir = tmp_path / "sql"
         _declare(sql_dir, INCIDENT_V2)
         apply_declared_schema(target, sql_dir, plan, expand_only=True, config=QUIET)
+
+
+# =============================================================================
+# Relations and grants, against a real server
+# =============================================================================
+
+
+@pytest.fixture
+def app_role(server_url):
+    role = f"pgdeclare_ec_app_{uuid.uuid4().hex[:8]}"
+    _run(server_url, f'CREATE ROLE "{role}"')
+    try:
+        yield role
+    finally:
+        _run(server_url, f'DROP ROLE IF EXISTS "{role}"')
+
+
+RELATIONS_V1 = """
+CREATE TABLE t (a int, b int);
+CREATE VIEW v AS SELECT a FROM t;
+CREATE MATERIALIZED VIEW m AS SELECT a FROM t;
+CREATE SEQUENCE s;
+GRANT USAGE ON SCHEMA public TO "{role}";
+GRANT SELECT ON t TO "{role}";
+GRANT SELECT ON v TO "{role}";
+GRANT SELECT ON m TO "{role}";
+GRANT USAGE ON SEQUENCE s TO "{role}";
+"""
+
+# The old version reads all of it, as the application role.
+OLD_READS = (
+    'SET ROLE "{role}"; '
+    "SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM v), "
+    "(SELECT count(*) FROM m), nextval('s') > 0, (SELECT count(b) FROM t)"
+)
+
+# The new version reads t's column a only, and needs none of the rest.
+RELATIONS_V2 = """
+CREATE TABLE t (a int, b int);
+GRANT USAGE ON SCHEMA public TO "{role}";
+GRANT SELECT (a) ON t TO "{role}";
+"""
+
+
+class TestRelationsWhileTheOldVersionServes:
+    def test_expand_keeps_what_the_old_version_reads_and_contract_drops(
+        self, tmp_path, app_role, databases
+    ):
+        target, plan = databases
+        sql_dir = tmp_path / "sql"
+        config = PgDeclareConfig(report=lambda _line: None, managed_roles=(app_role,))
+        _declare(sql_dir, RELATIONS_V1.format(role=app_role))
+        apply_declared_schema(target, sql_dir, plan, config=config)
+        old_reads = OLD_READS.format(role=app_role)
+        assert _run(target, old_reads) == [(0, 0, 0, True, 0)]
+
+        _declare(sql_dir, RELATIONS_V2.format(role=app_role))
+        # Before the fix, this dropped v, m and s and revoked the table-wide
+        # SELECT, and every one of these reads failed until the switch.
+        apply_declared_schema(target, sql_dir, plan, expand_only=True, config=config)
+        assert _run(target, old_reads) == [(0, 0, 0, True, 0)]
+
+        # Contract, once the old version has stopped: the role keeps column a
+        # (the table-wide REVOKE strips it, and the same statement restores it).
+        apply_declared_schema(target, sql_dir, plan, config=config)
+        assert _run(
+            target,
+            "SELECT relname FROM pg_class WHERE relnamespace = "
+            "'public'::regnamespace ORDER BY 1",
+        ) == [("t",)]
+        assert _run(target, f'SET ROLE "{app_role}"; SELECT count(a) FROM t') == [(0,)]
+        with pytest.raises(psycopg2.errors.InsufficientPrivilege):
+            _run(target, f'SET ROLE "{app_role}"; SELECT count(b) FROM t')
+        apply_declared_schema(
+            target, sql_dir, plan, expect_converged=True, config=config
+        )
+
+    def test_a_view_replaced_by_a_table_of_its_name_is_refused_online(
+        self, tmp_path, databases
+    ):
+        target, plan = databases
+        sql_dir = tmp_path / "sql"
+        _declare(sql_dir, "CREATE TABLE t (a int);\nCREATE VIEW v AS SELECT a FROM t;")
+        apply_declared_schema(target, sql_dir, plan, config=QUIET)
+
+        _declare(sql_dir, "CREATE TABLE t (a int);\nCREATE TABLE v (a int);")
+        with pytest.raises(Exception, match="Migration execution failed"):
+            apply_declared_schema(target, sql_dir, plan, expand_only=True, config=QUIET)
+        assert _run(target, "SELECT count(*) FROM v") == [(0,)]
+
+        apply_declared_schema(target, sql_dir, plan, offline=True, config=QUIET)
+        assert _run(target, "SELECT relkind FROM pg_class WHERE relname = 'v'") == [
+            ("r",)
+        ]
