@@ -34,6 +34,17 @@ may change in minor releases.
   kind (a view becoming a table) no longer fails `relation already exists`:
   the create is retried once the old relation is dropped.
 
+## [0.2.2] - 2026-11-19
+
+### Changed
+
+- A signature change that only appends parameters with defaults is online
+  again. The old and new forms still cannot coexist, but the drop and
+  re-create is one statement, and every call of the old form, by position or
+  by name, resolves to the new one. Any other change whose forms compete for
+  a call (new types at the same count, an old default taken away, a new
+  return type or renamed parameters) stays offline.
+
 ## [0.2.1] - 2026-11-19
 
 ### Changed
