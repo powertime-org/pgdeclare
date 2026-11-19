@@ -245,11 +245,18 @@ def databases(server_url):
 QUIET = PgDeclareConfig(report=lambda _line: None)
 
 
-def _apply(sql_dir: Path, sql: str, target_url: str, plan_db: str, config=QUIET):
+def _apply(
+    sql_dir: Path,
+    sql: str,
+    target_url: str,
+    plan_db: str,
+    config=QUIET,
+    offline: bool = False,
+):
     schemas = sql_dir / "schemas"
     schemas.mkdir(parents=True, exist_ok=True)
     (schemas / "schema.sql").write_text(sql)
-    apply_declared_schema(target_url, sql_dir, plan_db, config=config)
+    apply_declared_schema(target_url, sql_dir, plan_db, offline=offline, config=config)
 
 
 def _pending(sql_dir: Path, target_url: str, plan_db: str, config=QUIET):
@@ -399,7 +406,17 @@ class TestRoutineRoundTrip:
             .replace("step(a int, b int)", "step(x int, y int)")
             .replace("'SELECT a + b'", "'SELECT x + y'")
         )
-        _apply(sql_dir, recreated, target_url, plan_db)
+        # The new procedure signature competes with the old one for a call
+        # of two arguments, so the swap is offline.
+        offline = [
+            c
+            for c in _plan(sql_dir, recreated, target_url, plan_db)
+            if c.category.value == "offline"
+        ]
+        assert [c.object_name for c in offline] == [
+            "public.book(IN amount bigint, INOUT booked bigint)"
+        ]
+        _apply(sql_dir, recreated, target_url, plan_db, offline=True)
         routines = _routines(target_url)
         assert ("book", "p", "IN amount bigint, INOUT booked bigint") in routines
         assert ('odd "proc"', "f", "") in routines

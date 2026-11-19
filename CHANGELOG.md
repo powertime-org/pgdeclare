@@ -5,6 +5,41 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [0.2.0] - 2026-11-19
+
+### Added
+
+- Expand/contract for routines. Dropping an undeclared function, procedure
+  or aggregate, and revoking a grant on it, is a *contract* change:
+  `apply --expand-only` (`expand_only=True`) holds contract changes back for
+  a later run without the flag, so a deploy can migrate while the previous
+  version of the application still calls them. The convergence check of an
+  expand run allows exactly those changes.
+- An expand run refuses, before anything runs, a pending `@migrate-before`
+  or `@migrate-after` block that takes away what the serving version may use
+  (`ExpandRefusedError`): a `DROP` (but of an index, trigger or extended
+  statistics without `CASCADE`), a rename of anything a query names, `SET
+  SCHEMA`, or a column dropped, retyped or made `NOT NULL`. A block is SQL
+  run as written and cannot be postponed past the diff, so such a migration
+  runs offline. `breaking_statements(sql)` and `breaking_blocks(blocks,
+  applied)` give the same answer to a caller deciding how to deploy.
+- `Function` carries its call shape (`arg_types`, `min_call_args`,
+  `max_call_args`), read from `pg_proc`.
+
+### Changed
+
+- A routine whose signature changes is no longer always dropped and
+  re-created online. When no call can match both the old and the new
+  signature (the argument counts they accept do not overlap), the new one is
+  created beside the old and the old one is dropped as a contract change.
+  When a call could match both (a new parameter with a `DEFAULT`, or new
+  types at the same arity), the drop and re-create is now **offline**: an
+  application still calling the old signature fails from the drop on, and
+  the two overloads cannot coexist without making its calls ambiguous. A
+  change of parameter names only stays one online statement.
+- A dropped routine whose definition names a view, materialized view, domain
+  or range type the same run drops is dropped in that run, offline.
+
 ## [0.1.2] - 2026-10-19
 
 ### Changed

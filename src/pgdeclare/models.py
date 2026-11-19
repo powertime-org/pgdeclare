@@ -148,6 +148,35 @@ class Function:
     # Aggregates only: signatures of the functions the aggregate calls (state,
     # final, combine and so on). Dropping one of them drops the aggregate.
     support_functions: tuple[str, ...] = ()
+    # The call shape, which decides whether an old and a new overload of one
+    # name can live side by side (see `call_arity_overlaps`). `arg_types` is
+    # oidvectortypes(proargtypes): the input types without names or modes.
+    # A call passes from `min_call_args` (pronargs - pronargdefaults) to
+    # `max_call_args` (pronargs) arguments; None for a VARIADIC routine, which
+    # takes any number above the minimum. All three are None when unknown.
+    arg_types: Optional[str] = None
+    min_call_args: Optional[int] = None
+    max_call_args: Optional[int] = None
+
+    @property
+    def call_shape_known(self) -> bool:
+        return self.arg_types is not None and self.min_call_args is not None
+
+    def call_arity_overlaps(self, other: "Function") -> bool:
+        """Whether some call could match both routines by its argument count.
+
+        PostgreSQL resolves an overloaded call among the routines that accept
+        that many arguments, defaults and VARIADIC included. Two overloads of
+        one name whose ranges overlap can make a call ambiguous ("function ...
+        is not unique") or pick the other one; two whose ranges are disjoint
+        never compete for a call. An unknown shape counts as overlapping.
+        """
+        if not (self.call_shape_known and other.call_shape_known):
+            return True
+        assert self.min_call_args is not None and other.min_call_args is not None
+        self_hi = self.max_call_args if self.max_call_args is not None else 1 << 30
+        other_hi = other.max_call_args if other.max_call_args is not None else 1 << 30
+        return self.min_call_args <= other_hi and other.min_call_args <= self_hi
 
     @property
     def qualified_name(self) -> str:

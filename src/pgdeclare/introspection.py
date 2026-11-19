@@ -375,6 +375,16 @@ def _query_constraints(conn, schema: str, table_name: str) -> list[Constraint]:
     return constraints
 
 
+def _call_shape(row) -> dict:
+    """A pg_proc row's call shape, as `Function` keeps it."""
+    nargs = row["nargs"]
+    return {
+        "arg_types": row["arg_types"] or "",
+        "min_call_args": nargs - row["nargdefaults"],
+        "max_call_args": None if row["variadic"] else nargs,
+    }
+
+
 def _query_functions(conn, schema: str) -> dict[str, Function]:
     """Query functions, procedures and window functions from pg_proc.
 
@@ -393,6 +403,10 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
                 pg_get_functiondef(p.oid) AS full_definition,
                 p.oid AS func_oid,
                 p.prokind AS kind,
+                oidvectortypes(p.proargtypes) AS arg_types,
+                p.pronargs AS nargs,
+                p.pronargdefaults AS nargdefaults,
+                p.provariadic <> 0 AS variadic,
                 -- PUBLIC retains EXECUTE if the ACL is default (NULL => PUBLIC
                 -- EXECUTE) or an explicit grantee=0 EXECUTE entry exists.
                 (
@@ -435,6 +449,7 @@ def _query_functions(conn, schema: str) -> dict[str, Function]:
                 security_definer=row["security_definer"],
                 public_execute=row["public_execute"],
                 kind=row["kind"],
+                **_call_shape(row),
             )
             functions[func.signature] = func
 
@@ -474,6 +489,10 @@ def _query_aggregates(conn, schema: str) -> dict[str, Function]:
             SELECT
                 p.proname AS name,
                 pg_get_function_identity_arguments(p.oid) AS args,
+                oidvectortypes(p.proargtypes) AS arg_types,
+                p.pronargs AS nargs,
+                p.pronargdefaults AS nargdefaults,
+                p.provariadic <> 0 AS variadic,
                 format_type(p.prorettype, NULL) AS result_type,
                 p.proparallel AS parallel,
                 a.aggkind, {support_cols},
@@ -581,6 +600,7 @@ def _query_aggregates(conn, schema: str) -> dict[str, Function]:
             support_functions=tuple(signatures),
             # Aggregates are never SECURITY DEFINER.
             security_definer=False,
+            **_call_shape(row),
         )
         body = ",\n    ".join(options)
         func.full_definition = (
