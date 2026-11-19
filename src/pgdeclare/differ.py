@@ -1437,10 +1437,28 @@ def _diff_functions(desired: Schema, actual: Schema) -> list[Change]:
                 func.kind != actual_func.kind
                 or func.get_return_clause() != actual_func.get_return_clause()
             ):
-                # Use combined Drop+Create to keep them together
-                changes.append(
-                    DropAndCreateFunction(function=func, old_kind=actual_func.kind)
+                # One statement, so nothing ever finds it missing, but a
+                # caller of the old form reads a different answer: a cached
+                # plan for it fails ("cached plan must not change result
+                # type") and a procedure is not called like a function. The
+                # application still serving must be stopped: offline.
+                what = (
+                    f"its kind changes from {actual_func.keyword.lower()} "
+                    f"to {func.keyword.lower()}"
+                    if func.kind != actual_func.kind
+                    else "its result changes, and a cached plan for a call "
+                    "to the old form fails"
                 )
+                change = DropAndCreateFunction(
+                    function=func,
+                    old_kind=actual_func.kind,
+                    category=ChangeCategory.OFFLINE,
+                )
+                change.description = (
+                    f"Drop and re-create {func.keyword.lower()} "
+                    f"{func.signature} (offline: {what})"
+                )
+                changes.append(change)
             else:
                 changes.append(ReplaceFunction(function=func))
 
