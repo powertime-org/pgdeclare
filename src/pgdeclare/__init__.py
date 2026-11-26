@@ -17,7 +17,7 @@ file layout, bootstrap SQL, locking, failure classification) comes in through
 embeds it.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 from .config import DEFAULT_CONFIG, PgDeclareConfig
 from .models import (

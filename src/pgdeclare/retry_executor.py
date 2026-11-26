@@ -188,6 +188,7 @@ def execute_with_retry(
             raise failure from exc
         raise
     conn.autocommit = True  # DDL should run outside transaction
+    _quiet_expected_failures(conn)
 
     try:
         while pending and iteration < max_iterations:
@@ -308,6 +309,68 @@ def execute_with_retry(
 
     finally:
         conn.close()
+
+
+# What this session sets so the server log stays quiet while statements run
+# out of order. ERROR reaches the server log only at log_min_messages of error
+# or below, and its statement text only at log_min_error_statement of error or
+# below; FATAL and PANIC (the server or the session dying) are still logged.
+QUIET_SESSION_SETTINGS = (
+    ("log_min_messages", "fatal"),
+    ("log_min_error_statement", "panic"),
+)
+
+
+def _quiet_expected_failures(conn) -> bool:
+    """Keep this session's expected failures out of the server log.
+
+    Retry-until-stable finds the load order by failing: a statement whose
+    dependency is not there yet raises (`relation ... does not exist`) and runs
+    again in a later pass. Every such attempt is an ERROR the server logs with
+    the full statement text, so one load of a large schema writes thousands of
+    lines that are no fault at all, and the errors that matter on that server
+    drown in them. The failures are still caught here and the ones left at the
+    end are reported, with their errors, in the result.
+
+    Both settings are superuser-only (or need SET granted on them from
+    PostgreSQL 15), so they are set only when the role may: asking first keeps
+    a role that may not from logging a `permission denied` of its own, and its
+    load runs as before. Only this session is affected; nothing else on the
+    server, nor another session on the same database, logs any less.
+
+    Returns whether the session was quietened.
+    """
+    names = [name for name, _ in QUIET_SESSION_SETTINGS]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT current_setting('is_superuser') = 'on', "
+                "current_setting('server_version_num')::int"
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            allowed, version = bool(row[0]), int(row[1])
+            if not allowed and version >= 150000:
+                cur.execute(
+                    "SELECT bool_and(has_parameter_privilege(name, 'SET')) "
+                    "FROM unnest(%s::text[]) AS name",
+                    (names,),
+                )
+                granted = cur.fetchone()
+                allowed = bool(granted and granted[0])
+            if not allowed:
+                logger.debug(
+                    "Role may not set %s; failed attempts reach the server log",
+                    " or ".join(names),
+                )
+                return False
+            for name, value in QUIET_SESSION_SETTINGS:
+                cur.execute("SELECT set_config(%s, %s, false)", (name, value))
+            return True
+    except Exception as exc:  # best effort: the load itself must not depend on it
+        logger.debug(f"Could not quieten the server log for this load: {exc}")
+        return False
 
 
 def _execute_single_statement_with_conn(conn, stmt: ParsedStatement) -> None:
