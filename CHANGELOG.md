@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0 the API
 may change in minor releases.
 
+## [0.3.2] - 2026-11-26
+
+### Fixed
+
+- A schema load no longer floods the server log. Retry-until-stable finds the
+  load order by failing, and each attempt whose dependency was not there yet
+  was an ERROR in the server log with its full statement text: thousands of
+  lines per load of a large schema, every time a plan was built. The load's
+  session now sets `log_min_messages = fatal` and
+  `log_min_error_statement = panic` for itself when its role may (a
+  superuser, or `SET` granted on both from PostgreSQL 15). It asks first, so
+  a role that may not logs no `permission denied` and loads as before. No
+  other session logs any less, and the statements still failing at the end
+  are reported in the result as before.
+
 ## [0.3.1] - 2026-11-19
 
 ### Changed
